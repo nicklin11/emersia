@@ -18,7 +18,7 @@ make paid VR-desktop apps obsolete.
 ## Status
 
 Early development (milestone **M0 — Foundation**). The roadmap lives in the
-[Emersia project board](https://github.com/users/nicklin11/projects).
+[Emersia project board](https://github.com/users/nicklin11/projects/4).
 
 ### Planned milestones
 
