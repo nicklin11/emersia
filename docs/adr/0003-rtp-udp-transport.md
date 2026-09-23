@@ -34,6 +34,23 @@ where it measurably wins, AV1 where hardware allows (Quest 3).
 
 All of it runs inside the pairing-encrypted channel per ADR 0005.
 
+### Parameters proven by the libworkspaceVR prototype
+
+The superseded GStreamer prototype streamed 1080p60 to a headset over RTP/UDP
+and was verified end to end before the Rust rewrite. Four constants from it
+survive into this design and are worth keeping:
+
+| parameter | value | why |
+|---|---|---|
+| RTP video clock rate | 90000 Hz | standard for video; RTP timestamps count in 90 kHz units regardless of the actual frame rate |
+| payload type | 96 | conventional dynamic type for H.264, leaving the static range free |
+| in-band config interval | every packet | repeat SPS/PPS continuously so a client that joins mid-stream can decode immediately instead of waiting for the next keyframe |
+| sink sync | disabled | never pace output against a wall clock — emit as fast as the encoder produces |
+
+GOP in that prototype was `key-int-period=150` at 60 fps (≈2.5 s) at 30 Mbit/s
+for 1080p60. Treat both as inherited starting points, not targets: re-measure
+end-to-end latency and glitch rate once the encoder stage actually runs.
+
 ## Consequences
 
 + Zero signalling infrastructure; peer address is configuration, not a
