@@ -86,12 +86,12 @@ jobs:
 
             // Resolve project + fields by name (nothing hardcoded but names).
             const q = `
-              query($login: String!, $title: String!) {
+              query($login: String!) {
                 user(login: $login) {
                   projectsV2(first: 50) { nodes { id title } }
                 }
               }`;
-            const { user } = await g.graphql(q, { login: PROJECT_OWNER, title: PROJECT_TITLE });
+            const { user } = await g.graphql(q, { login: PROJECT_OWNER });
             const project = user.projectsV2.nodes.find(p => p.title === PROJECT_TITLE);
             if (!project) { core.warning(`Project '${PROJECT_TITLE}' not found`); return; }
 
@@ -143,7 +143,7 @@ jobs:
                   projectId: project.id,
                   itemId: itemId,
                   fieldId: field.id,
-                  value: { singleSelectValue: { optionId: option.id } }
+                  value: { singleSelectOptionId: option.id }
                 }
               }
             );
