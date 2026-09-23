@@ -14,13 +14,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 
-use emersia_protocol::{Command, ErrorCode, Request, Response, PROTOCOL_VERSION};
+use emersia_protocol::{
+    Command, DeviceInfo, ErrorCode, PairAction, Request, Response, PROTOCOL_VERSION,
+};
 use serde::Serialize;
 use serde_json::json;
 use wayland_client::Connection;
 
 use crate::capture::{self, Backend, BackendPref};
 use crate::control::{err_response, ok_response};
+use crate::crypto::HostIdentity;
+use crate::pairing::{PairingDb, PairingError};
 
 /// Default capture rate when `start` does not specify one.
 const DEFAULT_FPS: u32 = 30;
@@ -65,23 +69,41 @@ struct Inner {
 pub struct Service {
     inner: Mutex<Inner>,
     shutdown: AtomicBool,
+    /// File-backed device trust store, behind its own lock so a disk write
+    /// never blocks the status path.
+    pairing: Mutex<PairingDb>,
+    /// The daemon's own long-term identity (ADR 0006). Devices need this to
+    /// pin the host they are talking to.
+    host_public_key: String,
 }
 
 impl Service {
-    pub fn new() -> Self {
+    pub fn new(pairing: PairingDb, host: &HostIdentity) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 fps_target: DEFAULT_FPS,
                 ..Inner::default()
             }),
             shutdown: AtomicBool::new(false),
+            pairing: Mutex::new(pairing),
+            host_public_key: host.public_key_hex(),
         }
     }
 
     /// A service with no Wayland discovery, for socket-layer tests.
     #[cfg(test)]
     pub fn new_for_tests() -> Arc<Self> {
-        Arc::new(Self::new())
+        let dir = tempfile::tempdir().expect("temp dir for test trust store");
+        let db = PairingDb::load(&dir.path().join("pairing.json")).expect("fresh store");
+        let host =
+            HostIdentity::load_or_create(&dir.path().join("host.key")).expect("host identity");
+        // The store writes to this path for the life of the test process.
+        std::mem::forget(dir);
+        Arc::new(Self::new(db, &host))
+    }
+
+    fn lock_pairing(&self) -> std::sync::MutexGuard<'_, PairingDb> {
+        self.pairing.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -171,17 +193,26 @@ impl Service {
                 )
             }
             Command::Unknown => err_response(&id, ErrorCode::UnknownCmd, "unknown command"),
-            Command::Pair(_) => err_response(
-                &id,
-                ErrorCode::NotPaired,
-                "pairing is not implemented yet (M1.3)",
-            ),
-            Command::Devices => ok_response(&id, json!({ "devices": [] })),
-            Command::Revoke(args) => err_response(
-                &id,
-                ErrorCode::NotFound,
-                format!("no paired device {:?}", args.device),
-            ),
+            Command::Pair(args) => self.handle_pair(&id, args),
+            Command::Devices => {
+                let devices: Vec<DeviceInfo> = self
+                    .lock_pairing()
+                    .devices()
+                    .iter()
+                    .map(|d| DeviceInfo {
+                        id: d.id.clone(),
+                        name: d.name.clone(),
+                        paired_at: d.paired_at,
+                        revoked: d.revoked,
+                    })
+                    .collect();
+                let active = devices.iter().filter(|d| !d.revoked).count();
+                ok_response(&id, json!({ "devices": devices, "active": active }))
+            }
+            Command::Revoke(args) => match self.lock_pairing().revoke(&args.device) {
+                Ok(device) => ok_response(&id, json!({ "revoked": true, "device": device.id })),
+                Err(e) => err_response(&id, pairing_error_code(&e), e.to_string()),
+            },
             Command::Select(args) => {
                 if args.targets.is_empty() {
                     let mut inner = self.lock();
@@ -194,6 +225,42 @@ impl Service {
                         ErrorCode::InvalidArgs,
                         "multi-target select is not implemented yet; use start --output",
                     )
+                }
+            }
+        }
+    }
+
+    /// `pair new` mints a short-lived code; `pair accept <code>` registers a
+    /// device identity against it.
+    fn handle_pair(&self, id: &str, args: emersia_protocol::PairArgs) -> Response {
+        let mut db = self.lock_pairing();
+        match args.action {
+            PairAction::New => match db.new_code() {
+                Ok(code) => ok_response(
+                    id,
+                    json!({
+                        "code": code.to_string(),
+                        "expires_in_s": crate::pairing::CODE_TTL.as_secs(),
+                    }),
+                ),
+                Err(e) => err_response(id, pairing_error_code(&e), e.to_string()),
+            },
+            PairAction::Accept => {
+                let (Some(code), Some(name), Some(public_key)) =
+                    (args.code, args.name, args.public_key)
+                else {
+                    return err_response(
+                        id,
+                        ErrorCode::InvalidArgs,
+                        "pair accept needs a code, a device name and a public key",
+                    );
+                };
+                match db.accept_code(&code, &name, &public_key) {
+                    Ok(device) => ok_response(
+                        id,
+                        json!({ "paired": true, "device": device.id, "name": device.name }),
+                    ),
+                    Err(e) => err_response(id, pairing_error_code(&e), e.to_string()),
                 }
             }
         }
@@ -265,20 +332,28 @@ impl Service {
             "avg_latency_ms": round2(inner.stats.avg_latency_ms),
             "measured_fps": round2(inner.stats.measured_fps),
             "connected_devices": 0,
+            "paired_devices": self.lock_pairing().active_devices().len(),
             "last_error": inner.last_error,
             "protocol_version": PROTOCOL_VERSION,
+            "host_public_key": self.host_public_key,
         })
-    }
-}
-
-impl Default for Service {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
 fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
+}
+
+/// Map a pairing failure onto a stable wire error token.
+fn pairing_error_code(err: &PairingError) -> ErrorCode {
+    use PairingError as P;
+    match err {
+        P::WrongCode | P::NoPendingCode | P::TooManyAttempts => ErrorCode::NotPaired,
+        P::NotFound(_) => ErrorCode::NotFound,
+        P::Invalid(_) => ErrorCode::InvalidArgs,
+        // I/O and corruption are both server-side trust failures: refuse loudly.
+        P::Io(_) | P::Corrupt(_) | P::NoConfigDir => ErrorCode::Internal,
+    }
 }
 
 /// Everything the engine needs to capture, discovered once at startup.
@@ -392,8 +467,13 @@ mod tests {
     use super::*;
     use emersia_protocol::{Command, ResponseErr, ResponseOk, StartArgs};
 
+    /// A service backed by a throwaway trust store, with fake outputs.
     fn service_with_outputs() -> Service {
-        let service = Service::new();
+        let dir = tempfile::tempdir().expect("temp trust store");
+        let db = PairingDb::load(&dir.path().join("pairing.json")).expect("fresh store");
+        let host = HostIdentity::load_or_create(&dir.path().join("host.key")).expect("host key");
+        let service = Service::new(db, &host);
+        std::mem::forget(dir);
         service.publish_discovery(
             vec![
                 ScreenInfo {
@@ -524,16 +604,139 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_pairing_reports_not_paired() {
+    fn pair_new_mints_a_code() {
         let s = service_with_outputs();
-        let res = s.handle(req(
+        let p = ok_payload(s.handle(req(
             "1",
             Command::Pair(emersia_protocol::PairArgs {
                 action: emersia_protocol::PairAction::New,
                 code: None,
+                name: None,
+                public_key: None,
+            }),
+        )));
+        let code = p["code"].as_str().expect("code in response");
+        assert_eq!(code.len(), 7, "formatted as XXX-XXX");
+        assert!(p["expires_in_s"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn pair_accept_registers_then_devices_lists() {
+        let s = service_with_outputs();
+        let minted = ok_payload(s.handle(req(
+            "1",
+            Command::Pair(emersia_protocol::PairArgs {
+                action: emersia_protocol::PairAction::New,
+                code: None,
+                name: None,
+                public_key: None,
+            }),
+        )));
+        let code = minted["code"].as_str().unwrap().to_string();
+        let identity = crate::crypto::DeviceIdentity::generate().unwrap();
+        let paired = ok_payload(s.handle(req(
+            "2",
+            Command::Pair(emersia_protocol::PairArgs {
+                action: emersia_protocol::PairAction::Accept,
+                code: Some(code),
+                name: Some("Quest 3".into()),
+                public_key: Some(identity.public_key_hex()),
+            }),
+        )));
+        assert_eq!(paired["paired"], true);
+        assert_eq!(paired["name"], "Quest 3");
+
+        let listed = ok_payload(s.handle(req("3", Command::Devices)));
+        assert_eq!(listed["active"], 1);
+        let devices = listed["devices"].as_array().unwrap();
+        assert_eq!(devices[0]["name"], "Quest 3");
+        assert_eq!(devices[0]["revoked"], false);
+    }
+
+    #[test]
+    fn pair_accept_with_a_wrong_code_is_not_paired() {
+        let s = service_with_outputs();
+        let _ = s.handle(req(
+            "1",
+            Command::Pair(emersia_protocol::PairArgs {
+                action: emersia_protocol::PairAction::New,
+                code: None,
+                name: None,
+                public_key: None,
+            }),
+        ));
+        let identity = crate::crypto::DeviceIdentity::generate().unwrap();
+        let res = s.handle(req(
+            "2",
+            Command::Pair(emersia_protocol::PairArgs {
+                action: emersia_protocol::PairAction::Accept,
+                code: Some("000000".into()),
+                name: Some("Quest".into()),
+                public_key: Some(identity.public_key_hex()),
             }),
         ));
         assert_eq!(err_code(res), ErrorCode::NotPaired);
+    }
+
+    #[test]
+    fn pair_accept_requires_all_arguments() {
+        let s = service_with_outputs();
+        let res = s.handle(req(
+            "1",
+            Command::Pair(emersia_protocol::PairArgs {
+                action: emersia_protocol::PairAction::Accept,
+                code: Some("123456".into()),
+                name: None,
+                public_key: None,
+            }),
+        ));
+        assert_eq!(err_code(res), ErrorCode::InvalidArgs);
+    }
+
+    #[test]
+    fn revoke_removes_a_paired_device() {
+        let s = service_with_outputs();
+        let minted = ok_payload(s.handle(req(
+            "1",
+            Command::Pair(emersia_protocol::PairArgs {
+                action: emersia_protocol::PairAction::New,
+                code: None,
+                name: None,
+                public_key: None,
+            }),
+        )));
+        let code = minted["code"].as_str().unwrap().to_string();
+        let identity = crate::crypto::DeviceIdentity::generate().unwrap();
+        let paired = ok_payload(s.handle(req(
+            "2",
+            Command::Pair(emersia_protocol::PairArgs {
+                action: emersia_protocol::PairAction::Accept,
+                code: Some(code),
+                name: Some("Quest".into()),
+                public_key: Some(identity.public_key_hex()),
+            }),
+        )));
+        let device_id = paired["device"].as_str().unwrap().to_string();
+
+        let revoked = ok_payload(s.handle(req(
+            "3",
+            Command::Revoke(emersia_protocol::RevokeArgs { device: device_id }),
+        )));
+        assert_eq!(revoked["revoked"], true);
+        let listed = ok_payload(s.handle(req("4", Command::Devices)));
+        assert_eq!(listed["active"], 0, "revoked devices are not active");
+    }
+
+    #[test]
+    fn revoking_an_unknown_device_is_not_found() {
+        let s = service_with_outputs();
+        let res = s.handle(req(
+            "1",
+            Command::Revoke(emersia_protocol::RevokeArgs {
+                device: "nosuch".into(),
+            }),
+        ));
+        assert_eq!(err_code(res), ErrorCode::NotFound);
     }
 
     #[test]
