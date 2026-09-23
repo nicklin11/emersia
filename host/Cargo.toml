@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/emersia-daemon", "crates/emersia-cli"]
+members = [
+  "crates/emersia-daemon",
+  "crates/emersia-cli",
+  "crates/emersia-protocol",
+]
 
 [workspace.package]
 version = "0.0.1"

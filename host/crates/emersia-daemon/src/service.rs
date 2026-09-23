@@ -1,0 +1,586 @@
+//! Daemon service state machine and capture engine.
+//!
+//! The engine (main thread) owns the Wayland connection and runs a capture
+//! loop; the control server runs on its own thread and mutates the shared
+//! [`Service`] state. `start`/`stop` flip a flag the engine observes, so no
+//! Wayland object ever crosses a thread boundary.
+//!
+//! M1.2 scope: this captures and measures frames. Encoding, transport and
+//! uinput land in later subtasks of #3.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use anyhow::Context as _;
+
+use emersia_protocol::{Command, ErrorCode, Request, Response, PROTOCOL_VERSION};
+use serde::Serialize;
+use serde_json::json;
+use wayland_client::Connection;
+
+use crate::capture::{self, Backend, BackendPref};
+use crate::control::{err_response, ok_response};
+
+/// Default capture rate when `start` does not specify one.
+const DEFAULT_FPS: u32 = 30;
+
+/// Engine idle tick — how often a stopped engine checks for new commands.
+const IDLE_TICK: Duration = Duration::from_millis(20);
+
+/// A capturable output as reported by `screens`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScreenInfo {
+    pub kind: &'static str,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub transform: String,
+}
+
+/// Live counters, updated by the engine after every captured frame.
+#[derive(Debug, Default, Clone)]
+struct Stats {
+    frames: u64,
+    last_latency_ms: f64,
+    avg_latency_ms: f64,
+    measured_fps: f64,
+}
+
+/// Mutable service state, guarded by one mutex.
+#[derive(Debug, Default)]
+struct Inner {
+    streaming: bool,
+    fps_target: u32,
+    selected: Option<String>,
+    outputs: Vec<ScreenInfo>,
+    backend: Option<&'static str>,
+    stats: Stats,
+    last_error: Option<String>,
+}
+
+/// Shared control-plane state. Cheap to clone via `Arc`; the Wayland machinery
+/// stays on the engine thread.
+#[derive(Debug)]
+pub struct Service {
+    inner: Mutex<Inner>,
+    shutdown: AtomicBool,
+}
+
+impl Service {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                fps_target: DEFAULT_FPS,
+                ..Inner::default()
+            }),
+            shutdown: AtomicBool::new(false),
+        }
+    }
+
+    /// A service with no Wayland discovery, for socket-layer tests.
+    #[cfg(test)]
+    pub fn new_for_tests() -> Arc<Self> {
+        Arc::new(Self::new())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        // A poisoned lock means a prior thread panicked mid-update; the state
+        // is plain data with no invariants spanning fields, so recovering is
+        // safer than taking the whole daemon down.
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Populate outputs/backend discovered by the engine at startup.
+    pub fn publish_discovery(&self, outputs: Vec<ScreenInfo>, backend: Option<&'static str>) {
+        let mut inner = self.lock();
+        inner.outputs = outputs;
+        inner.backend = backend;
+    }
+
+    pub fn is_streaming(&self) -> bool {
+        self.lock().streaming
+    }
+
+    pub fn fps_target(&self) -> u32 {
+        self.lock().fps_target.max(1)
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Record one successfully captured frame.
+    pub fn record_frame(&self, latency: Duration, since_last: Duration) {
+        let mut inner = self.lock();
+        let ms = latency.as_secs_f64() * 1000.0;
+        inner.stats.frames += 1;
+        inner.stats.last_latency_ms = ms;
+        inner.stats.avg_latency_ms = if inner.stats.frames == 1 {
+            ms
+        } else {
+            // Running mean so a long session cannot drift.
+            let n = inner.stats.frames as f64;
+            (inner.stats.avg_latency_ms * (n - 1.0) + ms) / n
+        };
+        inner.stats.measured_fps = if since_last.is_zero() {
+            0.0
+        } else {
+            1.0 / since_last.as_secs_f64()
+        };
+        inner.last_error = None;
+    }
+
+    /// Record a capture failure and drop out of streaming.
+    pub fn record_error(&self, message: String) {
+        let mut inner = self.lock();
+        inner.streaming = false;
+        inner.last_error = Some(message);
+    }
+
+    /// Handle one control request and produce its response.
+    pub fn handle(&self, req: Request) -> Response {
+        let id = req.id.clone();
+        match req.command {
+            Command::Status => ok_response(&id, self.status_payload()),
+            Command::Screens => ok_response(&id, json!({ "screens": self.screens_payload() })),
+            Command::Start(args) => self.handle_start(&id, args),
+            Command::Stop => {
+                let was = {
+                    let mut inner = self.lock();
+                    let was = inner.streaming;
+                    inner.streaming = false;
+                    was
+                };
+                if was {
+                    ok_response(&id, json!({ "streaming": false }))
+                } else {
+                    err_response(&id, ErrorCode::Busy, "not streaming; nothing to stop")
+                }
+            }
+            Command::Events => {
+                // Follow-mode push is deferred; send the current snapshot so
+                // `emersia events` is useful today.
+                ok_response(
+                    &id,
+                    json!({ "snapshot": self.status_payload(), "following": false }),
+                )
+            }
+            Command::Unknown => err_response(&id, ErrorCode::UnknownCmd, "unknown command"),
+            Command::Pair(_) => err_response(
+                &id,
+                ErrorCode::NotPaired,
+                "pairing is not implemented yet (M1.3)",
+            ),
+            Command::Devices => ok_response(&id, json!({ "devices": [] })),
+            Command::Revoke(args) => err_response(
+                &id,
+                ErrorCode::NotFound,
+                format!("no paired device {:?}", args.device),
+            ),
+            Command::Select(args) => {
+                if args.targets.is_empty() {
+                    let mut inner = self.lock();
+                    inner.streaming = false;
+                    inner.selected = None;
+                    ok_response(&id, json!({ "targets": [] }))
+                } else {
+                    err_response(
+                        &id,
+                        ErrorCode::InvalidArgs,
+                        "multi-target select is not implemented yet; use start --output",
+                    )
+                }
+            }
+        }
+    }
+
+    fn handle_start(&self, id: &str, args: emersia_protocol::StartArgs) -> Response {
+        let mut inner = self.lock();
+        if inner.streaming {
+            return err_response(id, ErrorCode::Busy, "already streaming");
+        }
+        // Validate the requested output before claiming success.
+        if let Some(want) = &args.output {
+            let known = inner.outputs.iter().any(|o| &o.name == want);
+            if !known {
+                let names: Vec<&str> = inner.outputs.iter().map(|o| o.name.as_str()).collect();
+                return err_response(
+                    id,
+                    ErrorCode::NotFound,
+                    format!("no output named {want:?}; available: {}", names.join(", ")),
+                );
+            }
+        }
+        if let Some(fps) = args.fps {
+            if fps == 0 || fps > 240 {
+                return err_response(
+                    id,
+                    ErrorCode::InvalidArgs,
+                    format!("fps must be 1..=240, got {fps}"),
+                );
+            }
+            inner.fps_target = fps;
+        }
+        if args.output.is_some() {
+            inner.selected = args.output.clone();
+        }
+        if inner.selected.is_none() {
+            inner.selected = inner.outputs.first().map(|o| o.name.clone());
+        }
+        if inner.selected.is_none() {
+            return err_response(
+                id,
+                ErrorCode::NoCaptureBackend,
+                "no outputs detected on this compositor",
+            );
+        }
+        inner.streaming = true;
+        inner.last_error = None;
+        let selected = inner.selected.clone().unwrap_or_default();
+        ok_response(
+            id,
+            json!({ "streaming": true, "output": selected, "fps": inner.fps_target }),
+        )
+    }
+
+    fn screens_payload(&self) -> Vec<ScreenInfo> {
+        self.lock().outputs.clone()
+    }
+
+    fn status_payload(&self) -> serde_json::Value {
+        let inner = self.lock();
+        json!({
+            "streaming": inner.streaming,
+            "backend": inner.backend,
+            "encoder": serde_json::Value::Null,
+            "selected_output": inner.selected,
+            "fps_target": inner.fps_target,
+            "frames": inner.stats.frames,
+            "latency_ms": round2(inner.stats.last_latency_ms),
+            "avg_latency_ms": round2(inner.stats.avg_latency_ms),
+            "measured_fps": round2(inner.stats.measured_fps),
+            "connected_devices": 0,
+            "last_error": inner.last_error,
+            "protocol_version": PROTOCOL_VERSION,
+        })
+    }
+}
+
+impl Default for Service {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+/// Everything the engine needs to capture, discovered once at startup.
+pub struct Engine {
+    queue: wayland_client::EventQueue<capture::State>,
+    state: capture::State,
+    output: wayland_client::protocol::wl_output::WlOutput,
+    transform: wayland_client::protocol::wl_output::Transform,
+    backend: Backend,
+    pub backend_name: &'static str,
+    pub screens: Vec<ScreenInfo>,
+}
+
+impl Engine {
+    /// Connect to Wayland, enumerate outputs, and pick a backend/output.
+    pub fn discover(pref: BackendPref) -> anyhow::Result<Self> {
+        let conn = Connection::connect_to_env()
+            .context("failed to connect to a Wayland compositor (is WAYLAND_DISPLAY set?)")?;
+        let mut queue = conn.new_event_queue::<capture::State>();
+        let qh = queue.handle();
+        let _registry = conn.display().get_registry(&qh, ());
+        let mut state = capture::State::new();
+
+        queue
+            .roundtrip(&mut state)
+            .context("failed while enumerating Wayland globals")?;
+        queue
+            .roundtrip(&mut state)
+            .context("failed while reading output descriptions")?;
+
+        let labels = state.output_labels();
+        let has_ext = state.ext_source_mgr.is_some() && state.ext_copy_mgr.is_some();
+        let has_wlr = state.wlr_mgr.is_some();
+        let backend = capture::choose_backend(pref, has_ext, has_wlr)?;
+
+        let index = capture::select_output(&labels, None)?;
+        let output = state.outputs[index].proxy.clone();
+        let transform = state.outputs[index].transform;
+        let screens = state
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(i, info)| ScreenInfo {
+                kind: "output",
+                name: labels[i].clone(),
+                width: info.width,
+                height: info.height,
+                transform: format!("{:?}", info.transform).to_lowercase(),
+            })
+            .collect();
+
+        Ok(Self {
+            queue,
+            state,
+            output,
+            transform,
+            backend,
+            backend_name: backend.protocol(),
+            screens,
+        })
+    }
+
+    /// Capture exactly one frame with the selected backend.
+    pub fn capture_once(&mut self) -> anyhow::Result<crate::frame::Frame> {
+        match self.backend {
+            Backend::Ext => capture::ext::capture(&mut self.queue, &mut self.state, &self.output),
+            Backend::Wlr => capture::wlr::capture(
+                &mut self.queue,
+                &mut self.state,
+                &self.output,
+                self.transform,
+            ),
+        }
+    }
+}
+
+/// Run the engine until shutdown: capture while streaming, idle otherwise.
+pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
+    service.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
+    let mut last_frame = Instant::now();
+
+    while !service.is_shutting_down() && !crate::signal_received() {
+        if !service.is_streaming() {
+            std::thread::sleep(IDLE_TICK);
+            last_frame = Instant::now();
+            continue;
+        }
+        let started = Instant::now();
+        match engine.capture_once() {
+            Ok(frame) => {
+                // Pace to the requested rate; drop frames if capture is slow.
+                let interval = Duration::from_secs_f64(1.0 / service.fps_target() as f64);
+                let elapsed = started.elapsed();
+                if elapsed < interval {
+                    std::thread::sleep(interval - elapsed);
+                }
+                service.record_frame(started.elapsed(), last_frame.elapsed());
+                last_frame = Instant::now();
+                let _ = frame; // M1.3 pipes this into the encoder.
+            }
+            Err(err) => {
+                service.record_error(format!("{err:#}"));
+                eprintln!("emersia-daemon: capture failed: {err:#}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use emersia_protocol::{Command, ResponseErr, ResponseOk, StartArgs};
+
+    fn service_with_outputs() -> Service {
+        let service = Service::new();
+        service.publish_discovery(
+            vec![
+                ScreenInfo {
+                    kind: "output",
+                    name: "DP-3".into(),
+                    width: 1920,
+                    height: 1080,
+                    transform: "normal".into(),
+                },
+                ScreenInfo {
+                    kind: "output",
+                    name: "HDMI-A-1".into(),
+                    width: 1920,
+                    height: 1080,
+                    transform: "normal".into(),
+                },
+            ],
+            Some("wlr-screencopy"),
+        );
+        service
+    }
+
+    fn req(id: &str, command: Command) -> Request {
+        Request {
+            v: PROTOCOL_VERSION,
+            id: id.into(),
+            command,
+        }
+    }
+
+    fn ok_payload(res: Response) -> serde_json::Value {
+        match res {
+            Response::Ok(o) => o.ok,
+            Response::Err(e) => panic!("expected ok, got {:?}", e.error),
+        }
+    }
+
+    fn err_code(res: Response) -> ErrorCode {
+        match res {
+            Response::Err(e) => e.error.code,
+            Response::Ok(o) => panic!("expected err, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn status_reports_discovery() {
+        let s = service_with_outputs();
+        let p = ok_payload(s.handle(req("1", Command::Status)));
+        assert_eq!(p["backend"], "wlr-screencopy");
+        assert_eq!(p["streaming"], false);
+        assert_eq!(p["frames"], 0);
+    }
+
+    #[test]
+    fn screens_lists_outputs() {
+        let s = service_with_outputs();
+        let p = ok_payload(s.handle(req("1", Command::Screens)));
+        let arr = p["screens"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["name"], "DP-3");
+    }
+
+    #[test]
+    fn start_then_stop_transitions_streaming() {
+        let s = service_with_outputs();
+        let p = ok_payload(s.handle(req("1", Command::Start(StartArgs::default()))));
+        assert_eq!(p["streaming"], true);
+        assert_eq!(p["output"], "DP-3", "defaults to first output");
+        assert!(s.is_streaming());
+
+        // Starting twice is busy.
+        assert_eq!(
+            err_code(s.handle(req("2", Command::Start(StartArgs::default())))),
+            ErrorCode::Busy
+        );
+
+        ok_payload(s.handle(req("3", Command::Stop)));
+        assert!(!s.is_streaming());
+        // Stopping when idle is also reported, not silently ignored.
+        assert_eq!(err_code(s.handle(req("4", Command::Stop))), ErrorCode::Busy);
+    }
+
+    #[test]
+    fn start_rejects_unknown_output_and_bad_fps() {
+        let s = service_with_outputs();
+        let res = s.handle(req(
+            "1",
+            Command::Start(StartArgs {
+                output: Some("NOPE".into()),
+                fps: None,
+            }),
+        ));
+        assert_eq!(err_code(res), ErrorCode::NotFound);
+
+        let res = s.handle(req(
+            "2",
+            Command::Start(StartArgs {
+                output: None,
+                fps: Some(0),
+            }),
+        ));
+        assert_eq!(err_code(res), ErrorCode::InvalidArgs);
+        assert!(!s.is_streaming());
+    }
+
+    #[test]
+    fn start_selects_named_output() {
+        let s = service_with_outputs();
+        let p = ok_payload(s.handle(req(
+            "1",
+            Command::Start(StartArgs {
+                output: Some("HDMI-A-1".into()),
+                fps: Some(60),
+            }),
+        )));
+        assert_eq!(p["output"], "HDMI-A-1");
+        assert_eq!(p["fps"], 60);
+        assert_eq!(s.fps_target(), 60);
+    }
+
+    #[test]
+    fn unknown_command_is_rejected_cleanly() {
+        let s = service_with_outputs();
+        assert_eq!(
+            err_code(s.handle(req("1", Command::Unknown))),
+            ErrorCode::UnknownCmd
+        );
+    }
+
+    #[test]
+    fn unimplemented_pairing_reports_not_paired() {
+        let s = service_with_outputs();
+        let res = s.handle(req(
+            "1",
+            Command::Pair(emersia_protocol::PairArgs {
+                action: emersia_protocol::PairAction::New,
+                code: None,
+            }),
+        ));
+        assert_eq!(err_code(res), ErrorCode::NotPaired);
+    }
+
+    #[test]
+    fn record_frame_updates_running_stats() {
+        let s = service_with_outputs();
+        s.record_frame(Duration::from_millis(10), Duration::from_millis(20));
+        s.record_frame(Duration::from_millis(20), Duration::from_millis(20));
+        let p = ok_payload(s.handle(req("1", Command::Status)));
+        assert_eq!(p["frames"], 2);
+        assert_eq!(p["latency_ms"], 20.0);
+        assert_eq!(p["avg_latency_ms"], 15.0);
+    }
+
+    #[test]
+    fn record_error_stops_streaming() {
+        let s = service_with_outputs();
+        ok_payload(s.handle(req("1", Command::Start(StartArgs::default()))));
+        s.record_error("backend died".into());
+        assert!(!s.is_streaming());
+        let p = ok_payload(s.handle(req("2", Command::Status)));
+        assert_eq!(p["last_error"], "backend died");
+    }
+
+    #[test]
+    fn error_response_shape_is_wire_ready() {
+        let s = service_with_outputs();
+        let res = s.handle(req("abc", Command::Unknown));
+        match res {
+            Response::Err(ResponseErr { v, id, error }) => {
+                assert_eq!(v, PROTOCOL_VERSION);
+                assert_eq!(id, "abc");
+                assert_eq!(error.code, ErrorCode::UnknownCmd);
+            }
+            _ => panic!("expected error response"),
+        }
+    }
+
+    #[test]
+    fn ok_response_shape_is_wire_ready() {
+        let s = service_with_outputs();
+        let res = s.handle(req("xyz", Command::Status));
+        match res {
+            Response::Ok(ResponseOk { v, id, .. }) => {
+                assert_eq!(v, PROTOCOL_VERSION);
+                assert_eq!(id, "xyz");
+            }
+            _ => panic!("expected ok response"),
+        }
+    }
+}
