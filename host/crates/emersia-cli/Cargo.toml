@@ -1,0 +1,12 @@
+[package]
+name = "emersia-cli"
+description = "emersia — local control CLI for the Emersia host daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "emersia"
+path = "src/main.rs"

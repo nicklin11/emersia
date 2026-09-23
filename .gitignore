@@ -1,0 +1,12 @@
+# Rust
+/host/target/
+
+# Godot (client)
+client/.godot/
+*.translation
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

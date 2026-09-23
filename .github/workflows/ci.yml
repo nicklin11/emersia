@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validation:
+    name: validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Repository hygiene (pre-check)
+        run: bash scripts/pre-check.sh
+
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host
+      - name: rustfmt
+        if: hashFiles('host/Cargo.toml') != ''
+        run: cargo fmt --manifest-path host/Cargo.toml --all -- --check
+      - name: clippy
+        if: hashFiles('host/Cargo.toml') != ''
+        run: cargo clippy --manifest-path host/Cargo.toml --all-targets -- -D warnings
+      - name: test
+        if: hashFiles('host/Cargo.toml') != ''
+        run: cargo test --manifest-path host/Cargo.toml
+
+  # Aggregate check — this is the single required status on `main`.
+  ci:
+    name: ci
+    needs: [validation, rust]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: All jobs green?
+        run: |
+          if [ "${{ needs.validation.result }}" != "success" ] || [ "${{ needs.rust.result }}" != "success" ]; then
+            echo "required jobs did not succeed"
+            exit 1
+          fi
+          echo "ci OK"
