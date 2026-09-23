@@ -1,0 +1,12 @@
+[package]
+name = "emersia-daemon"
+description = "Emersia host daemon: Wayland capture, hardware encode, RTP/UDP streaming, uinput control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "emersia-daemon"
+path = "src/main.rs"

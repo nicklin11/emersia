@@ -1,0 +1,150 @@
+# Keeps the Emersia Projects (v2) board in sync automatically:
+#   - issues/PRs are added to the project when they appear
+#   - Status field moves: Todo -> In Progress -> In Review -> Done
+# Developer-driven moves (drag, Milestone/Priority/Area) remain untouched.
+# Requires repo secret PROJECT_TOKEN (a token with `project` scope).
+
+name: project-automation
+
+on:
+  issues:
+    types: [opened, assigned, labeled, closed, reopened]
+  pull_request:
+    types: [opened, converted_to_draft, ready_for_review, closed]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  update-project:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        with:
+          script: |
+            const TOKEN = process.env.PROJECT_TOKEN;
+            if (!TOKEN) {
+              core.warning("PROJECT_TOKEN secret is not set — project automation skipped.");
+              return;
+            }
+            const api = github.constructor;
+            const g = new api({ auth: TOKEN, headers: { "project-version": "2" } });
+
+            const PROJECT_OWNER = "nicklin11";
+            const PROJECT_TITLE = "Emersia";
+            const STATUS_FIELD = "Status";
+            const target = (() => {
+              const e = context.payload;
+              if (e.issue) {
+                return { kind: "issue", node: e.issue.node_id, url: e.issue.html_url, ev: e };
+              }
+              if (e.pull_request) {
+                return { kind: "pr", node: e.pull_request.node_id, url: e.pull_request.html_url, ev: e };
+              }
+              return null;
+            })();
+            if (!target) return;
+
+            // Which target status does this event imply? (null = no status change)
+            let status = null;
+            if (target.kind === "issue") {
+              const ev = target.ev;
+              switch (context.eventName + ":" + ev.action) {
+                case "issues:opened":
+                case "issues:reopened":
+                  status = "Todo";
+                  break;
+                case "issues:assigned":
+                  status = "In Progress";
+                  break;
+                case "issues:labeled":
+                  if (ev.label.name === "status: in-progress") status = "In Progress";
+                  break;
+                case "issues:closed":
+                  status = "Done";
+                  break;
+              }
+            } else {
+              const pr = target.ev.pull_request;
+              switch (context.eventName + ":" + target.ev.action) {
+                case "pull_request:opened":
+                case "pull_request:ready_for_review":
+                  status = "In Review";
+                  break;
+                case "pull_request:converted_to_draft":
+                  status = "In Progress";
+                  break;
+                case "pull_request:closed":
+                  status = pr.merged ? "Done" : "Todo";
+                  break;
+              }
+            }
+
+            // Resolve project + fields by name (nothing hardcoded but names).
+            const q = `
+              query($login: String!, $title: String!) {
+                user(login: $login) {
+                  projectsV2(first: 50) { nodes { id title } }
+                }
+              }`;
+            const { user } = await g.graphql(q, { login: PROJECT_OWNER, title: PROJECT_TITLE });
+            const project = user.projectsV2.nodes.find(p => p.title === PROJECT_TITLE);
+            if (!project) { core.warning(`Project '${PROJECT_TITLE}' not found`); return; }
+
+            const fq = `
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on ProjectV2 {
+                    fields(first: 50) {
+                      nodes {
+                        __typename
+                        ... on ProjectV2SingleSelectField { id name options { id name } }
+                      }
+                    }
+                  }
+                } }`;
+            const { node } = await g.graphql(fq, { id: project.id });
+            const field = node.fields.nodes.find(f => f.__typename === "ProjectV2SingleSelectField" && f.name === STATUS_FIELD);
+            if (!field) { core.warning(`Single-select field '${STATUS_FIELD}' not found`); return; }
+
+            // Ensure the item is on the board (idempotent for issues/PRs).
+            let itemId = null;
+            try {
+              const add = await g.graphql(
+                `mutation($projectId: ID!, $contentId: ID!) {
+                   addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+                     item { id }
+                   } }`,
+                { projectId: project.id, contentId: target.node }
+              );
+              itemId = add.addProjectV2ItemById.item.id;
+            } catch (e) {
+              // Already present (or add refused): fall back to finding the item by URL.
+              const iq = `query($id: ID!) { node(id: $id) { ... on ProjectV2 { items(first: 100) { nodes { id content { ... on Issue { url } ... on PullRequest { url } } } } } } }`;
+              const r = await g.graphql(iq, { id: project.id });
+              const found = r.node.items.nodes.find(i => i.content && (i.content.url === target.url));
+              if (!found) { core.warning(`Item not on board and could not be added: ${target.url}`); return; }
+              itemId = found.id;
+            }
+
+            if (!status) return; // just make sure it's on the board
+            const option = field.options.find(o => o.name === status);
+            if (!option) { core.warning(`Status option '${status}' not found`); return; }
+
+            await g.graphql(
+              `mutation($input: UpdateProjectV2ItemFieldValueInput!) {
+                 updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } } }`,
+              {
+                input: {
+                  projectId: project.id,
+                  itemId: itemId,
+                  fieldId: field.id,
+                  value: { singleSelectValue: { optionId: option.id } }
+                }
+              }
+            );
+            core.info(`${target.url} -> ${STATUS_FIELD}: ${status}`);
