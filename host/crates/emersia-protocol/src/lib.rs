@@ -115,6 +115,22 @@ pub struct PairArgs {
     pub action: PairAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    /// Display name for the device being paired (`accept`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Hex-encoded X25519 public key proving the device identity (`accept`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+}
+
+/// A paired device as reported by `devices`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub name: String,
+    /// Unix seconds.
+    pub paired_at: u64,
+    pub revoked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -198,7 +198,11 @@ fn print_human(payload: &serde_json::Value) {
         } else {
             println!("devices:");
             for d in arr {
-                println!("  {}", d.get("id").and_then(|v| v.as_str()).unwrap_or("?"));
+                let id = d.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let revoked = d.get("revoked").and_then(|v| v.as_bool()).unwrap_or(false);
+                let state = if revoked { "revoked" } else { "active" };
+                println!("  {id}  {name}  [{state}]");
             }
         }
         return;
@@ -255,6 +259,8 @@ fn parse_args(args: &[String]) -> Result<Option<Invocation>, Failure> {
     let mut socket = None;
     let mut json = false;
     let mut fps: Option<u32> = None;
+    let mut device_name: Option<String> = None;
+    let mut public_key: Option<String> = None;
     let mut command_name: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
 
@@ -284,6 +290,18 @@ fn parse_args(args: &[String]) -> Result<Option<Invocation>, Failure> {
                     Failure::Usage(format!("--fps must be a number, got {value:?}"))
                 })?);
             }
+            "--name" => {
+                let value = rest
+                    .next()
+                    .ok_or_else(|| Failure::Usage("missing value for --name".into()))?;
+                device_name = Some(value.to_string());
+            }
+            "--public-key" => {
+                let value = rest
+                    .next()
+                    .ok_or_else(|| Failure::Usage("missing value for --public-key".into()))?;
+                public_key = Some(value.to_string());
+            }
             other if other.starts_with('-') && other != "-" => {
                 return Err(Failure::Usage(format!("unknown flag: {other}")));
             }
@@ -306,7 +324,7 @@ fn parse_args(args: &[String]) -> Result<Option<Invocation>, Failure> {
         return Ok(None);
     }
 
-    let command = build_command(&name, &positionals, fps)?;
+    let command = build_command(&name, &positionals, fps, device_name, public_key)?;
     Ok(Some(Invocation {
         socket,
         json,
@@ -314,7 +332,13 @@ fn parse_args(args: &[String]) -> Result<Option<Invocation>, Failure> {
     }))
 }
 
-fn build_command(name: &str, positionals: &[String], fps: Option<u32>) -> Result<Command, Failure> {
+fn build_command(
+    name: &str,
+    positionals: &[String],
+    fps: Option<u32>,
+    device_name: Option<String>,
+    public_key: Option<String>,
+) -> Result<Command, Failure> {
     if let Some(command) = simple_command(name) {
         if !positionals.is_empty() {
             return Err(Failure::Usage(format!(
@@ -347,9 +371,26 @@ fn build_command(name: &str, positionals: &[String], fps: Option<u32>) -> Result
                     )))
                 }
             };
+            // `accept` cannot work without a code, a name and a public key.
+            if action == PairAction::Accept {
+                if positionals.get(1).is_none() {
+                    return Err(Failure::Usage(
+                        "'pair accept' needs a code (e.g. emersia pair accept 123-456 --name …)"
+                            .into(),
+                    ));
+                }
+                if device_name.is_none() {
+                    return Err(Failure::Usage("'pair accept' needs --name".into()));
+                }
+                if public_key.is_none() {
+                    return Err(Failure::Usage("'pair accept' needs --public-key".into()));
+                }
+            }
             Ok(Command::Pair(PairArgs {
                 action,
                 code: positionals.get(1).cloned(),
+                name: device_name,
+                public_key,
             }))
         }
         "revoke" => {
@@ -375,13 +416,17 @@ fn print_help() {
     println!("  start [OUTPUT]         begin capture streaming");
     println!("  stop                   end capture streaming");
     println!("  events                 current state snapshot (follow-mode later)");
-    println!("  pair new|accept [code] start/accept pairing");
-    println!("  devices                list paired devices");
-    println!("  revoke <id>            remove a paired device");
-    println!("  select [TARGET…]       set capture targets (empty = none)");
+    println!("  pair new                 mint a short-lived pairing code");
+    println!("  pair accept CODE --name N --public-key HEX");
+    println!("                           register a device identity");
+    println!("  devices                  list paired devices");
+    println!("  revoke <id>              revoke a paired device");
+    println!("  select [TARGET…]         set capture targets (empty = none)");
     println!("\nOptions:");
     println!("  --socket PATH   control socket [default: $XDG_RUNTIME_DIR/emersia/control.sock]");
     println!("  --fps N         target capture rate for 'start'");
+    println!("  --name NAME     display name for 'pair accept'");
+    println!("  --public-key H  hex X25519 public key for 'pair accept'");
     println!("  --json          print the raw JSON payload");
     println!("  -V, --version   print version and exit");
     println!("  -h, --help      print this help and exit");
@@ -441,14 +486,53 @@ mod tests {
     }
 
     #[test]
-    fn pair_and_revoke_and_select_parse() {
+    fn pair_new_needs_nothing_else() {
         assert_eq!(
             parsed(&["pair", "new"]).command,
             Command::Pair(PairArgs {
                 action: PairAction::New,
-                code: None
+                code: None,
+                name: None,
+                public_key: None,
             })
         );
+    }
+
+    #[test]
+    fn pair_accept_carries_code_name_and_key() {
+        let inv = parsed(&[
+            "pair",
+            "accept",
+            "123-456",
+            "--name",
+            "Quest 3",
+            "--public-key",
+            "aabbcc",
+        ]);
+        match inv.command {
+            Command::Pair(a) => {
+                assert_eq!(a.action, PairAction::Accept);
+                assert_eq!(a.code.as_deref(), Some("123-456"));
+                assert_eq!(a.name.as_deref(), Some("Quest 3"));
+                assert_eq!(a.public_key.as_deref(), Some("aabbcc"));
+            }
+            other => panic!("expected pair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pair_accept_without_required_flags_is_a_usage_error() {
+        let bad = |list: &[&str]| parse_args(&args(list)).is_err();
+        assert!(bad(&["pair", "accept"]), "needs a code");
+        assert!(bad(&["pair", "accept", "123-456"]), "needs a name and key");
+        assert!(
+            bad(&["pair", "accept", "123-456", "--name", "Quest"]),
+            "needs a public key"
+        );
+    }
+
+    #[test]
+    fn revoke_and_select_parse() {
         match parsed(&["revoke", "abc123"]).command {
             Command::Revoke(a) => assert_eq!(a.device, "abc123"),
             other => panic!("expected revoke, got {other:?}"),

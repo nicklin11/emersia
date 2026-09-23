@@ -24,3 +24,11 @@ wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 
 emersia-protocol = { path = "../emersia-protocol" }
+# `static_secrets` is required for long-term device identity keys (ADR 0006).
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+chacha20poly1305 = "0.11"
+hkdf = "0.13"
+sha2 = "0.11"
+getrandom = "0.4"
+hex = "0.4"
+aead = "0.6"
