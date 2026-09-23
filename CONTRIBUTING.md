@@ -32,7 +32,7 @@ in `docs/adr/`:
 
 ## Labels & project board
 
-The [project board](https://github.com/users/nicklin11/projects) tracks work:
+The [project board](https://github.com/users/nicklin11/projects/4) tracks work:
 
 - New issues/PRs are added automatically (Status = **Todo**).
 - Add the `status: in-progress` label (or assign the issue) → **In Progress**.
