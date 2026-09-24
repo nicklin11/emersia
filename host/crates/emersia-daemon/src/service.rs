@@ -27,14 +27,6 @@ use crate::pairing::{PairingDb, PairingError};
 use crate::transport::udp::HostEndpoint;
 use crate::transport::VIDEO_CLOCK_HZ;
 
-/// A minimal copy of a paired device, for the transport authorizer.
-#[derive(Debug, Clone)]
-pub struct DeviceSnapshot {
-    pub id: String,
-    pub public_key: String,
-    pub revoked: bool,
-}
-
 /// Decode a hex device id back to bytes.
 fn decode_device_id(hex_str: &str) -> Option<[u8; 8]> {
     if hex_str.len() != 16 {
@@ -87,6 +79,16 @@ struct Inner {
     /// Devices revoked since the engine last drained; the engine disconnects
     /// them, which is how "revoke kills an active session" is honoured.
     revoked_pending: Vec<[u8; 8]>,
+    /// Encrypted packets handed to the transport since start.
+    encoded_packets: u64,
+    /// The ffmpeg encoder currently in use, for status reporting.
+    encoder_name: Option<String>,
+    /// True when the encoder in use is the software fallback.
+    encoder_software: bool,
+    /// Frames handed to the encoder.
+    encoder_frames_in: u64,
+    /// Access units the encoder has produced.
+    encoder_frames_out: u64,
 }
 
 /// Shared control-plane state. Cheap to clone via `Arc`; the Wayland machinery
@@ -137,24 +139,34 @@ impl Service {
         Arc::new(Self::new(db, &host_hex))
     }
 
-    fn lock_pairing(&self) -> std::sync::MutexGuard<'_, PairingDb> {
+    pub(crate) fn lock_pairing(&self) -> std::sync::MutexGuard<'_, PairingDb> {
         self.pairing.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Copy of the device table for the transport's default-deny check.
-    ///
-    /// The closure passed to the transport must not borrow the service (the
-    /// engine holds it), so we hand over an owned snapshot instead.
-    pub fn clone_pairing_snapshot(&self) -> Vec<DeviceSnapshot> {
-        self.lock_pairing()
-            .devices()
-            .into_iter()
-            .map(|d| DeviceSnapshot {
-                id: d.id,
-                public_key: d.public_key,
-                revoked: d.revoked,
-            })
-            .collect()
+    /// Record that `count` encrypted packets were shipped.
+    pub fn record_encoded(&self, count: u32) {
+        let mut inner = self.lock();
+        inner.encoded_packets += u64::from(count);
+    }
+
+    /// Report the encoder in use and its frame counters.
+    pub fn set_encoder(
+        &self,
+        name: Option<String>,
+        software: bool,
+        frames_in: u64,
+        frames_out: u64,
+    ) {
+        let mut inner = self.lock();
+        inner.encoder_name = name;
+        inner.encoder_software = software;
+        inner.encoder_frames_in = frames_in;
+        inner.encoder_frames_out = frames_out;
+    }
+
+    /// The frame rate capture is actually achieving.
+    pub fn measured_fps(&self) -> f64 {
+        self.lock().stats.measured_fps
     }
 
     /// Record how many devices are connected to the streaming endpoint.
@@ -420,6 +432,11 @@ impl Service {
             "measured_fps": round2(inner.stats.measured_fps),
             "connected_devices": inner.stream_peers,
             "paired_devices": paired_devices,
+            "encoder": inner.encoder_name,
+            "encoder_software": inner.encoder_software,
+            "encoder_frames_in": inner.encoder_frames_in,
+            "encoder_frames_out": inner.encoder_frames_out,
+            "encoded_packets": inner.encoded_packets,
             "last_error": inner.last_error,
             "protocol_version": PROTOCOL_VERSION,
             "host_public_key": self.host_public_key,
@@ -449,6 +466,17 @@ pub struct Engine {
     state: capture::State,
     /// Streaming endpoint; bound even when idle so a device can pair and wait.
     transport: Option<HostEndpoint>,
+    /// Video encoder; started on the first streamed frame so the capture size
+    /// and the encoder configuration are known before anything is spawned.
+    encoder: Option<crate::encoder::Encoder>,
+    /// Encoder selection requested by the user.
+    encoder_choice: crate::encoder::EncoderChoice,
+    /// Bitrate requested for the stream.
+    bitrate: u32,
+    /// The codec in force, once an encoder exists.
+    codec: crate::codec::Codec,
+    /// Rolling estimate of the capture rate actually being achieved.
+    measured_fps: f64,
     output: wayland_client::protocol::wl_output::WlOutput,
     transform: wayland_client::protocol::wl_output::Transform,
     backend: Backend,
@@ -481,6 +509,96 @@ impl Engine {
     /// The streaming endpoint, once bound.
     pub fn transport(&self) -> Option<&HostEndpoint> {
         self.transport.as_ref()
+    }
+
+    /// Choose the encoder family and bitrate. Does not start anything: the
+    /// encoder is created on the first frame, when the capture geometry is
+    /// known and an odd resolution can be rejected with a clear message.
+    pub fn with_encoder(
+        mut self,
+        choice: crate::encoder::EncoderChoice,
+        bitrate: Option<u32>,
+    ) -> Self {
+        self.encoder_choice = choice;
+        if let Some(b) = bitrate {
+            self.bitrate = b;
+        }
+        self
+    }
+
+    /// Record how long the last capture took, to estimate the real frame rate.
+    fn note_capture(&mut self, since_last: Duration) {
+        let instant = since_last.as_secs_f64();
+        if instant <= 0.0 {
+            return;
+        }
+        let sample = 1.0 / instant;
+        // Light smoothing: enough to stop one slow frame from reconfiguring
+        // the encoder, not so much that a real change is missed.
+        self.measured_fps = if self.measured_fps <= 0.0 {
+            sample
+        } else {
+            self.measured_fps * 0.8 + sample * 0.2
+        };
+    }
+
+    /// The encoder in use, if one has been started.
+    #[allow(dead_code)]
+    pub fn encoder(&self) -> Option<&crate::encoder::Encoder> {
+        self.encoder.as_ref()
+    }
+
+    /// Start the encoder for a given capture geometry.
+    ///
+    /// `target_fps` is what the user asked for; `measured_fps` is what capture
+    /// is actually delivering. The encoder is told the **measured** rate,
+    /// because its clock is derived from the declared input rate: telling it
+    /// 60 fps while frames arrive at 2.5 makes every duration it computes 24x
+    /// too long, including the keyframe interval.
+    fn ensure_encoder(
+        &mut self,
+        width: u32,
+        height: u32,
+        target_fps: u32,
+        measured_fps: f64,
+    ) -> Result<bool, crate::encoder::EncoderError> {
+        // Report a sane rate: never zero, never above what was asked for.
+        let effective = if measured_fps >= 1.0 {
+            (measured_fps.round() as u32).clamp(1, target_fps.max(1))
+        } else {
+            target_fps.max(1)
+        };
+        if let Some(enc) = &self.encoder {
+            // A geometry change means the running encoder is wrong for the
+            // new frames; restart rather than feed it mismatched bytes.
+            if enc.config().width != width || enc.config().height != height {
+                self.encoder = None;
+            } else if (enc.config().fps as i64 - effective as i64).abs()
+                > (effective as i64 / 4).max(1)
+            {
+                // The delivered rate moved far enough that the encoder's
+                // timing is now wrong. Restarting also forces a keyframe,
+                // which is convenient rather than incidental.
+                self.encoder = None;
+            } else {
+                return Ok(true);
+            }
+        }
+        let config = crate::encoder::EncoderConfig {
+            choice: self.encoder_choice,
+            codec: self.codec,
+            bitrate: self.bitrate,
+            // A 2-second GOP, counted in frames at the rate we are actually
+            // achieving, so it stays 2 seconds whatever that rate is.
+            gop: effective.saturating_mul(2).max(1),
+            fps: effective,
+            width,
+            height,
+        };
+        let encoder = crate::encoder::Encoder::start(config)?;
+        self.codec = encoder.candidate().codec;
+        self.encoder = Some(encoder);
+        Ok(true)
     }
 
     pub fn discover(pref: BackendPref) -> anyhow::Result<Self> {
@@ -523,6 +641,11 @@ impl Engine {
             queue,
             state,
             transport: None,
+            encoder: None,
+            encoder_choice: crate::encoder::EncoderChoice::Auto,
+            bitrate: crate::encoder::EncoderConfig::default().bitrate,
+            codec: crate::codec::Codec::H264,
+            measured_fps: 0.0,
             output,
             transform,
             backend,
@@ -556,6 +679,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
     service.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
     let mut last_frame = Instant::now();
     let mut timestamp: u32 = 0;
+    let mut last_peers = 0usize;
 
     while !service.is_shutting_down() && !crate::signal_received() {
         // Always service the transport so a device can pair and connect even
@@ -570,16 +694,42 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                     );
                 }
             }
-            let pairing = service.clone_pairing_snapshot();
-            let mut allowed = move |id: &[u8; 8], pubkey: &[u8; 32]| {
-                pairing.iter().any(|d| {
-                    d.id == hex::encode(id)
-                        && d.public_key.eq_ignore_ascii_case(&hex::encode(pubkey))
-                        && !d.revoked
+            // The authorizer reads the trust store at the moment of the
+            // decision rather than from a snapshot taken at the top of the
+            // loop.
+            //
+            // A snapshot is stale for up to a whole engine iteration (a few
+            // hundred ms), and a device that pairs and immediately connects
+            // lands squarely in that window: it was refused as unpaired, and
+            // because a client sends `init` only once, the connection failed
+            // until the user retried. The lock is taken per handshake, not per
+            // frame, so the cost is irrelevant next to the correctness.
+            let mut allowed = |id: &[u8; 8], pubkey: &[u8; 32]| {
+                let got_id = hex::encode(id);
+                let got_key = hex::encode(pubkey);
+                service.lock_pairing().devices().iter().any(|d| {
+                    d.id == got_id && d.public_key.eq_ignore_ascii_case(&got_key) && !d.revoked
                 })
             };
-            let _ = transport.pump(16, &mut allowed);
-            service.set_stream_peers(transport.peer_count());
+            if let Err(e) = transport.pump(16, &mut allowed) {
+                eprintln!("emersia-daemon: stream pump error: {e}");
+            }
+            let peers = transport.peer_count();
+            if peers > last_peers {
+                // A device just connected. It has no prior frames, so it cannot
+                // decode anything until a keyframe arrives. Dropping the
+                // encoder makes the next frame an IDR, which is the only way to
+                // force one over a raw ffmpeg pipe — there is no control
+                // channel. Costs one encoder restart per connection.
+                if last_peers > 0 || engine.encoder.is_some() {
+                    eprintln!(
+                        "emersia-daemon: new device connected, restarting encoder for a keyframe"
+                    );
+                }
+                engine.encoder = None;
+            }
+            last_peers = peers;
+            service.set_stream_peers(peers);
         }
 
         if !service.is_streaming() {
@@ -590,22 +740,101 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
         let started = Instant::now();
         match engine.capture_once() {
             Ok(frame) => {
-                if let Some(transport) = engine.transport.as_mut() {
-                    if transport.peer_count() > 0 {
-                        // 90 kHz presentation clock, per ADR 0003.
-                        timestamp = timestamp.wrapping_add(
-                            ((VIDEO_CLOCK_HZ as u64 / service.fps_target().max(1) as u64) as u32)
-                                .max(1),
-                        );
-                        let preview = downscale_rgba(&frame, PREVIEW_MAX_WIDTH);
-                        for id in service.connected_device_ids() {
-                            let _ = transport.send_frame(
-                                &id,
-                                timestamp,
-                                true,
-                                crate::transport::PAYLOAD_TYPE_RAW,
-                                &preview,
+                if engine
+                    .transport
+                    .as_ref()
+                    .is_some_and(|t| t.peer_count() > 0)
+                {
+                    // Start or restart the encoder for this geometry. A failure
+                    // is reported but does not stop the daemon: the user may be
+                    // able to fix it by choosing another encoder from the CLI.
+                    match engine.ensure_encoder(
+                        frame.width,
+                        frame.height,
+                        service.fps_target().max(1),
+                        service.measured_fps().max(engine.measured_fps),
+                    ) {
+                        Ok(true) => {
+                            // 90 kHz presentation clock, per ADR 0003.
+                            timestamp = timestamp.wrapping_add(
+                                ((VIDEO_CLOCK_HZ as u64 / service.fps_target().max(1) as u64)
+                                    as u32)
+                                    .max(1),
                             );
+                            if let Some(enc) = engine.encoder.as_mut() {
+                                if let Err(e) = enc.encode(&frame.rgba) {
+                                    service.record_error(format!("encode: {e}"));
+                                    eprintln!("emersia-daemon: encode failed: {e}");
+                                    engine.encoder = None;
+                                }
+                            }
+                            // Ship every access unit that is ready. Each packet
+                            // carries the parameter sets in-band (ADR 0003), so
+                            // a device joining mid-stream can decode at once.
+                            let ids = service.connected_device_ids();
+                            let mut shipped = 0u32;
+                            while let Some(au) = engine
+                                .encoder
+                                .as_mut()
+                                .and_then(crate::encoder::Encoder::next_access_unit)
+                            {
+                                let pt = au.codec_payload_type();
+                                let keyframe = au.keyframe;
+                                // Prefix the parameter sets so a delta packet is
+                                // still self-describing.
+                                let payload = engine
+                                    .encoder
+                                    .as_ref()
+                                    .map(|e| e.payload_for(&au))
+                                    .unwrap_or_else(|| au.annexb.clone());
+                                for id in &ids {
+                                    match engine.transport.as_mut().map(|t| {
+                                        t.send_frame(id, timestamp, keyframe, pt, &payload)
+                                    }) {
+                                        Some(Ok(_)) => shipped += 1,
+                                        Some(Err(e)) => {
+                                            eprintln!(
+                                                "emersia-daemon: send failed: {e} (id {})",
+                                                hex::encode(id)
+                                            );
+                                        }
+                                        None => eprintln!("emersia-daemon: no transport"),
+                                    }
+                                }
+                            }
+                            if shipped > 0 {
+                                service.record_encoded(shipped);
+                            }
+                            if let Some(enc) = engine.encoder.as_ref() {
+                                service.set_encoder(
+                                    Some(enc.candidate().name.clone()),
+                                    enc.is_software(),
+                                    enc.frames_in(),
+                                    enc.frames_out(),
+                                );
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            // A missing ffmpeg is a setup problem, not a
+                            // stream problem, and it is worth saying so plainly
+                            // rather than logging it once per frame.
+                            if e.ffmpeg_missing() {
+                                service.record_error(
+                                    "streaming needs the ffmpeg binary, which was not found on PATH"
+                                        .to_string(),
+                                );
+                                eprintln!(
+                                    "emersia-daemon: streaming requires ffmpeg on PATH. \
+                                     Install it (e.g. `apt install ffmpeg`, `pacman -S ffmpeg`) \
+                                     and restart the daemon; capture and the control socket keep \
+                                     working without it."
+                                );
+                                service.request_shutdown();
+                            } else {
+                                service.record_error(format!("encoder: {e}"));
+                                eprintln!("emersia-daemon: encoder unavailable: {e}");
+                            }
                         }
                     }
                 }
@@ -616,6 +845,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                     std::thread::sleep(interval - elapsed);
                 }
                 service.record_frame(started.elapsed(), last_frame.elapsed());
+                engine.note_capture(last_frame.elapsed());
                 last_frame = Instant::now();
             }
             Err(err) => {
@@ -624,29 +854,6 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
             }
         }
     }
-}
-
-/// Width of the preview shipped to a device before the encoder exists.
-const PREVIEW_MAX_WIDTH: u32 = 320;
-
-/// Nearest-neighbour downscale of an RGBA frame. No dependency, and adequate
-/// for proving the transport path; the encoder will replace this entirely.
-fn downscale_rgba(frame: &crate::frame::Frame, max_width: u32) -> Vec<u8> {
-    if frame.width <= max_width {
-        return frame.rgba.clone();
-    }
-    let out_w = max_width;
-    let out_h = ((frame.height as u64 * out_w as u64) / frame.width as u64).max(1) as u32;
-    let mut out = Vec::with_capacity((out_w * out_h * 4) as usize);
-    for y in 0..out_h {
-        let sy = ((y as u64 * frame.height as u64) / out_h as u64) as u32;
-        for x in 0..out_w {
-            let sx = ((x as u64 * frame.width as u64) / out_w as u64) as u32;
-            let si = ((sy * frame.width + sx) * 4) as usize;
-            out.extend_from_slice(&frame.rgba[si..si + 4]);
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -840,6 +1047,97 @@ mod tests {
         let devices = listed["devices"].as_array().unwrap();
         assert_eq!(devices[0]["name"], "Quest 3");
         assert_eq!(devices[0]["revoked"], false);
+    }
+
+    /// A device that pairs and connects immediately must be accepted.
+    ///
+    /// The engine used to copy the device table once per loop iteration and
+    /// answer handshakes from that copy, so a device paired within the
+    /// iteration's window was refused as unpaired. Since a client sends its
+    /// `init` exactly once, the connection then failed until the user retried.
+    /// The authorizer now reads the trust store at the moment it decides.
+    #[test]
+    fn a_device_paired_after_the_authorizer_existed_is_accepted() {
+        let s = service_with_outputs();
+        // Take the authorizer's view *before* the device exists, the way a
+        // long-lived closure would have.
+        let existing = s.lock_pairing().devices();
+        assert!(existing.is_empty(), "nothing paired yet");
+
+        let minted = ok_payload(s.handle(req(
+            "1",
+            Command::Pair(emersia_protocol::PairArgs {
+                action: emersia_protocol::PairAction::New,
+                code: None,
+                name: None,
+                public_key: None,
+            }),
+        )));
+        let code = minted["code"].as_str().unwrap().to_string();
+        let identity = crate::crypto::DeviceIdentity::generate().unwrap();
+        let paired = ok_payload(s.handle(req(
+            "2",
+            Command::Pair(emersia_protocol::PairArgs {
+                action: emersia_protocol::PairAction::Accept,
+                code: Some(code),
+                name: Some("Quest 3".into()),
+                public_key: Some(identity.public_key_hex()),
+            }),
+        )));
+        let id = paired["device"].as_str().unwrap();
+
+        // The decision reads current state, not the pre-pairing copy.
+        let db = s.lock_pairing();
+        let authorized = db.devices().iter().any(|d| {
+            d.id == id
+                && d.public_key
+                    .eq_ignore_ascii_case(&identity.public_key_hex())
+                && !d.revoked
+        });
+        assert!(
+            authorized,
+            "a device paired after the authorizer was created must be accepted"
+        );
+    }
+
+    /// A revoked device must be refused even if it presents valid credentials.
+    #[test]
+    fn a_revoked_device_is_refused_even_with_the_right_key() {
+        let s = service_with_outputs();
+        let minted = ok_payload(s.handle(req(
+            "1",
+            Command::Pair(emersia_protocol::PairArgs {
+                action: emersia_protocol::PairAction::New,
+                code: None,
+                name: None,
+                public_key: None,
+            }),
+        )));
+        let code = minted["code"].as_str().unwrap().to_string();
+        let identity = crate::crypto::DeviceIdentity::generate().unwrap();
+        let paired = ok_payload(s.handle(req(
+            "2",
+            Command::Pair(emersia_protocol::PairArgs {
+                action: emersia_protocol::PairAction::Accept,
+                code: Some(code),
+                name: Some("Quest 3".into()),
+                public_key: Some(identity.public_key_hex()),
+            }),
+        )));
+        let id = paired["device"].as_str().unwrap().to_string();
+        ok_payload(s.handle(req(
+            "3",
+            Command::Revoke(emersia_protocol::RevokeArgs { device: id.clone() }),
+        )));
+
+        let db = s.lock_pairing();
+        let authorized = db.devices().iter().any(|d| {
+            d.id == id
+                && d.public_key
+                    .eq_ignore_ascii_case(&identity.public_key_hex())
+                && !d.revoked
+        });
+        assert!(!authorized, "a revoked device must never be authorized");
     }
 
     #[test]

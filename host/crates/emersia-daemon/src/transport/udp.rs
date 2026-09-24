@@ -389,7 +389,8 @@ mod tests {
         }
     }
 
-    use crate::transport::{Reassembler, PAYLOAD_TYPE_RAW};
+    use crate::codec::Codec;
+    use crate::transport::Reassembler;
 
     fn dev_id(n: u8) -> [u8; DEVICE_ID_LEN] {
         let mut out = [0u8; DEVICE_ID_LEN];
@@ -439,7 +440,7 @@ mod tests {
         let (mut host, _client, id) = established();
         assert_eq!(host.peer_count(), 1);
         assert!(host
-            .send_frame(&id, 0, true, PAYLOAD_TYPE_RAW, b"hello")
+            .send_frame(&id, 0, true, Codec::H264.payload_type(), b"hello")
             .is_ok());
     }
 
@@ -491,7 +492,7 @@ mod tests {
         let (mut host, mut client, id) = established();
         let payload = vec![0xABu8; 900];
         let datagrams = host
-            .send_frame(&id, 90_000, true, PAYLOAD_TYPE_RAW, &payload)
+            .send_frame(&id, 90_000, true, Codec::H264.payload_type(), &payload)
             .unwrap();
         assert_eq!(datagrams, 1, "a small payload fits one datagram");
         let (header, got) = client
@@ -511,7 +512,7 @@ mod tests {
         // Comfortably more than one datagram's payload budget.
         let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
         let datagrams = host
-            .send_frame(&id, 90_000, true, PAYLOAD_TYPE_RAW, &payload)
+            .send_frame(&id, 90_000, true, Codec::H264.payload_type(), &payload)
             .unwrap();
         assert!(datagrams > 1, "expected fragmentation, got {datagrams}");
 
@@ -534,7 +535,7 @@ mod tests {
         let (mut host, _client, _id) = established();
         let ghost = dev_id(99);
         assert!(matches!(
-            host.send_frame(&ghost, 0, false, PAYLOAD_TYPE_RAW, b"x"),
+            host.send_frame(&ghost, 0, false, Codec::H264.payload_type(), b"x"),
             Err(TransportError::Dropped(_))
         ));
     }
@@ -546,7 +547,7 @@ mod tests {
         assert!(host.disconnect(&id), "revoke should drop the live peer");
         assert_eq!(host.peer_count(), 0);
         assert!(matches!(
-            host.send_frame(&id, 0, false, PAYLOAD_TYPE_RAW, b"x"),
+            host.send_frame(&id, 0, false, Codec::H264.payload_type(), b"x"),
             Err(TransportError::Dropped(_))
         ));
     }
@@ -554,7 +555,7 @@ mod tests {
     #[test]
     fn replayed_record_is_dropped_by_the_receiver() {
         let (mut host, mut client, id) = established();
-        host.send_frame(&id, 0, false, PAYLOAD_TYPE_RAW, b"one")
+        host.send_frame(&id, 0, false, Codec::H264.payload_type(), b"one")
             .unwrap();
         client.recv_record(Duration::from_secs(2)).unwrap();
 
@@ -562,7 +563,8 @@ mod tests {
         let mut packet = Vec::new();
         packet.push(packet_type::DATA);
         packet.extend_from_slice(&0u32.to_be_bytes());
-        let record = build_record(0, 0, 0, false, PAYLOAD_TYPE_RAW, b"one", 0, 1).unwrap();
+        let record =
+            build_record(0, 0, 0, false, Codec::H264.payload_type(), b"one", 0, 1).unwrap();
         let sealed = {
             let session = client.session().unwrap();
             crate::crypto::seal(session, crate::crypto::Direction::HostToDevice, 0, &record)

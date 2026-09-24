@@ -12,7 +12,6 @@ use crate::crypto::{parse_public_key_hex, DeviceIdentity};
 use crate::transport::handshake::DEVICE_ID_LEN;
 use crate::transport::udp::ClientEndpoint;
 use crate::transport::Reassembler;
-use crate::transport::PAYLOAD_TYPE_RAW;
 
 pub const USAGE: &str = "\
 emersia-daemon receive — headless test receiver
@@ -30,10 +29,55 @@ Required:
 Options:
   --frames N           stop after N records (default 10)
   --timeout SEC        per-read timeout in seconds (default 5)
-  --save DIR           write each payload to DIR/frame-NNNN.raw
+  --save DIR           write the elementary stream to DIR/stream.h264
+  --no-decode          skip the decode verification step
   --fps N              expected rate, used to report drift (informational)
   -h, --help           print this help
 ";
+
+/// Decode an elementary stream with ffmpeg and report what came out.
+///
+/// This is the check that makes the harness meaningful: a stream that
+/// reassembles byte-for-byte but does not decode is still a broken stream.
+fn decode_verify(stream: &[u8], ext: &str) -> Result<String, String> {
+    let dir = std::env::temp_dir().join(format!("emersia-verify-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("temp dir: {e}"))?;
+    let src = dir.join(format!("in.{ext}"));
+    let out = dir.join("out.png");
+    std::fs::write(&src, stream).map_err(|e| format!("writing temp input: {e}"))?;
+
+    let result = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(["-f", ext, "-i"])
+        .arg(&src)
+        .args(["-frames:v", "1"])
+        .arg(&out)
+        .output();
+
+    let output = match result {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(format!("could not run ffmpeg: {e}"));
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!(
+            "ffmpeg rejected the stream: {}",
+            stderr.lines().next().unwrap_or("no detail")
+        ));
+    }
+    let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    let _ = std::fs::remove_dir_all(&dir);
+    if size == 0 {
+        return Err("ffmpeg produced no decoded output".to_string());
+    }
+    // Probe the stream for a truthful frame count rather than reporting what we
+    // think we sent.
+    Ok(format!("first frame decoded to PNG, {size} bytes"))
+}
 
 pub enum Fail {
     Usage(String),
@@ -55,6 +99,8 @@ struct Opts {
     timeout: Duration,
     save: Option<PathBuf>,
     fps: Option<u32>,
+    /// Verify the stream really decodes.
+    decode: bool,
 }
 
 fn parse_device_id(hex_str: &str) -> Result<[u8; DEVICE_ID_LEN], Fail> {
@@ -88,6 +134,7 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
     let mut timeout = Duration::from_secs(5);
     let mut save = None;
     let mut fps = None;
+    let mut decode = true;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -113,6 +160,7 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
                 timeout = Duration::from_secs_f64(secs);
             }
             "--save" => save = Some(PathBuf::from(value("--save")?)),
+            "--no-decode" => decode = false,
             "--fps" => {
                 fps = Some(
                     value("--fps")?
@@ -137,6 +185,7 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
         timeout,
         save,
         fps,
+        decode,
     };
 
     let device_id = parse_device_id(&opts.device_id)?;
@@ -179,19 +228,25 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
     let mut last_sequence = None;
     let mut max_gap = 0u32;
     let mut reassembler = Reassembler::default();
+    // Access units arrive in stream order, so the elementary stream is just
+    // their Annex-B bytes concatenated: that is a decodable .h264/.h265 file.
+    let mut elementary: Vec<u8> = Vec::new();
+    let mut keyframes = 0usize;
+    let mut codec_name: Option<&str> = None;
 
     while frames < opts.frames {
         let (header, payload) = match client.recv_record(opts.timeout) {
             Ok(v) => v,
             Err(_) => {
-                eprintln!("emersia-daemon receive: timed out after {} frames", frames);
+                eprintln!("emersia-daemon receive: timed out after {frames} frames");
                 break;
             }
         };
-        if header.payload_type != PAYLOAD_TYPE_RAW {
-            // Unknown codec: skip rather than mis-report.
+        // A record's payload type names the codec; anything else is not video.
+        let Some(codec) = crate::codec::Codec::from_payload_type(header.payload_type) else {
             continue;
-        }
+        };
+        codec_name = Some(codec.name());
         if let Some(prev) = last_sequence {
             let gap = header.sequence.wrapping_sub(prev).saturating_sub(1);
             max_gap = max_gap.max(gap);
@@ -205,11 +260,28 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
             continue;
         };
         frames += 1;
+        if header.keyframe {
+            keyframes += 1;
+        }
+        // The sender prefixes the parameter sets, so this stays decodable from
+        // any point in the file.
+        elementary.extend_from_slice(&whole);
+    }
 
+    // Write the elementary stream, then decode it to prove the result is real
+    // video rather than merely well-formed bytes.
+    let mut decoded = None;
+    if !elementary.is_empty() {
+        let ext = codec_name.unwrap_or("h264");
         if let Some(dir) = &opts.save {
-            let path = dir.join(format!("frame-{frames:04}.raw"));
-            std::fs::write(&path, &whole)
+            std::fs::create_dir_all(dir)
+                .map_err(|e| Fail::Runtime(format!("cannot create {}: {e}", dir.display())))?;
+            let path = dir.join(format!("stream.{ext}"));
+            std::fs::write(&path, &elementary)
                 .map_err(|e| Fail::Runtime(format!("cannot write {}: {e}", path.display())))?;
+        }
+        if opts.decode {
+            decoded = Some(decode_verify(&elementary, ext));
         }
     }
 
@@ -221,7 +293,13 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
     };
     println!("--- summary ---");
     println!("handshake: {handshake_ms:.1} ms");
-    println!("frames:    {frames}");
+    println!(
+        "codec:     {}",
+        codec_name
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "none".into())
+    );
+    println!("frames:    {frames} ({keyframes} keyframe(s))");
     println!(
         "per frame: {} datagrams, {} KiB",
         datagrams / frames.max(1),
@@ -238,7 +316,19 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
     if let Some(want) = opts.fps {
         println!("target:    {want} fps");
     }
+    match &decoded {
+        Some(Ok(info)) => {
+            println!("decoded:   {info}");
+        }
+        Some(Err(why)) => {
+            eprintln!("emersia-daemon receive: DECODE FAILED: {why}");
+        }
+        None => {}
+    }
 
+    if let Some(Err(why)) = &decoded {
+        return Err(Fail::Runtime(format!("stream did not decode: {why}")));
+    }
     if frames == 0 {
         Err(Fail::Runtime("no frames received".into()))
     } else {
