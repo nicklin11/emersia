@@ -232,40 +232,69 @@ pub fn payload_chunks(payload: &[u8]) -> Vec<&[u8]> {
 }
 
 /// Reassembles fragmented records back into whole frames.
+#[derive(Debug)]
+struct PendingFrame {
+    frame_sequence: u32,
+    frag_count: u16,
+    fragments: Vec<Option<Vec<u8>>>,
+    received: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct Reassembler {
-    current: Option<(u32, Vec<u8>, u16, u16)>,
+    current: Option<PendingFrame>,
 }
 
 impl Reassembler {
     /// Feed one record; yields a complete frame when the last fragment lands.
     pub fn push(&mut self, header: FrameHeader, payload: &[u8]) -> Option<Vec<u8>> {
+        if header.frag_count == 0 || header.frag_index >= header.frag_count {
+            return None;
+        }
         if header.frag_count == 1 {
+            self.current = None;
             return Some(payload.to_vec());
         }
-        match &mut self.current {
-            Some((seq, buf, next, _)) if *seq == header.frame_sequence => {
-                buf.extend_from_slice(payload);
-                *next += 1;
-                if *next >= header.frag_count {
-                    let (_, done, _, _) = self.current.take()?;
-                    return Some(done);
-                }
-                None
-            }
-            // A new frame supersedes any incomplete one.
-            _ => {
-                let mut buf = Vec::new();
-                buf.extend_from_slice(payload);
-                if header.frag_index != 0 {
-                    // Out-of-order start: drop until the next clean frame.
-                    self.current = None;
-                    return None;
-                }
-                self.current = Some((header.frame_sequence, buf, 1, header.frag_count));
-                None
-            }
+
+        // A fragment with a different count cannot belong to the frame already
+        // being assembled. Keep the valid partial frame and reject this one.
+        if self.current.as_ref().is_some_and(|current| {
+            current.frame_sequence == header.frame_sequence
+                && current.frag_count != header.frag_count
+        }) {
+            return None;
         }
+
+        let start_new_frame = self
+            .current
+            .as_ref()
+            .is_none_or(|current| current.frame_sequence != header.frame_sequence);
+        if start_new_frame {
+            self.current = Some(PendingFrame {
+                frame_sequence: header.frame_sequence,
+                frag_count: header.frag_count,
+                fragments: vec![None; header.frag_count as usize],
+                received: 0,
+            });
+        }
+
+        let current = self.current.as_mut().expect("pending frame just ensured");
+        let index = header.frag_index as usize;
+        if current.fragments[index].is_some() {
+            return None;
+        }
+        current.fragments[index] = Some(payload.to_vec());
+        current.received += 1;
+        if current.received < current.frag_count as usize {
+            return None;
+        }
+
+        let current = self.current.take()?;
+        let mut frame = Vec::new();
+        for fragment in current.fragments.into_iter().flatten() {
+            frame.extend_from_slice(&fragment);
+        }
+        Some(frame)
     }
 }
 
@@ -407,6 +436,34 @@ mod tests {
         assert_eq!(header.sequence, 5);
         assert!(header.keyframe);
         assert_eq!(parsed, payload.as_slice());
+    }
+
+    #[test]
+    fn reordered_fragments_are_reassembled_by_index() {
+        let fragments = [b"first".to_vec(), b"second".to_vec(), b"third".to_vec()];
+        let expected = b"firstsecondthird".to_vec();
+
+        for order in [[0usize, 2, 1], [2, 0, 1]] {
+            let mut reassembler = Reassembler::default();
+            let mut complete = None;
+            for index in order {
+                let header = FrameHeader {
+                    version: 1,
+                    keyframe: true,
+                    payload_type: Codec::H264.payload_type(),
+                    sequence: index as u32,
+                    frame_sequence: 7,
+                    timestamp: 90_000,
+                    payload_len: fragments[index].len() as u16,
+                    frag_index: index as u16,
+                    frag_count: fragments.len() as u16,
+                };
+                if let Some(frame) = reassembler.push(header, &fragments[index]) {
+                    complete = Some(frame);
+                }
+            }
+            assert_eq!(complete, Some(expected.clone()), "order {order:?}");
+        }
     }
 
     #[test]
