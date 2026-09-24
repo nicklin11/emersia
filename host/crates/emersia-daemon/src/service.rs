@@ -109,8 +109,10 @@ struct Inner {
     encoder_software: bool,
     /// Frames handed to the encoder.
     encoder_frames_in: u64,
-    /// Access units the encoder has produced.
+    /// Access units consumed from the encoder by the streaming loop.
     encoder_frames_out: u64,
+    /// Frames dropped because the encoder input queue was full.
+    encoder_frames_dropped: u64,
 }
 
 /// Shared control-plane state. Cheap to clone via `Arc`; the Wayland machinery
@@ -179,11 +181,25 @@ impl Service {
         frames_in: u64,
         frames_out: u64,
     ) {
+        self.set_encoder_with_drops(name, software, frames_in, frames_out, 0);
+    }
+
+    /// Report the encoder counters, including frames dropped by its bounded
+    /// input queue.
+    pub fn set_encoder_with_drops(
+        &self,
+        name: Option<String>,
+        software: bool,
+        frames_in: u64,
+        frames_out: u64,
+        frames_dropped: u64,
+    ) {
         let mut inner = self.lock();
         inner.encoder_name = name;
         inner.encoder_software = software;
         inner.encoder_frames_in = frames_in;
         inner.encoder_frames_out = frames_out;
+        inner.encoder_frames_dropped = frames_dropped;
     }
 
     /// The frame rate capture is actually achieving.
@@ -451,6 +467,7 @@ impl Service {
             "encoder_software": inner.encoder_software,
             "encoder_frames_in": inner.encoder_frames_in,
             "encoder_frames_out": inner.encoder_frames_out,
+            "encoder_frames_dropped": inner.encoder_frames_dropped,
             "encoded_packets": inner.encoded_packets,
             "last_error": inner.last_error,
             "protocol_version": PROTOCOL_VERSION,
@@ -809,6 +826,8 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                                     service.record_error(format!("encode: {e}"));
                                     eprintln!("emersia-daemon: encode failed: {e}");
                                     engine.encoder = None;
+                                    service.set_encoder(None, false, 0, 0);
+                                    continue;
                                 }
                             }
                             // Ship every access unit that is ready. Each packet
@@ -820,11 +839,24 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                                 .map(|transport| transport.peer_ids())
                                 .unwrap_or_default();
                             let mut shipped = 0u32;
-                            while let Some(au) = engine
+                            let mut output_failed = false;
+                            while let Some(next) = engine
                                 .encoder
                                 .as_mut()
-                                .and_then(crate::encoder::Encoder::next_access_unit)
+                                .map(|encoder| encoder.next_access_unit_result())
                             {
+                                let au = match next {
+                                    Ok(Some(au)) => au,
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        service.record_error(format!("encoder: {e}"));
+                                        eprintln!("emersia-daemon: encoder output failed: {e}");
+                                        engine.encoder = None;
+                                        service.set_encoder(None, false, 0, 0);
+                                        output_failed = true;
+                                        break;
+                                    }
+                                };
                                 let pt = au.codec_payload_type();
                                 let keyframe = au.keyframe;
                                 // Prefix the parameter sets so a delta packet is
@@ -849,15 +881,19 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                                     }
                                 }
                             }
+                            if output_failed {
+                                continue;
+                            }
                             if shipped > 0 {
                                 service.record_encoded(shipped);
                             }
                             if let Some(enc) = engine.encoder.as_ref() {
-                                service.set_encoder(
+                                service.set_encoder_with_drops(
                                     Some(enc.candidate().name.clone()),
                                     enc.is_software(),
                                     enc.frames_in(),
                                     enc.frames_out(),
+                                    enc.frames_dropped(),
                                 );
                             }
                         }
