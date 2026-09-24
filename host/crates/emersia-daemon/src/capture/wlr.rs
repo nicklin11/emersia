@@ -16,7 +16,7 @@ use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::{
 use crate::frame::{decode, flip_rows, untransform, Frame};
 use crate::shm::ShmBuffer;
 
-use super::{wait_until, State, CONSTRAINT_TIMEOUT, FRAME_TIMEOUT};
+use super::{wait_until, CaptureTimings, CapturedFrame, State, CONSTRAINT_TIMEOUT, FRAME_TIMEOUT};
 
 /// Capture one frame from `output` with `wlr-screencopy`.
 ///
@@ -27,7 +27,8 @@ pub fn capture(
     state: &mut State,
     output: &WlOutput,
     transform: wl_output::Transform,
-) -> anyhow::Result<Frame> {
+) -> anyhow::Result<CapturedFrame> {
+    let total_started = Instant::now();
     let qh = queue.handle();
     state.wlr.reset();
 
@@ -45,6 +46,7 @@ pub fn capture(
     // buffer description with `buffer` alone.
     let needs_buffer_done = frame.version() >= 3;
 
+    let constraints_started = Instant::now();
     wait_until(
         queue,
         state,
@@ -56,6 +58,7 @@ pub fn capture(
                 || s.wlr.dmabuf_only
         },
     )?;
+    let constraints = constraints_started.elapsed();
     if state.wlr.failed {
         bail!("the compositor failed the screencopy request");
     }
@@ -73,6 +76,7 @@ pub fn capture(
     let mut shm_buffer = ShmBuffer::create(&shm, &qh, width, height, stride, format)?;
 
     frame.copy(shm_buffer.buffer());
+    let frame_wait_started = Instant::now();
     wait_until(
         queue,
         state,
@@ -80,6 +84,7 @@ pub fn capture(
         "screencopy frame",
         |s| s.wlr.ready || s.wlr.failed,
     )?;
+    let frame_wait = frame_wait_started.elapsed();
 
     let y_invert = state.wlr.y_invert;
     frame.destroy();
@@ -87,13 +92,29 @@ pub fn capture(
         bail!("the compositor failed the screencopy");
     }
 
+    let shm_read_started = Instant::now();
     let data = shm_buffer.read_pixels(stride, height)?;
+    let shm_read = shm_read_started.elapsed();
+    let decode_started = Instant::now();
     let mut rgba = decode(format, width, height, stride, &data)?;
+    let decode = decode_started.elapsed();
+    let transform_started = Instant::now();
     if y_invert {
         rgba = flip_rows(&rgba, width, height);
     }
     let (rgba, out_w, out_h) = untransform(&rgba, width, height, transform);
-    Ok(Frame::new(out_w, out_h, rgba))
+    let transform = transform_started.elapsed();
+    Ok(CapturedFrame {
+        frame: Frame::new(out_w, out_h, rgba),
+        timings: CaptureTimings {
+            constraints,
+            frame_wait,
+            shm_read,
+            decode,
+            transform,
+            total: total_started.elapsed(),
+        },
+    })
 }
 
 impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {

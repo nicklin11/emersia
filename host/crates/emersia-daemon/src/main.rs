@@ -450,11 +450,13 @@ fn run_capture(opts: &CaptureOpts) -> anyhow::Result<()> {
     );
 
     let started = Instant::now();
-    let frame = match backend {
+    let captured = match backend {
         capture::Backend::Ext => capture::ext::capture(&mut queue, &mut state, &output)?,
         capture::Backend::Wlr => capture::wlr::capture(&mut queue, &mut state, &output, transform)?,
     };
     let elapsed = started.elapsed();
+    let frame = captured.frame;
+    let timings = captured.timings;
 
     frame.save(&opts.out).with_context(|| {
         format!(
@@ -464,6 +466,14 @@ fn run_capture(opts: &CaptureOpts) -> anyhow::Result<()> {
     })?;
     let written = std::fs::metadata(&opts.out).map(|m| m.len()).unwrap_or(0);
 
+    println!(
+        "capture phases: constraints {:.1} ms, frame_wait {:.1} ms, shm_read {:.1} ms, decode {:.1} ms, transform {:.1} ms",
+        timings.constraints.as_secs_f64() * 1000.0,
+        timings.frame_wait.as_secs_f64() * 1000.0,
+        timings.shm_read.as_secs_f64() * 1000.0,
+        timings.decode.as_secs_f64() * 1000.0,
+        timings.transform.as_secs_f64() * 1000.0,
+    );
     println!(
         "captured {}x{} RGBA in {:.1} ms via {}",
         frame.width,
