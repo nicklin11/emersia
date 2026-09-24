@@ -692,6 +692,12 @@ impl Encoder {
     /// The wire payload for one access unit: the parameter sets currently in
     /// force, then the picture (ADR 0003 — config repeated in every packet).
     pub fn payload_for(&self, au: &AccessUnit) -> Vec<u8> {
+        // A keyframe access unit already starts with the current parameter
+        // sets. Do not duplicate them on the wire; delta pictures still need
+        // the carried-forward prefix.
+        if au.keyframe && au.annexb.starts_with(&self.parameter_sets) {
+            return au.annexb.clone();
+        }
         let mut out = Vec::with_capacity(self.parameter_sets.len() + au.annexb.len());
         out.extend_from_slice(&self.parameter_sets);
         out.extend_from_slice(&au.annexb);
