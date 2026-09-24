@@ -416,9 +416,7 @@ impl AnnexBParser {
             }
             self.parameter_sets.extend_from_slice(&nal.annexb);
             if self.parameter_sets.len() > MAX_PARAMETER_SET_BYTES {
-                return Err(CodecError::TooManyParameterSets(
-                    self.parameter_sets.len(),
-                ));
+                return Err(CodecError::TooManyParameterSets(self.parameter_sets.len()));
             }
         }
         if nal.is_vcl(self.codec) {
