@@ -17,7 +17,10 @@ use wayland_protocols::ext::image_copy_capture::v1::client::{
 use crate::frame::{decode, untransform, Frame};
 use crate::shm::ShmBuffer;
 
-use super::{pick_shm_format, wait_until, State, CONSTRAINT_TIMEOUT, FRAME_TIMEOUT};
+use super::{
+    pick_shm_format, wait_until, CaptureTimings, CapturedFrame, State, CONSTRAINT_TIMEOUT,
+    FRAME_TIMEOUT,
+};
 
 /// Capture one frame from `output` with `ext-image-copy-capture`.
 ///
@@ -28,7 +31,8 @@ pub fn capture(
     queue: &mut EventQueue<State>,
     state: &mut State,
     output: &WlOutput,
-) -> anyhow::Result<Frame> {
+) -> anyhow::Result<CapturedFrame> {
+    let total_started = Instant::now();
     let qh = queue.handle();
     state.ext.reset();
 
@@ -49,6 +53,7 @@ pub fn capture(
     let session = copy_mgr.create_session(&source, Options::empty(), &qh, ());
 
     // 1. The compositor tells us what buffer it will accept.
+    let constraints_started = Instant::now();
     wait_until(
         queue,
         state,
@@ -56,6 +61,7 @@ pub fn capture(
         "capture constraints",
         |s| s.ext.constraints_done || s.ext.stopped,
     )?;
+    let constraints = constraints_started.elapsed();
     if state.ext.stopped {
         bail!("the compositor stopped the capture session before publishing constraints");
     }
@@ -72,6 +78,7 @@ pub fn capture(
     frame.damage_buffer(0, 0, width as i32, height as i32);
     frame.capture();
 
+    let frame_wait_started = Instant::now();
     wait_until(
         queue,
         state,
@@ -79,6 +86,7 @@ pub fn capture(
         "frame copy",
         |s| s.ext.frame_ready || s.ext.failure.is_some() || s.ext.stopped,
     )?;
+    let frame_wait = frame_wait_started.elapsed();
 
     let failure = state.ext.failure.clone();
     let transform = state.ext.transform.unwrap_or(wl_output::Transform::Normal);
@@ -94,10 +102,26 @@ pub fn capture(
     }
 
     // 3. Read back and convert to an upright RGBA image.
+    let shm_read_started = Instant::now();
     let data = shm_buffer.read_pixels(stride, height)?;
+    let shm_read = shm_read_started.elapsed();
+    let decode_started = Instant::now();
     let rgba = decode(format, width, height, stride, &data)?;
+    let decode = decode_started.elapsed();
+    let transform_started = Instant::now();
     let (rgba, out_w, out_h) = untransform(&rgba, width, height, transform);
-    Ok(Frame::new(out_w, out_h, rgba))
+    let transform = transform_started.elapsed();
+    Ok(CapturedFrame {
+        frame: Frame::new(out_w, out_h, rgba),
+        timings: CaptureTimings {
+            constraints,
+            frame_wait,
+            shm_read,
+            decode,
+            transform,
+            total: total_started.elapsed(),
+        },
+    })
 }
 
 impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {

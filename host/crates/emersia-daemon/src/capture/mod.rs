@@ -11,6 +11,8 @@ pub mod wlr;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _};
+
+use crate::frame::Frame;
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 use wayland_client::protocol::{
@@ -32,6 +34,30 @@ use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::Z
 pub const CONSTRAINT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long to wait for a frame copy after requesting it.
 pub const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timings for the measurable phases of one successful capture.
+///
+/// `frame_wait` includes both compositor scheduling and the copy itself: the
+/// Wayland protocol does not expose a separate timestamp at which a copy
+/// started. The other fields isolate userspace readback, pixel decoding, and
+/// transform work. `total` is measured around the complete capture operation
+/// and is intentionally not a sum of the phase fields.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureTimings {
+    pub constraints: Duration,
+    pub frame_wait: Duration,
+    pub shm_read: Duration,
+    pub decode: Duration,
+    pub transform: Duration,
+    pub total: Duration,
+}
+
+/// A decoded frame plus the timing evidence from the same capture operation.
+#[derive(Debug)]
+pub struct CapturedFrame {
+    pub frame: Frame,
+    pub timings: CaptureTimings,
+}
 
 /// A capture backend offered by the compositor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

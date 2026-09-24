@@ -22,7 +22,7 @@ use serde_json::json;
 use wayland_client::backend::WaylandError;
 use wayland_client::{Connection, DispatchError};
 
-use crate::capture::{self, Backend, BackendPref};
+use crate::capture::{self, Backend, BackendPref, CaptureTimings};
 use crate::control::{err_response, ok_response};
 use crate::pairing::{PairingDb, PairingError};
 use crate::transport::udp::HostEndpoint;
@@ -45,6 +45,9 @@ const DEFAULT_FPS: u32 = 30;
 
 /// Engine idle tick — how often a stopped engine checks for new commands.
 const IDLE_TICK: Duration = Duration::from_millis(20);
+
+/// Rolling window used for the session-scoped capture-rate telemetry.
+const CAPTURE_RATE_WINDOW: Duration = Duration::from_secs(2);
 
 const MISSING_FFMPEG_ERROR: &str = "streaming needs the ffmpeg binary, which was not found on PATH";
 
@@ -101,6 +104,69 @@ pub struct ScreenInfo {
     pub transform: String,
 }
 
+/// Monotonic, session-scoped capture-rate window.
+///
+/// The first successful capture starts the window. Once the window is full,
+/// the next capture records the rate and starts a fresh window, so a stalled
+/// compositor contributes its full idle interval to the reported average.
+#[derive(Debug, Default, Clone)]
+struct CaptureRateWindow {
+    started: Option<Instant>,
+    frames: u64,
+    latest_fps: f64,
+    last_success: Option<Instant>,
+}
+
+impl CaptureRateWindow {
+    fn reset(&mut self) {
+        self.started = None;
+        self.frames = 0;
+        self.latest_fps = 0.0;
+        self.last_success = None;
+    }
+
+    fn record(&mut self, now: Instant) {
+        let Some(started) = self.started else {
+            self.started = Some(now);
+            self.frames = 1;
+            self.last_success = Some(now);
+            return;
+        };
+        let elapsed = now.saturating_duration_since(started);
+        if elapsed >= CAPTURE_RATE_WINDOW {
+            // The triggering sample belongs to the new window. Do not count it
+            // in both windows, or a steady stream reports a small artificial
+            // rate increase at every rollover.
+            if self.frames > 0 && !elapsed.is_zero() {
+                self.latest_fps = self.frames as f64 / elapsed.as_secs_f64();
+            }
+            self.started = Some(now);
+            self.frames = 1;
+        } else {
+            self.frames += 1;
+        }
+        self.last_success = Some(now);
+    }
+
+    /// Return a rate only while it is backed by a recent successful capture.
+    fn current_fps(&self, now: Instant) -> f64 {
+        let Some(last_success) = self.last_success else {
+            return 0.0;
+        };
+        if now.saturating_duration_since(last_success) >= CAPTURE_RATE_WINDOW {
+            0.0
+        } else {
+            self.latest_fps
+        }
+    }
+
+    fn elapsed_ms(&self, now: Instant) -> f64 {
+        self.started
+            .map(|started| now.saturating_duration_since(started).as_secs_f64() * 1000.0)
+            .unwrap_or(0.0)
+    }
+}
+
 /// Live counters, updated by the engine after every captured frame.
 #[derive(Debug, Default, Clone)]
 struct Stats {
@@ -108,6 +174,8 @@ struct Stats {
     last_latency_ms: f64,
     avg_latency_ms: f64,
     measured_fps: f64,
+    capture_rate: CaptureRateWindow,
+    capture_last: CaptureTimings,
 }
 
 /// Mutable service state, guarded by one mutex.
@@ -314,6 +382,21 @@ impl Service {
         inner.last_error = None;
     }
 
+    /// Record successful capture evidence independently of encoder latency.
+    pub fn record_capture(&self, timings: CaptureTimings) {
+        let mut inner = self.lock();
+        inner.stats.capture_last = timings;
+        let now = Instant::now();
+        inner.stats.capture_rate.record(now);
+    }
+
+    /// Start a fresh telemetry window for a new stream or Wayland connection.
+    pub fn reset_capture_metrics(&self) {
+        let mut inner = self.lock();
+        inner.stats.capture_rate.reset();
+        inner.stats.capture_last = CaptureTimings::default();
+    }
+
     /// Record a capture failure and drop out of streaming.
     pub fn record_error(&self, message: String) {
         let mut inner = self.lock();
@@ -474,6 +557,8 @@ impl Service {
                 "no outputs detected on this compositor",
             );
         }
+        inner.stats.capture_rate.reset();
+        inner.stats.capture_last = CaptureTimings::default();
         inner.streaming = true;
         inner.last_error = None;
         let selected = inner.selected.clone().unwrap_or_default();
@@ -492,6 +577,9 @@ impl Service {
         // `inner`. See the locking rule on `Service`.
         let paired_devices = self.lock_pairing().active_devices().len();
         let inner = self.lock();
+        let now = Instant::now();
+        let capture_measured_fps = inner.stats.capture_rate.current_fps(now);
+        let capture_window_ms = inner.stats.capture_rate.elapsed_ms(now);
         json!({
             "streaming": inner.streaming,
             "backend": inner.backend,
@@ -501,6 +589,10 @@ impl Service {
             "latency_ms": round2(inner.stats.last_latency_ms),
             "avg_latency_ms": round2(inner.stats.avg_latency_ms),
             "measured_fps": round2(inner.stats.measured_fps),
+            "capture_measured_fps": round2(capture_measured_fps),
+            "capture_window_frames": inner.stats.capture_rate.frames,
+            "capture_window_elapsed_ms": round2(capture_window_ms),
+            "capture_phases": capture_timings_payload(inner.stats.capture_last),
             "connected_devices": inner.stream_peers,
             "paired_devices": paired_devices,
             "encoder": inner.encoder_name,
@@ -518,6 +610,18 @@ impl Service {
 
 fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
+}
+
+fn capture_timings_payload(timings: CaptureTimings) -> serde_json::Value {
+    let ms = |duration: Duration| round2(duration.as_secs_f64() * 1000.0);
+    json!({
+        "total_ms": ms(timings.total),
+        "constraints_ms": ms(timings.constraints),
+        "frame_wait_ms": ms(timings.frame_wait),
+        "shm_read_ms": ms(timings.shm_read),
+        "decode_ms": ms(timings.decode),
+        "transform_ms": ms(timings.transform),
+    })
 }
 
 fn screen_infos(state: &capture::State) -> Vec<ScreenInfo> {
@@ -800,7 +904,7 @@ impl Engine {
     }
 
     /// Capture exactly one frame with the selected backend.
-    pub fn capture_once(&mut self) -> anyhow::Result<crate::frame::Frame> {
+    pub fn capture_once(&mut self) -> anyhow::Result<capture::CapturedFrame> {
         match self.backend {
             Backend::Ext => capture::ext::capture(&mut self.queue, &mut self.state, &self.output),
             Backend::Wlr => capture::wlr::capture(
@@ -902,6 +1006,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                     service.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
                     service.set_encoder(None, false, 0, 0);
                     service.clear_error();
+                    service.reset_capture_metrics();
                     applied_output = service.selected_output();
                     last_frame = Instant::now();
                     eprintln!(
@@ -937,7 +1042,9 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
         }
         let started = Instant::now();
         match engine.capture_once() {
-            Ok(frame) => {
+            Ok(captured) => {
+                let capture::CapturedFrame { frame, timings } = captured;
+                service.record_capture(timings);
                 if engine
                     .transport
                     .as_ref()
@@ -1090,6 +1197,86 @@ mod tests {
             object_interface: "wl_display".into(),
             message: "fatal test protocol error".into(),
         }
+    }
+
+    #[test]
+    fn capture_rate_window_reports_only_completed_windows() {
+        let base = Instant::now();
+        let mut window = CaptureRateWindow::default();
+        window.record(base);
+        assert_eq!(window.frames, 1);
+        assert_eq!(window.latest_fps, 0.0);
+
+        window.record(base + Duration::from_millis(999));
+        assert_eq!(window.frames, 2);
+        assert_eq!(window.latest_fps, 0.0);
+
+        window.record(base + CAPTURE_RATE_WINDOW);
+        assert_eq!(window.frames, 1, "rollover starts a new session window");
+        assert!(
+            (window.latest_fps - 1.0).abs() < 0.001,
+            "the boundary sample belongs only to the new window"
+        );
+
+        window.reset();
+        assert_eq!(window.frames, 0);
+        assert_eq!(window.latest_fps, 0.0);
+    }
+
+    #[test]
+    fn capture_rate_window_handles_zero_elapsed_samples() {
+        let now = Instant::now();
+        let mut window = CaptureRateWindow::default();
+        window.record(now);
+        window.record(now);
+        assert_eq!(window.frames, 2);
+        assert_eq!(window.latest_fps, 0.0);
+    }
+
+    #[test]
+    fn capture_rate_expires_without_a_recent_success() {
+        let base = Instant::now();
+        let mut window = CaptureRateWindow::default();
+        window.record(base);
+        window.record(base + Duration::from_secs(1));
+        window.record(base + CAPTURE_RATE_WINDOW);
+        assert_eq!(window.current_fps(base + Duration::from_millis(2500)), 1.0);
+        assert_eq!(window.current_fps(base + Duration::from_secs(4)), 0.0);
+        assert!((window.elapsed_ms(base + Duration::from_secs(4)) - 2000.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn status_exposes_capture_phase_telemetry() {
+        let service = service_with_outputs();
+        service.record_capture(CaptureTimings {
+            total: Duration::from_millis(12),
+            constraints: Duration::from_millis(2),
+            frame_wait: Duration::from_millis(4),
+            shm_read: Duration::from_millis(3),
+            decode: Duration::from_millis(2),
+            transform: Duration::from_millis(1),
+        });
+        let status = service.status_payload();
+        assert_eq!(status["capture_phases"]["total_ms"], 12.0);
+        assert_eq!(status["capture_phases"]["frame_wait_ms"], 4.0);
+        assert_eq!(status["capture_measured_fps"], 0.0);
+        assert_eq!(status["capture_window_frames"], 1);
+    }
+
+    #[test]
+    fn starting_a_stream_resets_capture_telemetry() {
+        let service = service_with_outputs();
+        service.record_capture(CaptureTimings {
+            total: Duration::from_millis(9),
+            ..CaptureTimings::default()
+        });
+        assert_eq!(service.status_payload()["capture_phases"]["total_ms"], 9.0);
+
+        ok_payload(service.handle(req("1", Command::Start(StartArgs::default()))));
+        let status = service.status_payload();
+        assert_eq!(status["capture_phases"]["total_ms"], 0.0);
+        assert_eq!(status["capture_measured_fps"], 0.0);
+        assert_eq!(status["capture_window_frames"], 0);
     }
 
     #[test]
