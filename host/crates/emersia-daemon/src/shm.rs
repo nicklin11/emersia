@@ -89,3 +89,15 @@ impl ShmBuffer {
         Ok(data)
     }
 }
+
+impl Drop for ShmBuffer {
+    /// Release the compositor-side objects.
+    ///
+    /// wayland-client does not destroy a proxy when it is dropped. Without
+    /// these requests the compositor keeps every pool mapped for the life of
+    /// the connection: one full frame of memory leaked per capture (#49).
+    fn drop(&mut self) {
+        self.buffer.destroy();
+        self._pool.destroy();
+    }
+}
