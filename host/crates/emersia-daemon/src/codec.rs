@@ -223,7 +223,7 @@ impl fmt::Display for CodecError {
             Self::TruncatedNal => write!(f, "bitstream ended inside a NAL unit"),
             Self::EmptyNal => write!(f, "NAL unit has no payload"),
             Self::TooManyParameterSets(n) => {
-                write!(f, "refusing to carry {n} parameter sets in one packet")
+                write!(f, "refusing to carry {n} bytes of parameter sets in one packet")
             }
         }
     }
@@ -268,6 +268,10 @@ pub struct AnnexBParser {
     buffer: Vec<u8>,
     /// Parameter sets most recently seen, carried forward to every packet.
     parameter_sets: Vec<u8>,
+    /// True while reading a run of parameter sets that no picture data has
+    /// followed yet. The next parameter set after picture data starts a new
+    /// group, which replaces the old one.
+    collecting_sets: bool,
     /// NAL units of the access unit currently being assembled.
     current: Vec<NalUnit>,
     /// Whether `current` already contains a VCL (picture) NAL.
@@ -285,6 +289,7 @@ impl AnnexBParser {
             codec,
             buffer: Vec::new(),
             parameter_sets: Vec::new(),
+            collecting_sets: false,
             current: Vec::new(),
             current_has_vcl: false,
             index: 0,
@@ -401,15 +406,25 @@ impl AnnexBParser {
             None
         };
 
-        // Parameter sets in force are updated from whatever we see.
+        // Parameter sets in force. Encoders repeat SPS/PPS on every keyframe,
+        // so a new group *replaces* the previous one. Appending instead grew
+        // the prefix until it passed the limit and killed the stream (#50).
         if nal.is_parameter_set(self.codec) {
+            if !self.collecting_sets {
+                self.parameter_sets.clear();
+                self.collecting_sets = true;
+            }
             self.parameter_sets.extend_from_slice(&nal.annexb);
             if self.parameter_sets.len() > MAX_PARAMETER_SET_BYTES {
-                return Err(CodecError::TooManyParameterSets(self.current.len()));
+                return Err(CodecError::TooManyParameterSets(
+                    self.parameter_sets.len(),
+                ));
             }
         }
         if nal.is_vcl(self.codec) {
             self.current_has_vcl = true;
+            // Picture data closes the current group of parameter sets.
+            self.collecting_sets = false;
         }
         self.current.push(nal);
         Ok(flushed)
@@ -823,6 +838,26 @@ mod tests {
         let mut p = AnnexBParser::new(Codec::H264);
         let junk = vec![0xFF; MAX_PARAMETER_SET_BYTES + 10];
         assert_eq!(p.push(&junk).unwrap_err(), CodecError::NoStartCode);
+    }
+
+    /// Regression for #50: parameter sets repeated on every keyframe must
+    /// replace the previous ones, not pile up until the parser gives up.
+    #[test]
+    fn repeated_parameter_sets_replace_rather_than_accumulate() {
+        let one_set_len = h264_nal(h264::SPS, 10).len() + h264_nal(h264::PPS, 4).len();
+        let mut stream = Vec::new();
+        for _ in 0..100 {
+            // SPS + PPS + IDR, as a real encoder emits for each keyframe.
+            stream.extend(access_unit(true));
+        }
+        let mut p = AnnexBParser::new(Codec::H264);
+        let aus = parse_all(&mut p, &stream);
+        assert_eq!(aus.len(), 100, "every keyframe is its own picture");
+        assert_eq!(
+            p.parameter_sets().len(),
+            one_set_len,
+            "only the latest SPS+PPS are in force"
+        );
     }
 
     #[test]
