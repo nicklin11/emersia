@@ -22,7 +22,8 @@
 #![allow(dead_code)]
 
 use std::fmt;
-use std::path::Path;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
 
 use aead::{Aead, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
@@ -50,6 +51,10 @@ pub enum CryptoError {
     Random(&'static str),
     /// A hex field in stored data was malformed.
     Hex,
+    /// A filesystem operation failed while loading or persisting host identity.
+    Io(std::io::Error),
+    /// An existing private key is readable by another user.
+    InsecurePermissions { path: PathBuf, mode: u32 },
     /// A public key was not a valid curve point.
     BadKey,
     /// Key derivation output was the wrong length.
@@ -63,6 +68,13 @@ impl fmt::Display for CryptoError {
         match self {
             Self::Random(what) => write!(f, "random source failed for {what}"),
             Self::Hex => write!(f, "malformed hex-encoded key material"),
+            Self::Io(err) => write!(f, "host identity filesystem I/O failed: {err}"),
+            Self::InsecurePermissions { path, mode } => write!(
+                f,
+                "host identity {} has unsafe permissions {:04o}; expected 0600",
+                path.display(),
+                mode & 0o777
+            ),
             Self::BadKey => write!(f, "invalid X25519 public key"),
             Self::KeyLength => write!(f, "unexpected derived key length"),
             Self::Aead => write!(f, "authentication failed (wrong key or tampered data)"),
@@ -70,7 +82,14 @@ impl fmt::Display for CryptoError {
     }
 }
 
-impl std::error::Error for CryptoError {}
+impl std::error::Error for CryptoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            _ => None,
+        }
+    }
+}
 
 fn random_bytes<const N: usize>(what: &'static str) -> Result<[u8; N], CryptoError> {
     let mut out = [0u8; N];
@@ -153,8 +172,21 @@ impl HostIdentity {
     /// Load the host key from `path`, generating and persisting one on first
     /// run. The private key never leaves this process except into that file.
     pub fn load_or_create(path: &Path) -> Result<Self, CryptoError> {
-        let inner = match std::fs::read_to_string(path) {
-            Ok(text) => {
+        let inner = match std::fs::File::open(path) {
+            Ok(mut file) => {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                let metadata = file.metadata().map_err(CryptoError::Io)?;
+                let mode = metadata.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    return Err(CryptoError::InsecurePermissions {
+                        path: path.to_path_buf(),
+                        mode,
+                    });
+                }
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).map_err(CryptoError::Io)?;
+                let text = std::str::from_utf8(&bytes).map_err(|_| CryptoError::Hex)?;
                 let bytes = hex::decode(text.trim()).map_err(|_| CryptoError::Hex)?;
                 let arr: [u8; 32] = bytes.try_into().map_err(|_| CryptoError::Hex)?;
                 DeviceIdentity::from_private_bytes(arr)
@@ -162,14 +194,14 @@ impl HostIdentity {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let fresh = DeviceIdentity::generate()?;
                 if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir).map_err(|_| CryptoError::Hex)?;
+                    std::fs::create_dir_all(dir).map_err(CryptoError::Io)?;
                     restrict(dir, 0o700)?;
                 }
                 // Write 0600 *before* the secret lands in the file.
                 write_private(path, hex::encode(fresh.secret.to_bytes()).as_bytes())?;
                 fresh
             }
-            Err(_) => return Err(CryptoError::Hex),
+            Err(e) => return Err(CryptoError::Io(e)),
         };
         Ok(Self { inner })
     }
@@ -191,8 +223,7 @@ impl HostIdentity {
 /// Set owner-only permissions on a path.
 fn restrict(path: &Path, mode: u32) -> Result<(), CryptoError> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .map_err(|_| CryptoError::Hex)
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(CryptoError::Io)
 }
 
 /// Write a file that only the owner can read.
@@ -205,9 +236,9 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), CryptoError> {
         .truncate(true)
         .mode(0o600)
         .open(path)
-        .map_err(|_| CryptoError::Hex)?;
-    file.write_all(bytes).map_err(|_| CryptoError::Hex)?;
-    file.sync_all().map_err(|_| CryptoError::Hex)
+        .map_err(CryptoError::Io)?;
+    file.write_all(bytes).map_err(CryptoError::Io)?;
+    file.sync_all().map_err(CryptoError::Io)
 }
 
 /// Compute the public key for a secret scalar.
@@ -740,6 +771,99 @@ mod tests {
     fn malformed_hex_is_rejected() {
         assert!(parse_public_key_hex("not-hex").is_err());
         assert!(parse_public_key_hex("abcd").is_err(), "wrong length");
+    }
+
+    #[test]
+    fn host_identity_creates_private_file_and_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("host.key");
+        HostIdentity::load_or_create(&path).unwrap();
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(dir_mode, 0o700);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.len(), 64);
+        assert!(text.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn host_identity_round_trips_the_same_public_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.key");
+        let first = HostIdentity::load_or_create(&path).unwrap();
+        let second = HostIdentity::load_or_create(&path).unwrap();
+        assert_eq!(first.public_key_hex(), second.public_key_hex());
+    }
+
+    #[test]
+    fn host_identity_read_error_is_io_not_hex() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.key");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        match HostIdentity::load_or_create(&path) {
+            Err(CryptoError::Io(_)) => {}
+            Err(other) => panic!("expected I/O error, got {other:?}"),
+            Ok(_) => panic!("a directory is not a host identity"),
+        }
+    }
+
+    #[test]
+    fn malformed_existing_host_key_is_hex() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        for (index, content) in [b"not-hex".to_vec(), vec![0xff]].into_iter().enumerate() {
+            let path = dir.path().join(format!("host-{index}.key"));
+            std::fs::write(&path, content).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(matches!(
+                HostIdentity::load_or_create(&path),
+                Err(CryptoError::Hex)
+            ));
+        }
+    }
+
+    #[test]
+    fn insecure_existing_host_key_is_rejected_without_overwrite() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.key");
+        HostIdentity::load_or_create(&source).unwrap();
+        let original = std::fs::read(&source).unwrap();
+        let target = dir.path().join("target.key");
+        std::fs::write(&target, &original).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(matches!(
+            HostIdentity::load_or_create(&target),
+            Err(CryptoError::InsecurePermissions { .. })
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+    }
+
+    #[test]
+    fn private_file_helpers_report_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert!(matches!(restrict(&missing, 0o700), Err(CryptoError::Io(_))));
+
+        let directory = dir.path().join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(matches!(
+            write_private(&directory, b"not a file"),
+            Err(CryptoError::Io(_))
+        ));
     }
 
     #[test]
