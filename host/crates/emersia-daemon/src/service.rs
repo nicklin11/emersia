@@ -816,8 +816,25 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                         }
                         Ok(false) => {}
                         Err(e) => {
-                            service.record_error(format!("encoder: {e}"));
-                            eprintln!("emersia-daemon: encoder unavailable: {e}");
+                            // A missing ffmpeg is a setup problem, not a
+                            // stream problem, and it is worth saying so plainly
+                            // rather than logging it once per frame.
+                            if e.ffmpeg_missing() {
+                                service.record_error(
+                                    "streaming needs the ffmpeg binary, which was not found on PATH"
+                                        .to_string(),
+                                );
+                                eprintln!(
+                                    "emersia-daemon: streaming requires ffmpeg on PATH. \
+                                     Install it (e.g. `apt install ffmpeg`, `pacman -S ffmpeg`) \
+                                     and restart the daemon; capture and the control socket keep \
+                                     working without it."
+                                );
+                                service.request_shutdown();
+                            } else {
+                                service.record_error(format!("encoder: {e}"));
+                                eprintln!("emersia-daemon: encoder unavailable: {e}");
+                            }
                         }
                     }
                 }

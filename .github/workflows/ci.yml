@@ -28,6 +28,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: host
+      # The encoder is the ffmpeg CLI (ADR 0003), and the encoder tests are
+      # only meaningful when it is actually present: without it they skip and
+      # the most important part of M1.5 goes untested. Software x264 comes from
+      # the ffmpeg binary, so no GPU is needed for these.
+      - name: Install ffmpeg (encoder under test)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
       - name: rustfmt
         if: hashFiles('host/Cargo.toml') != ''
         run: cargo fmt --manifest-path host/Cargo.toml --all -- --check

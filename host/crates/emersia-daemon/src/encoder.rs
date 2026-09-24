@@ -233,6 +233,19 @@ impl std::fmt::Display for EncoderError {
 
 impl std::error::Error for EncoderError {}
 
+impl EncoderError {
+    /// True when the failure is just "there is no ffmpeg on this machine".
+    ///
+    /// Tests use this to skip rather than fail, so the suite still runs on a
+    /// bare machine. It deliberately matches only the spawn failure and not
+    /// any encoder error: "libx264 started but produced nothing" is a real
+    /// failure and must not be skipped away.
+    pub fn ffmpeg_missing(&self) -> bool {
+        let text = self.to_string();
+        text.contains("could not start ffmpeg")
+    }
+}
+
 impl From<CodecError> for EncoderError {
     fn from(e: CodecError) -> Self {
         Self::Codec(e)
@@ -881,8 +894,8 @@ mod tests {
         };
         let mut enc = match Encoder::start(cfg) {
             Ok(e) => e,
-            Err(EncoderError::Rejected(why)) if why.contains("ffmpeg") => {
-                eprintln!("skipping: {why}");
+            Err(e) if e.ffmpeg_missing() => {
+                eprintln!("skipping: {e}");
                 return;
             }
             Err(e) => panic!("software encoder should be available: {e}"),
@@ -1075,7 +1088,7 @@ mod tests {
         };
         let mut enc = match Encoder::start(cfg) {
             Ok(e) => e,
-            Err(EncoderError::Rejected(why)) if why.contains("ffmpeg") => return,
+            Err(e) if e.ffmpeg_missing() => return,
             Err(e) => panic!("{e}"),
         };
         let frame = vec![77u8; (w * h * 4) as usize];
@@ -1108,7 +1121,7 @@ mod tests {
         };
         let mut enc = match Encoder::start(cfg) {
             Ok(e) => e,
-            Err(EncoderError::Rejected(why)) if why.contains("ffmpeg") => return,
+            Err(e) if e.ffmpeg_missing() => return,
             Err(e) => panic!("{e}"),
         };
         let mut keyframes = 0;
