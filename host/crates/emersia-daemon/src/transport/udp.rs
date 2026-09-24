@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::crypto::{DeviceIdentity, Session};
 use crate::transport::handshake::{
@@ -26,6 +26,14 @@ const MAX_DATAGRAM: usize = 65_535;
 
 /// Default socket read timeout, so a stalled peer cannot wedge the endpoint.
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Pending handshakes are short-lived; the device sends CONFIRM immediately
+/// after receiving the response, and a ten-second bound leaves room for a slow
+/// response without retaining session state indefinitely.
+const PENDING_HANDSHAKE_TTL: Duration = Duration::from_secs(10);
+
+/// Maximum number of source tuples allowed to have an in-flight handshake.
+const MAX_PENDING_HANDSHAKES: usize = 64;
 
 /// Outcome of offering one packet to the host.
 #[derive(Debug, PartialEq, Eq)]
@@ -47,7 +55,9 @@ pub struct Peer {
 /// A handshake that got as far as a session but is not yet confirmed.
 struct Pending {
     device_id: [u8; DEVICE_ID_LEN],
+    device_static: [u8; 32],
     session: Session,
+    created_at: Instant,
 }
 
 /// Host-side UDP endpoint.
@@ -94,9 +104,10 @@ impl HostEndpoint {
         from: SocketAddr,
         authorized: &mut Authorizer<'_>,
     ) -> HostOutcome {
+        self.prune_pending(Instant::now());
         match packet.first() {
             Some(&packet_type::HANDSHAKE_INIT) => self.handle_init(packet, from, authorized),
-            Some(&packet_type::HANDSHAKE_CONFIRM) => self.handle_confirm(packet, from),
+            Some(&packet_type::HANDSHAKE_CONFIRM) => self.handle_confirm(packet, from, authorized),
             Some(&packet_type::DATA) => {
                 self.handle_data(packet, from);
                 HostOutcome::Silent
@@ -106,12 +117,21 @@ impl HostEndpoint {
         }
     }
 
+    fn prune_pending(&mut self, now: Instant) {
+        self.pending.retain(|_, pending| {
+            now.checked_duration_since(pending.created_at)
+                .is_some_and(|age| age < PENDING_HANDSHAKE_TTL)
+        });
+    }
+
     fn handle_init(
         &mut self,
         packet: &[u8],
         from: SocketAddr,
         authorized: &mut Authorizer<'_>,
     ) -> HostOutcome {
+        let now = Instant::now();
+        self.prune_pending(now);
         let body = match packet.strip_prefix([packet_type::HANDSHAKE_INIT].as_slice()) {
             Some(b) if b.len() >= DEVICE_ID_LEN + 64 => b,
             _ => return HostOutcome::Silent,
@@ -126,6 +146,12 @@ impl HostEndpoint {
             return HostOutcome::Silent;
         }
 
+        // A source may replace its own pending handshake, but a new source must
+        // not grow the map beyond the fixed resource bound.
+        if self.pending.len() >= MAX_PENDING_HANDSHAKES && !self.pending.contains_key(&from) {
+            return HostOutcome::Silent;
+        }
+
         // The identity borrow ends with this statement, so no in-flight
         // handshake has to hold one.
         let mut server = HandshakeServer::new(&self.host_identity);
@@ -135,7 +161,9 @@ impl HostEndpoint {
                     from,
                     Pending {
                         device_id: outcome.device_id,
+                        device_static,
                         session: outcome.session,
+                        created_at: Instant::now(),
                     },
                 );
                 HostOutcome::Reply(outcome.response)
@@ -144,10 +172,26 @@ impl HostEndpoint {
         }
     }
 
-    fn handle_confirm(&mut self, packet: &[u8], from: SocketAddr) -> HostOutcome {
+    fn handle_confirm(
+        &mut self,
+        packet: &[u8],
+        from: SocketAddr,
+        authorized: &mut Authorizer<'_>,
+    ) -> HostOutcome {
+        self.prune_pending(Instant::now());
         let Some(pending) = self.pending.get(&from) else {
             return HostOutcome::Silent;
         };
+        let device_id = pending.device_id;
+        let device_static = pending.device_static;
+
+        // Re-check current trust at the state transition. A device may have
+        // been revoked after INIT, and confirmation must not resurrect it.
+        if !authorized(&device_id, &device_static) {
+            self.pending.remove(&from);
+            self.peers.remove(&device_id);
+            return HostOutcome::Silent;
+        }
         // Same rule as HandshakeServer::finish_confirm, one implementation.
         if verify_confirm(&pending.session, packet).is_err() {
             self.pending.remove(&from);
@@ -189,6 +233,7 @@ impl HostEndpoint {
         let mut processed = 0;
         let mut buf = [0u8; MAX_DATAGRAM];
         while processed < max {
+            self.prune_pending(Instant::now());
             let (n, from) = match self.socket.recv_from(&mut buf) {
                 Ok(v) => v,
                 Err(e)
@@ -217,9 +262,14 @@ impl HostEndpoint {
         self.peers.len()
     }
 
-    /// Disconnect a device — call on revoke.
+    /// Disconnect a device and purge any handshakes that could confirm it.
+    /// Returns whether either confirmed or pending state existed.
     pub fn disconnect(&mut self, device_id: &[u8; DEVICE_ID_LEN]) -> bool {
-        self.peers.remove(device_id).is_some()
+        let peer_removed = self.peers.remove(device_id).is_some();
+        let pending_before = self.pending.len();
+        self.pending
+            .retain(|_, pending| pending.device_id != *device_id);
+        peer_removed || pending_before != self.pending.len()
     }
 
     /// Build and send one *frame*, fragmenting it across datagrams.
@@ -435,6 +485,38 @@ mod tests {
         (host, client, id)
     }
 
+    fn pending_handshake() -> (
+        HostEndpoint,
+        Vec<u8>,
+        SocketAddr,
+        [u8; DEVICE_ID_LEN],
+        [u8; 32],
+    ) {
+        let host_identity = DeviceIdentity::generate().unwrap();
+        let mut host = HostEndpoint::bind("127.0.0.1:0", host_identity).unwrap();
+        let host_static = host.host_identity.public_key_bytes();
+        let addr = host.local_addr().unwrap();
+        let device_identity = DeviceIdentity::generate().unwrap();
+        let device_pub = device_identity.public_key_bytes();
+        let id = dev_id(4);
+        let mut client =
+            ClientEndpoint::new(&addr.to_string(), id, device_identity, host_static).unwrap();
+        let from = client.local_addr().unwrap();
+
+        client.send_init().unwrap();
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (n, _) = host.socket.recv_from(&mut buf).unwrap();
+        let mut allow = |cid: &[u8; DEVICE_ID_LEN], pk: &[u8; 32]| cid == &id && pk == &device_pub;
+        let response = match host.handle_packet(&buf[..n], from, &mut allow) {
+            HostOutcome::Reply(response) => response,
+            HostOutcome::Silent => panic!("host refused a paired device"),
+        };
+        client.complete(&response).unwrap();
+        let (n, _) = host.socket.recv_from(&mut buf).unwrap();
+        let confirm = buf[..n].to_vec();
+        (host, confirm, from, id, device_pub)
+    }
+
     #[test]
     fn handshake_over_real_sockets_connects_a_peer() {
         let (mut host, _client, id) = established();
@@ -550,6 +632,81 @@ mod tests {
             host.send_frame(&id, 0, false, Codec::H264.payload_type(), b"x"),
             Err(TransportError::Dropped(_))
         ));
+    }
+
+    #[test]
+    fn confirmation_reauthorizes_current_trust() {
+        let (mut host, confirm, from, _id, _device_pub) = pending_handshake();
+        let mut deny = |_: &[u8; DEVICE_ID_LEN], _: &[u8; 32]| false;
+        assert_eq!(
+            host.handle_packet(&confirm, from, &mut deny),
+            HostOutcome::Silent
+        );
+        assert_eq!(host.pending.len(), 0, "revoked confirmation is consumed");
+        assert_eq!(host.peer_count(), 0);
+    }
+
+    #[test]
+    fn expired_pending_confirm_is_rejected() {
+        let (mut host, confirm, from, _id, _device_pub) = pending_handshake();
+        let expired_at = std::time::Instant::now()
+            .checked_sub(PENDING_HANDSHAKE_TTL)
+            .unwrap();
+        host.pending.get_mut(&from).unwrap().created_at = expired_at;
+
+        let mut allow = |_: &[u8; DEVICE_ID_LEN], _: &[u8; 32]| true;
+        assert_eq!(
+            host.handle_packet(&confirm, from, &mut allow),
+            HostOutcome::Silent
+        );
+        assert_eq!(host.pending.len(), 0);
+        assert_eq!(host.peer_count(), 0);
+    }
+
+    #[test]
+    fn pending_capacity_is_bounded() {
+        let host_identity = DeviceIdentity::generate().unwrap();
+        let mut host = HostEndpoint::bind("127.0.0.1:0", host_identity).unwrap();
+        let host_static = host.host_identity.public_key_bytes();
+        let device = DeviceIdentity::generate().unwrap();
+        let mut client = HandshakeClient::new(dev_id(5), device, host_static);
+        let init = client.init();
+        let mut allow = |_: &[u8; DEVICE_ID_LEN], _: &[u8; 32]| true;
+        let mut addresses = Vec::with_capacity(MAX_PENDING_HANDSHAKES + 1);
+
+        for index in 0..=MAX_PENDING_HANDSHAKES {
+            let from = SocketAddr::from(([127, 0, 0, 1], 20_000 + index as u16));
+            addresses.push(from);
+            let outcome = host.handle_packet(&init, from, &mut allow);
+            if index < MAX_PENDING_HANDSHAKES {
+                assert!(matches!(outcome, HostOutcome::Reply(_)));
+            } else {
+                assert_eq!(outcome, HostOutcome::Silent);
+            }
+            assert!(host.pending.len() <= MAX_PENDING_HANDSHAKES);
+        }
+
+        // An admitted source may replace its own entry without growing the map.
+        assert!(matches!(
+            host.handle_packet(&init, addresses[0], &mut allow),
+            HostOutcome::Reply(_)
+        ));
+        assert_eq!(host.pending.len(), MAX_PENDING_HANDSHAKES);
+    }
+
+    #[test]
+    fn disconnect_purges_pending_handshake() {
+        let (mut host, confirm, from, id, _device_pub) = pending_handshake();
+        assert_eq!(host.pending.len(), 1);
+        assert!(host.disconnect(&id));
+        assert_eq!(host.pending.len(), 0);
+
+        let mut allow = |_: &[u8; DEVICE_ID_LEN], _: &[u8; 32]| true;
+        assert_eq!(
+            host.handle_packet(&confirm, from, &mut allow),
+            HostOutcome::Silent
+        );
+        assert_eq!(host.peer_count(), 0);
     }
 
     #[test]
