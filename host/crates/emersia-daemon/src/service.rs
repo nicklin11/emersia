@@ -933,7 +933,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use emersia_protocol::{Command, ResponseErr, ResponseOk, StartArgs};
+    use emersia_protocol::{Command, ResponseErr, ResponseOk, RevokeArgs, StartArgs};
 
     /// A service backed by a throwaway trust store, with fake outputs.
     fn service_with_outputs() -> Service {
@@ -995,6 +995,65 @@ mod tests {
         assert_eq!(p["backend"], "wlr-screencopy");
         assert_eq!(p["streaming"], false);
         assert_eq!(p["frames"], 0);
+    }
+
+    #[test]
+    fn status_and_revoke_complete_concurrently() {
+        let service = Arc::new(service_with_outputs());
+        let device_id = {
+            let mut db = service.lock_pairing();
+            let code = db.new_code().expect("pairing code");
+            db.accept_code(code.as_str(), "concurrent-test", &"11".repeat(32))
+                .expect("pair test device")
+                .id
+        };
+
+        const STATUS_WORKERS: usize = 4;
+        const ITERATIONS: usize = 200;
+        let start = Arc::new(std::sync::Barrier::new(STATUS_WORKERS + 1));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut threads = Vec::new();
+
+        for worker in 0..STATUS_WORKERS {
+            let service = Arc::clone(&service);
+            let start = Arc::clone(&start);
+            let done_tx = done_tx.clone();
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                for iteration in 0..ITERATIONS {
+                    let response = service.handle(req(
+                        &format!("status-{worker}-{iteration}"),
+                        Command::Status,
+                    ));
+                    assert!(matches!(response, Response::Ok(_)));
+                }
+                done_tx.send(()).expect("status worker completion");
+            }));
+        }
+
+        let service_for_revoke = Arc::clone(&service);
+        let start_for_revoke = Arc::clone(&start);
+        let done_for_revoke = done_tx.clone();
+        threads.push(std::thread::spawn(move || {
+            start_for_revoke.wait();
+            let response = service_for_revoke.handle(req(
+                "revoke-1",
+                Command::Revoke(RevokeArgs {
+                    device: device_id.clone(),
+                }),
+            ));
+            assert!(matches!(response, Response::Ok(_)));
+            done_for_revoke.send(()).expect("revoke worker completion");
+        }));
+
+        for _ in 0..=STATUS_WORKERS {
+            done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("concurrent status/revoke handler deadlocked or stalled");
+        }
+        for thread in threads {
+            thread.join().expect("worker panicked");
+        }
     }
 
     #[test]
