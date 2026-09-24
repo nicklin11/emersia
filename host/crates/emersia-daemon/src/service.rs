@@ -92,9 +92,13 @@ struct Inner {
 /// Shared control-plane state. Cheap to clone via `Arc`; the Wayland machinery
 /// stays on the engine thread.
 ///
-/// **Lock order:** `pairing` before `inner`, or one at a time. Holding `inner`
-/// across a `pairing` acquisition deadlocks against a revoke that does the
-/// reverse. `status_payload` shows the safe shape.
+/// **Locking rule:** never hold both mutexes at once. Read or mutate one,
+/// drop it, then take the other. `status_payload` shows the safe shape.
+///
+/// The two locks are only ever needed together to build a response. Acquiring
+/// them in different orders in two code paths is a deadlock, not a race: each
+/// holds one and waits for the other. An earlier version of this file did
+/// exactly that and wedged `status` against `revoke` (see issue #26).
 #[derive(Debug)]
 pub struct Service {
     inner: Mutex<Inner>,
@@ -400,9 +404,8 @@ impl Service {
     }
 
     fn status_payload(&self) -> serde_json::Value {
-        // Lock order matters: `inner` is taken first here, so anything that
-        // needs both must do the same. Acquire the pairing read before `inner`
-        // and release it, then take `inner`.
+        // Never hold both locks: take the pairing read, drop it, then lock
+        // `inner`. See the locking rule on `Service`.
         let paired_devices = self.lock_pairing().active_devices().len();
         let inner = self.lock();
         json!({
