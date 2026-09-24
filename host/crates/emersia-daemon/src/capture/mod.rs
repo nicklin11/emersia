@@ -280,14 +280,12 @@ impl Dispatch<WlRegistry, ()> for State {
         _conn: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        // `GlobalRemove` is ignored: outputs never vanish mid-capture here.
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
-            match interface.as_str() {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => match interface.as_str() {
                 "wl_shm" => state.shm = Some(registry.bind(name, version.min(3), qh, ())),
                 "wl_output" => {
                     // v4 adds the `name` event we use for `--output`.
@@ -304,7 +302,11 @@ impl Dispatch<WlRegistry, ()> for State {
                     state.wlr_mgr = Some(registry.bind(name, version.min(3), qh, ()));
                 }
                 _ => {}
+            },
+            wl_registry::Event::GlobalRemove { name } => {
+                state.outputs.retain(|output| output.global_name != name);
             }
+            _ => {}
         }
     }
 }

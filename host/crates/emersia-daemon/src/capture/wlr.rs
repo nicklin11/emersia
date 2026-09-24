@@ -50,8 +50,15 @@ pub fn capture(
         state,
         Instant::now() + CONSTRAINT_TIMEOUT,
         "screencopy buffer description",
-        |s| (s.wlr.have_buffer && (!needs_buffer_done || s.wlr.buffer_done)) || s.wlr.dmabuf_only,
+        |s| {
+            s.wlr.failed
+                || (s.wlr.have_buffer && (!needs_buffer_done || s.wlr.buffer_done))
+                || s.wlr.dmabuf_only
+        },
     )?;
+    if state.wlr.failed {
+        bail!("the compositor failed the screencopy request");
+    }
     if state.wlr.dmabuf_only && !state.wlr.have_buffer {
         bail!("the compositor only offers dmabuf screencopy buffers (unsupported in M1.1)");
     }
