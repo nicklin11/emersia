@@ -6,11 +6,13 @@
 //! byte is read. Default-deny — a peer whose UID differs is disconnected
 //! immediately. There is no TCP surface.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read as _, Write};
+use std::net::Shutdown;
 use std::os::fd::AsFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +27,37 @@ use crate::service::Service;
 
 /// Refuse absurd lines rather than letting one client push arbitrary data.
 const MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// Bound the number of simultaneously blocked control connections.
+const MAX_CONNECTIONS: usize = 16;
+
+/// Result of reading one newline-delimited control request.
+#[derive(Debug)]
+enum RequestLine {
+    Eof,
+    Line(String),
+    TooLong,
+}
+
+/// Acquire one connection slot without allowing the accept loop to overshoot the
+/// configured cap during a race with a finishing worker.
+fn try_acquire_connection(counter: Arc<AtomicUsize>) -> Option<ConnectionPermit> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < MAX_CONNECTIONS).then_some(count + 1)
+        })
+        .ok()
+        .map(|_| ConnectionPermit(counter))
+}
+
+/// Releases a connection slot on every return path, including panics.
+struct ConnectionPermit(Arc<AtomicUsize>);
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// A bound, listening control socket.
 pub struct ControlServer {
@@ -83,11 +116,18 @@ impl ControlServer {
         self.listener
             .set_nonblocking(true)
             .context("failed to set the control socket non-blocking")?;
+        let active_connections = Arc::new(AtomicUsize::new(0));
         while !service.is_shutting_down() {
             match self.listener.accept() {
                 Ok((stream, _)) => {
+                    let Some(permit) = try_acquire_connection(Arc::clone(&active_connections))
+                    else {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    };
                     let service = Arc::clone(&service);
                     std::thread::spawn(move || {
+                        let _permit = permit;
                         if let Err(err) = handle_connection(stream, &service) {
                             // A dropped client is routine; log and move on.
                             eprintln!("emersia-daemon: control connection ended: {err:#}");
@@ -122,6 +162,28 @@ fn peer_is_same_uid(stream: &UnixStream) -> bool {
     }
 }
 
+/// Read at most `MAX_LINE_BYTES + 1` bytes and require a complete UTF-8 line.
+///
+/// `read_line` allocates according to the input length before the caller can
+/// inspect it. Taking a bounded reader first makes the allocation bound part of
+/// the read operation itself, while the extra byte lets us distinguish a full
+/// line from one that was truncated at the limit.
+fn read_request_line<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<RequestLine> {
+    buf.clear();
+    let mut limited = reader.take((MAX_LINE_BYTES as u64) + 1);
+    let read = limited.read_until(b'\n', buf)?;
+    if read == 0 {
+        return Ok(RequestLine::Eof);
+    }
+    if buf.len() > MAX_LINE_BYTES || !buf.ends_with(b"\n") {
+        return Ok(RequestLine::TooLong);
+    }
+    let line = buf.strip_suffix(b"\n").expect("newline was checked above");
+    let line =
+        std::str::from_utf8(line).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    Ok(RequestLine::Line(line.to_owned()))
+}
+
 /// Serve one client: auth, then request/response until it disconnects.
 fn handle_connection(stream: UnixStream, service: &Service) -> anyhow::Result<()> {
     if !peer_is_same_uid(&stream) {
@@ -134,31 +196,29 @@ fn handle_connection(stream: UnixStream, service: &Service) -> anyhow::Result<()
 
     let mut writer = stream.try_clone().context("failed to clone connection")?;
     let mut reader = BufReader::new(stream);
-    let mut buf = String::new();
+    let mut buf = Vec::new();
     loop {
-        buf.clear();
-        let read = reader
-            .read_line(&mut buf)
-            .context("failed to read a control request")?;
-        if read == 0 {
-            // Client closed the connection.
-            break;
-        }
-        if buf.len() > MAX_LINE_BYTES {
-            let response = err_response(
-                "",
-                ErrorCode::InvalidArgs,
-                format!("control request exceeds {MAX_LINE_BYTES} bytes"),
-            );
-            writer
-                .write_all(encode_response(&response)?.as_bytes())
-                .context("failed to write a control response")?;
-            writer
-                .flush()
-                .context("failed to flush the control response")?;
-            break;
-        }
-        let line = buf.trim();
+        let line = match read_request_line(&mut reader, &mut buf)
+            .context("failed to read a control request")?
+        {
+            RequestLine::Eof => break,
+            RequestLine::TooLong => {
+                let response = err_response(
+                    "",
+                    ErrorCode::InvalidArgs,
+                    format!("control request exceeds {MAX_LINE_BYTES} bytes"),
+                );
+                writer
+                    .write_all(encode_response(&response)?.as_bytes())
+                    .context("failed to write a control response")?;
+                writer
+                    .flush()
+                    .context("failed to flush the control response")?;
+                break;
+            }
+            RequestLine::Line(line) => line,
+        };
+        let line = line.trim();
         if line.is_empty() {
             continue;
         }
@@ -262,6 +322,40 @@ mod tests {
     }
 
     #[test]
+    fn bounded_line_reader_rejects_unterminated_and_oversized_input() {
+        let mut buf = Vec::new();
+        let mut unterminated = std::io::Cursor::new(b"{}".to_vec());
+        assert!(matches!(
+            read_request_line(&mut unterminated, &mut buf),
+            Ok(RequestLine::TooLong)
+        ));
+
+        let mut oversized = std::io::Cursor::new(vec![b'x'; MAX_LINE_BYTES + 1]);
+        assert!(matches!(
+            read_request_line(&mut oversized, &mut buf),
+            Ok(RequestLine::TooLong)
+        ));
+
+        let mut valid = std::io::Cursor::new(b"{}\n".to_vec());
+        match read_request_line(&mut valid, &mut buf) {
+            Ok(RequestLine::Line(line)) => assert_eq!(line, "{}"),
+            other => panic!("expected a complete bounded line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connection_slots_are_bounded_and_released() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut permits = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            permits.push(try_acquire_connection(Arc::clone(&counter)).expect("slot"));
+        }
+        assert!(try_acquire_connection(Arc::clone(&counter)).is_none());
+        permits.pop();
+        assert!(try_acquire_connection(Arc::clone(&counter)).is_some());
+    }
+
+    #[test]
     fn malformed_line_gets_invalid_args() {
         let res = error_response(
             "7",
@@ -277,6 +371,36 @@ mod tests {
             }
             _ => panic!("expected error response"),
         }
+    }
+
+    #[test]
+    fn oversized_socket_request_is_rejected_at_the_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let server = ControlServer::bind(&path).unwrap();
+        server.listener.set_nonblocking(true).unwrap();
+
+        let client = UnixStream::connect(&path).unwrap();
+        let (accepted, _) = server.listener.accept().unwrap();
+        let service = Service::new_for_tests();
+        let handle = std::thread::spawn(move || handle_connection(accepted, &service).unwrap());
+
+        let mut writer = client.try_clone().unwrap();
+        writer.write_all(&vec![b'x'; MAX_LINE_BYTES + 1]).unwrap();
+        writer.flush().unwrap();
+
+        let mut reader = BufReader::new(&client);
+        let mut response = String::new();
+        reader.read_line(&mut response).unwrap();
+        let response = emersia_protocol::decode_response(response.trim()).unwrap();
+        match response {
+            Response::Err(error) => assert_eq!(error.error.code, ErrorCode::InvalidArgs),
+            other => panic!("expected oversized-request error, got {other:?}"),
+        }
+        drop(reader);
+        drop(writer);
+        drop(client);
+        let _ = handle.join();
     }
 
     #[test]
