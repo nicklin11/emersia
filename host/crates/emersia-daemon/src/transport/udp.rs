@@ -273,6 +273,11 @@ impl HostEndpoint {
         self.peers.len()
     }
 
+    /// Ids of peers with a confirmed session.
+    pub fn peer_ids(&self) -> Vec<[u8; DEVICE_ID_LEN]> {
+        self.peers.keys().copied().collect()
+    }
+
     /// Disconnect a device and purge any handshakes that could confirm it.
     /// Returns whether either confirmed or pending state existed.
     pub fn disconnect(&mut self, device_id: &[u8; DEVICE_ID_LEN]) -> bool {
@@ -532,6 +537,7 @@ mod tests {
     fn handshake_over_real_sockets_connects_a_peer() {
         let (mut host, _client, id) = established();
         assert_eq!(host.peer_count(), 1);
+        assert_eq!(host.peer_ids(), vec![id]);
         assert!(host
             .send_frame(&id, 0, true, Codec::H264.payload_type(), b"hello")
             .is_ok());
@@ -639,6 +645,7 @@ mod tests {
         assert_eq!(host.peer_count(), 1);
         assert!(host.disconnect(&id), "revoke should drop the live peer");
         assert_eq!(host.peer_count(), 0);
+        assert!(host.peer_ids().is_empty());
         assert!(matches!(
             host.send_frame(&id, 0, false, Codec::H264.payload_type(), b"x"),
             Err(TransportError::Dropped(_))
@@ -655,6 +662,7 @@ mod tests {
         );
         assert_eq!(host.pending.len(), 0, "revoked confirmation is consumed");
         assert_eq!(host.peer_count(), 0);
+        assert!(host.peer_ids().is_empty());
     }
 
     #[test]
