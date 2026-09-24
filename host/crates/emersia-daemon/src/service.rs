@@ -423,7 +423,6 @@ impl Service {
         json!({
             "streaming": inner.streaming,
             "backend": inner.backend,
-            "encoder": serde_json::Value::Null,
             "selected_output": inner.selected,
             "fps_target": inner.fps_target,
             "frames": inner.stats.frames,
@@ -839,13 +838,17 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                     }
                 }
                 // Pace to the requested rate; drop frames if capture is slow.
+                // Sample timings before sleeping so pacing is not reported as
+                // capture or frame-processing latency.
+                let frame_latency = started.elapsed();
+                let since_last = last_frame.elapsed();
                 let interval = Duration::from_secs_f64(1.0 / service.fps_target() as f64);
                 let elapsed = started.elapsed();
                 if elapsed < interval {
                     std::thread::sleep(interval - elapsed);
                 }
-                service.record_frame(started.elapsed(), last_frame.elapsed());
-                engine.note_capture(last_frame.elapsed());
+                service.record_frame(frame_latency, since_last);
+                engine.note_capture(since_last);
                 last_frame = Instant::now();
             }
             Err(err) => {
@@ -1229,12 +1232,12 @@ mod tests {
     #[test]
     fn record_frame_updates_running_stats() {
         let s = service_with_outputs();
-        s.record_frame(Duration::from_millis(10), Duration::from_millis(20));
-        s.record_frame(Duration::from_millis(20), Duration::from_millis(20));
+        s.record_frame(Duration::from_millis(5), Duration::from_millis(33));
+        s.record_frame(Duration::from_millis(20), Duration::from_millis(33));
         let p = ok_payload(s.handle(req("1", Command::Status)));
         assert_eq!(p["frames"], 2);
         assert_eq!(p["latency_ms"], 20.0);
-        assert_eq!(p["avg_latency_ms"], 15.0);
+        assert_eq!(p["avg_latency_ms"], 12.5);
     }
 
     #[test]
