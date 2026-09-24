@@ -337,6 +337,9 @@ pub fn open_packet(
     let plaintext = crate::crypto::open(session, direction, sequence as u64, &sealed[4..])
         .map_err(|_| TransportError::Dropped("authentication failed"))?;
     let (header, payload) = parse_record(&plaintext)?;
+    if header.sequence != sequence {
+        return Err(TransportError::MalformedRecord);
+    }
     if !window.commit(sequence) {
         return Err(TransportError::Dropped("replayed or too old"));
     }
@@ -542,6 +545,33 @@ mod tests {
         assert!(matches!(
             open_packet(&s, Direction::HostToDevice, &mut w, &forged),
             Err(TransportError::Dropped(_))
+        ));
+
+        let valid_record =
+            build_record(0, 0, 0, false, Codec::H264.payload_type(), b"valid", 0, 1).unwrap();
+        let valid = seal_packet(&s, Direction::HostToDevice, 0, &valid_record).unwrap();
+        assert!(open_packet(&s, Direction::HostToDevice, &mut w, &valid).is_ok());
+    }
+
+    #[test]
+    fn authenticated_header_sequence_must_match_wire_sequence() {
+        let s = session();
+        let mismatched_record = build_record(
+            2,
+            2,
+            0,
+            false,
+            Codec::H264.payload_type(),
+            b"mismatch",
+            0,
+            1,
+        )
+        .unwrap();
+        let mismatched = seal_packet(&s, Direction::HostToDevice, 1, &mismatched_record).unwrap();
+        let mut w = ReplayWindow::default();
+        assert!(matches!(
+            open_packet(&s, Direction::HostToDevice, &mut w, &mismatched),
+            Err(TransportError::MalformedRecord)
         ));
 
         let valid_record =

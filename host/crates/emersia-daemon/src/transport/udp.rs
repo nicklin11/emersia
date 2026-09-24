@@ -35,6 +35,9 @@ const PENDING_HANDSHAKE_TTL: Duration = Duration::from_secs(10);
 /// Maximum number of source tuples allowed to have an in-flight handshake.
 const MAX_PENDING_HANDSHAKES: usize = 64;
 
+/// A single paired device may not consume the entire global handshake budget.
+const MAX_PENDING_HANDSHAKES_PER_DEVICE: usize = 4;
+
 /// Outcome of offering one packet to the host.
 #[derive(Debug, PartialEq, Eq)]
 pub enum HostOutcome {
@@ -148,7 +151,15 @@ impl HostEndpoint {
 
         // A source may replace its own pending handshake, but a new source must
         // not grow the map beyond the fixed resource bound.
-        if self.pending.len() >= MAX_PENDING_HANDSHAKES && !self.pending.contains_key(&from) {
+        if !self.pending.contains_key(&from)
+            && (self.pending.len() >= MAX_PENDING_HANDSHAKES
+                || self
+                    .pending
+                    .values()
+                    .filter(|pending| pending.device_id == device_id)
+                    .count()
+                    >= MAX_PENDING_HANDSHAKES_PER_DEVICE)
+        {
             return HostOutcome::Silent;
         }
 
@@ -668,16 +679,19 @@ mod tests {
         let host_identity = DeviceIdentity::generate().unwrap();
         let mut host = HostEndpoint::bind("127.0.0.1:0", host_identity).unwrap();
         let host_static = host.host_identity.public_key_bytes();
-        let device = DeviceIdentity::generate().unwrap();
-        let mut client = HandshakeClient::new(dev_id(5), device, host_static);
-        let init = client.init();
+        let mut inits = Vec::with_capacity(MAX_PENDING_HANDSHAKES + 1);
+        for index in 0..=MAX_PENDING_HANDSHAKES {
+            let device = DeviceIdentity::generate().unwrap();
+            let mut client = HandshakeClient::new(dev_id(20 + index as u8), device, host_static);
+            inits.push(client.init());
+        }
         let mut allow = |_: &[u8; DEVICE_ID_LEN], _: &[u8; 32]| true;
         let mut addresses = Vec::with_capacity(MAX_PENDING_HANDSHAKES + 1);
 
-        for index in 0..=MAX_PENDING_HANDSHAKES {
+        for (index, init) in inits.iter().enumerate() {
             let from = SocketAddr::from(([127, 0, 0, 1], 20_000 + index as u16));
             addresses.push(from);
-            let outcome = host.handle_packet(&init, from, &mut allow);
+            let outcome = host.handle_packet(init, from, &mut allow);
             if index < MAX_PENDING_HANDSHAKES {
                 assert!(matches!(outcome, HostOutcome::Reply(_)));
             } else {
@@ -688,10 +702,42 @@ mod tests {
 
         // An admitted source may replace its own entry without growing the map.
         assert!(matches!(
-            host.handle_packet(&init, addresses[0], &mut allow),
+            host.handle_packet(&inits[0], addresses[0], &mut allow),
             HostOutcome::Reply(_)
         ));
         assert_eq!(host.pending.len(), MAX_PENDING_HANDSHAKES);
+    }
+
+    #[test]
+    fn one_device_cannot_consume_the_global_pending_budget() {
+        let host_identity = DeviceIdentity::generate().unwrap();
+        let mut host = HostEndpoint::bind("127.0.0.1:0", host_identity).unwrap();
+        let host_static = host.host_identity.public_key_bytes();
+        let device = DeviceIdentity::generate().unwrap();
+        let mut client = HandshakeClient::new(dev_id(6), device, host_static);
+        let init = client.init();
+        let mut allow = |_: &[u8; DEVICE_ID_LEN], _: &[u8; 32]| true;
+
+        for index in 0..=MAX_PENDING_HANDSHAKES_PER_DEVICE {
+            let from = SocketAddr::from(([127, 0, 0, 1], 30_000 + index as u16));
+            let outcome = host.handle_packet(&init, from, &mut allow);
+            if index < MAX_PENDING_HANDSHAKES_PER_DEVICE {
+                assert!(matches!(outcome, HostOutcome::Reply(_)));
+            } else {
+                assert_eq!(outcome, HostOutcome::Silent);
+            }
+        }
+        assert_eq!(host.pending.len(), MAX_PENDING_HANDSHAKES_PER_DEVICE);
+
+        let other_device = DeviceIdentity::generate().unwrap();
+        let mut other_client = HandshakeClient::new(dev_id(7), other_device, host_static);
+        let other_init = other_client.init();
+        let other_from = "127.0.0.1:30010".parse().unwrap();
+        assert!(matches!(
+            host.handle_packet(&other_init, other_from, &mut allow),
+            HostOutcome::Reply(_)
+        ));
+        assert_eq!(host.pending.len(), MAX_PENDING_HANDSHAKES_PER_DEVICE + 1);
     }
 
     #[test]
