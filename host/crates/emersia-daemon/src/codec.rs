@@ -411,6 +411,14 @@ impl AnnexBParser {
             None
         };
 
+        // An explicit AUD starts a fresh access unit even when the preceding
+        // unit contained only parameter sets. Discard that uncommitted group
+        // so repeated AUDs cannot grow the pending prefix indefinitely.
+        if is_aud {
+            self.pending_parameter_sets.clear();
+            self.collecting_sets = false;
+        }
+
         // Encoders repeat parameter sets on each keyframe. Keep only the
         // current group: once picture data has closed a group, the next
         // parameter set starts a replacement rather than extending history.
@@ -885,6 +893,60 @@ mod tests {
         assert_eq!(p.parameter_sets().len(), old_len);
         p.finish().unwrap();
         assert_eq!(p.parameter_sets().len(), new_sps.len() + new_pps.len());
+    }
+
+    #[test]
+    fn aud_discards_an_uncommitted_parameter_set_group() {
+        let first_sps = h264_nal(h264::SPS, 30);
+        let first_pps = h264_nal(h264::PPS, 20);
+        let second_sps = h264_nal(h264::SPS, 40);
+        let second_pps = h264_nal(h264::PPS, 30);
+        let stream = [
+            &h264_nal(h264::AUD, 1)[..],
+            &first_sps[..],
+            &first_pps[..],
+            &h264_nal(h264::AUD, 1)[..],
+            &second_sps[..],
+            &second_pps[..],
+            &h264_nal(h264::IDR, 100)[..],
+        ]
+        .concat();
+        let mut p = AnnexBParser::new(Codec::H264);
+        parse_all(&mut p, &stream);
+        assert_eq!(
+            p.parameter_sets().len(),
+            second_sps.len() + second_pps.len(),
+            "AUD must discard the previous uncommitted group"
+        );
+    }
+
+    #[test]
+    fn repeated_hevc_parameter_sets_replace_rather_than_accumulate() {
+        let group = [
+            nal(Codec::Hevc, hevc::PARAMETER_SET, 12),
+            nal(Codec::Hevc, hevc::PARAMETER_SET, 10),
+            nal(Codec::Hevc, hevc::PARAMETER_SET, 4),
+            hevc_vcl(hevc::CRA, true, 80),
+        ]
+        .concat();
+        let stream = (0..100).flat_map(|_| group.clone()).collect::<Vec<_>>();
+        let mut p = AnnexBParser::new(Codec::Hevc);
+        let aus = parse_all(&mut p, &stream);
+        assert_eq!(aus.len(), 100);
+        assert_eq!(
+            p.parameter_sets().len(),
+            group.len() - hevc_vcl(hevc::CRA, true, 80).len()
+        );
+    }
+
+    #[test]
+    fn oversized_parameter_set_reports_the_byte_count() {
+        let oversized = h264_nal(h264::SPS, MAX_PARAMETER_SET_BYTES);
+        let stream = [&oversized[..], &h264_nal(h264::PPS, 1)[..]].concat();
+        let mut p = AnnexBParser::new(Codec::H264);
+        let err = p.push(&stream).unwrap_err();
+        assert_eq!(err, CodecError::TooManyParameterSets(oversized.len()));
+        assert!(err.to_string().contains("bytes"));
     }
 
     /// Parse a real encoder bitstream captured into `tests/fixtures`.
