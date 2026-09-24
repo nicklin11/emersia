@@ -180,17 +180,6 @@ impl Service {
         std::mem::take(&mut self.lock().revoked_pending)
     }
 
-    /// Ids of devices currently connected, for outbound sends.
-    pub fn connected_device_ids(&self) -> Vec<[u8; 8]> {
-        let mut out = Vec::new();
-        for d in self.lock_pairing().active_devices() {
-            if let Some(bytes) = decode_device_id(&d.id) {
-                out.push(bytes);
-            }
-        }
-        out
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         // A poisoned lock means a prior thread panicked mid-update; the state
         // is plain data with no invariants spanning fields, so recovering is
@@ -770,7 +759,11 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                             // Ship every access unit that is ready. Each packet
                             // carries the parameter sets in-band (ADR 0003), so
                             // a device joining mid-stream can decode at once.
-                            let ids = service.connected_device_ids();
+                            let ids = engine
+                                .transport
+                                .as_ref()
+                                .map(|transport| transport.peer_ids())
+                                .unwrap_or_default();
                             let mut shipped = 0u32;
                             while let Some(au) = engine
                                 .encoder
