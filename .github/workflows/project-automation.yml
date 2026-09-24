@@ -56,7 +56,15 @@ jobs:
               switch (context.eventName + ":" + ev.action) {
                 case "issues:opened":
                 case "issues:reopened":
-                  status = "Todo";
+                  // An issue can be created already carrying a status label
+                  // (`gh issue create --label "status: in-progress"`), and that
+                  // does not produce a separate `labeled` event — so honour
+                  // the label here or the board silently disagrees with the
+                  // issue forever.
+                  status = (ev.issue.labels?.nodes ?? [])
+                    .some(l => l.name === "status: in-progress")
+                    ? "In Progress"
+                    : "Todo";
                   break;
                 case "issues:assigned":
                   status = "In Progress";
