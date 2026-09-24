@@ -19,7 +19,8 @@ use emersia_protocol::{
 };
 use serde::Serialize;
 use serde_json::json;
-use wayland_client::Connection;
+use wayland_client::backend::WaylandError;
+use wayland_client::{Connection, DispatchError};
 
 use crate::capture::{self, Backend, BackendPref};
 use crate::control::{err_response, ok_response};
@@ -49,6 +50,26 @@ const MISSING_FFMPEG_ERROR: &str = "streaming needs the ffmpeg binary, which was
 
 /// Delay between attempts to replace a protocol-fatal Wayland connection.
 const WAYLAND_RECONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Detect a terminal Wayland protocol error in the full `anyhow` chain.
+///
+/// `capture` may drop a live SHM proxy while unwinding. Its destructor can
+/// flush an I/O error after the compositor has already sent `wl_display.error`,
+/// replacing the backend's stored protocol error. The original dispatch error
+/// still contains the protocol variant, so classify it before relying on
+/// `Connection::protocol_error()` on the next loop iteration.
+fn is_wayland_protocol_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        source
+            .downcast_ref::<DispatchError>()
+            .is_some_and(|dispatch| {
+                matches!(dispatch, DispatchError::Backend(WaylandError::Protocol(_)))
+            })
+            || source
+                .downcast_ref::<WaylandError>()
+                .is_some_and(|wayland| matches!(wayland, WaylandError::Protocol(_)))
+    })
+}
 
 /// Report an encoder startup failure without terminating the daemon.
 ///
@@ -532,6 +553,9 @@ pub struct Engine {
     /// The connection is kept alongside the queue so a protocol error can be
     /// detected after the queue reports a generic dispatch failure.
     connection: Connection,
+    /// Latched from the original dispatch error; survives SHM destructor
+    /// teardown that can overwrite the backend's stored error with EPIPE.
+    protocol_failed: bool,
     queue: wayland_client::EventQueue<capture::State>,
     state: capture::State,
     /// Backend preference supplied at startup, retained for reconnect.
@@ -588,7 +612,14 @@ impl Engine {
     /// error, which otherwise makes a reconnect look like a transient capture
     /// failure.
     fn wayland_protocol_failed(&self) -> bool {
-        self.connection.protocol_error().is_some()
+        self.protocol_failed || self.connection.protocol_error().is_some()
+    }
+
+    /// Latch a protocol failure from the returned error before any subsequent
+    /// proxy teardown can hide it behind an I/O error.
+    fn latch_protocol_failure(&mut self, error: &anyhow::Error) -> bool {
+        self.protocol_failed |= is_wayland_protocol_error(error);
+        self.wayland_protocol_failed()
     }
 
     /// Replace a protocol-fatal Wayland connection while retaining the UDP
@@ -599,9 +630,11 @@ impl Engine {
     /// the previously selected output disappeared and discovery selected the
     /// first available output instead.
     fn reconnect(&mut self, selected: Option<&str>) -> anyhow::Result<Option<String>> {
-        // A protocol-fatal connection cannot service the old encoder's input
-        // or Wayland state. Drop it before rediscovering so helper threads do
-        // not keep running against a socket that is known to be invalid.
+        // A protocol-fatal connection cannot service the old encoder's input.
+        // Drop the encoder before rediscovery so helper threads do not keep
+        // running against a session that is known to be invalid. The poisoned
+        // Wayland objects remain owned until a replacement is ready, but are
+        // never used again.
         self.encoder.take();
 
         let mut fresh = Self::discover(self.backend_pref)?;
@@ -737,6 +770,7 @@ impl Engine {
 
         Ok(Self {
             connection: conn,
+            protocol_failed: false,
             queue,
             state,
             backend_pref: pref,
@@ -890,7 +924,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
 
         if let Some(name) = service.selected_output() {
             if let Err(e) = engine.set_output(&name) {
-                if !engine.wayland_protocol_failed() {
+                if !engine.latch_protocol_failure(&e) {
                     service.record_error(format!("output selection: {e:#}"));
                     eprintln!("emersia-daemon: output selection failed: {e:#}");
                 }
@@ -1027,7 +1061,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                 last_frame = Instant::now();
             }
             Err(err) => {
-                if engine.wayland_protocol_failed() {
+                if engine.latch_protocol_failure(&err) {
                     // Leave streaming enabled; the next loop iteration replaces
                     // the poisoned Wayland connection. Retrying this queue
                     // would violate the Wayland protocol error contract.
@@ -1045,6 +1079,30 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
 mod tests {
     use super::*;
     use emersia_protocol::{Command, ResponseErr, ResponseOk, RevokeArgs, StartArgs};
+    use wayland_client::backend::protocol::ProtocolError;
+    use wayland_client::backend::WaylandError;
+    use wayland_client::DispatchError;
+
+    fn protocol_error() -> ProtocolError {
+        ProtocolError {
+            code: 2,
+            object_id: 1,
+            object_interface: "wl_display".into(),
+            message: "fatal test protocol error".into(),
+        }
+    }
+
+    #[test]
+    fn protocol_error_is_latched_from_dispatch_and_backend_errors() {
+        let dispatch = anyhow::Error::new(DispatchError::Backend(WaylandError::Protocol(
+            protocol_error(),
+        )));
+        assert!(is_wayland_protocol_error(&dispatch));
+        let direct = anyhow::Error::new(WaylandError::Protocol(protocol_error()));
+        assert!(is_wayland_protocol_error(&direct));
+        let ordinary = anyhow::anyhow!("ordinary capture failure");
+        assert!(!is_wayland_protocol_error(&ordinary));
+    }
 
     /// A service backed by a throwaway trust store, with fake outputs.
     fn service_with_outputs() -> Service {
