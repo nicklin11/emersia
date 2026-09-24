@@ -224,6 +224,11 @@ impl Service {
         self.lock().fps_target.max(1)
     }
 
+    /// Output name selected by the control plane for the next capture.
+    pub fn selected_output(&self) -> Option<String> {
+        self.lock().selected.clone()
+    }
+
     pub fn is_shutting_down(&self) -> bool {
         self.shutdown.load(Ordering::Relaxed)
     }
@@ -458,6 +463,22 @@ fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
+fn screen_infos(state: &capture::State) -> Vec<ScreenInfo> {
+    let labels = state.output_labels();
+    state
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(i, info)| ScreenInfo {
+            kind: "output",
+            name: labels[i].clone(),
+            width: info.width,
+            height: info.height,
+            transform: format!("{:?}", info.transform).to_lowercase(),
+        })
+        .collect()
+}
+
 /// Map a pairing failure onto a stable wire error token.
 fn pairing_error_code(err: &PairingError) -> ErrorCode {
     use PairingError as P;
@@ -634,18 +655,7 @@ impl Engine {
         let index = capture::select_output(&labels, None)?;
         let output = state.outputs[index].proxy.clone();
         let transform = state.outputs[index].transform;
-        let screens = state
-            .outputs
-            .iter()
-            .enumerate()
-            .map(|(i, info)| ScreenInfo {
-                kind: "output",
-                name: labels[i].clone(),
-                width: info.width,
-                height: info.height,
-                transform: format!("{:?}", info.transform).to_lowercase(),
-            })
-            .collect();
+        let screens = screen_infos(&state);
 
         Ok(Self {
             queue,
@@ -662,6 +672,17 @@ impl Engine {
             backend_name: backend.protocol(),
             screens,
         })
+    }
+
+    /// Select a named output from the live discovery state.
+    pub fn set_output(&mut self, name: &str) -> anyhow::Result<()> {
+        let labels = self.state.output_labels();
+        let index = capture::select_output(&labels, Some(name))?;
+        let info = &self.state.outputs[index];
+        self.output = info.proxy.clone();
+        self.transform = info.transform;
+        self.screens = screen_infos(&self.state);
+        Ok(())
     }
 
     /// Capture exactly one frame with the selected backend.
@@ -690,6 +711,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
     let mut last_frame = Instant::now();
     let mut timestamp: u32 = 0;
     let mut last_peers = 0usize;
+    let mut applied_output: Option<String> = None;
 
     while !service.is_shutting_down() && !crate::signal_received() {
         // Always service the transport so a device can pair and connect even
@@ -746,6 +768,17 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
             std::thread::sleep(IDLE_TICK);
             last_frame = Instant::now();
             continue;
+        }
+        if let Some(name) = service.selected_output() {
+            if let Err(e) = engine.set_output(&name) {
+                service.record_error(format!("output selection: {e:#}"));
+                eprintln!("emersia-daemon: output selection failed: {e:#}");
+                continue;
+            }
+            if applied_output.as_deref() != Some(name.as_str()) {
+                service.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
+                applied_output = Some(name);
+            }
         }
         let started = Instant::now();
         match engine.capture_once() {
@@ -993,6 +1026,7 @@ mod tests {
         assert_eq!(p["output"], "HDMI-A-1");
         assert_eq!(p["fps"], 60);
         assert_eq!(s.fps_target(), 60);
+        assert_eq!(s.selected_output().as_deref(), Some("HDMI-A-1"));
     }
 
     #[test]
