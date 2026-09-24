@@ -23,8 +23,29 @@ use wayland_client::Connection;
 
 use crate::capture::{self, Backend, BackendPref};
 use crate::control::{err_response, ok_response};
-use crate::crypto::HostIdentity;
 use crate::pairing::{PairingDb, PairingError};
+use crate::transport::udp::HostEndpoint;
+use crate::transport::VIDEO_CLOCK_HZ;
+
+/// A minimal copy of a paired device, for the transport authorizer.
+#[derive(Debug, Clone)]
+pub struct DeviceSnapshot {
+    pub id: String,
+    pub public_key: String,
+    pub revoked: bool,
+}
+
+/// Decode a hex device id back to bytes.
+fn decode_device_id(hex_str: &str) -> Option<[u8; 8]> {
+    if hex_str.len() != 16 {
+        return None;
+    }
+    let mut out = [0u8; 8];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
 
 /// Default capture rate when `start` does not specify one.
 const DEFAULT_FPS: u32 = 30;
@@ -61,10 +82,19 @@ struct Inner {
     backend: Option<&'static str>,
     stats: Stats,
     last_error: Option<String>,
+    /// Devices currently connected to the streaming endpoint.
+    stream_peers: usize,
+    /// Devices revoked since the engine last drained; the engine disconnects
+    /// them, which is how "revoke kills an active session" is honoured.
+    revoked_pending: Vec<[u8; 8]>,
 }
 
 /// Shared control-plane state. Cheap to clone via `Arc`; the Wayland machinery
 /// stays on the engine thread.
+///
+/// **Lock order:** `pairing` before `inner`, or one at a time. Holding `inner`
+/// across a `pairing` acquisition deadlocks against a revoke that does the
+/// reverse. `status_payload` shows the safe shape.
 #[derive(Debug)]
 pub struct Service {
     inner: Mutex<Inner>,
@@ -78,7 +108,7 @@ pub struct Service {
 }
 
 impl Service {
-    pub fn new(pairing: PairingDb, host: &HostIdentity) -> Self {
+    pub fn new(pairing: PairingDb, host_public_key_hex: &str) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 fps_target: DEFAULT_FPS,
@@ -86,7 +116,7 @@ impl Service {
             }),
             shutdown: AtomicBool::new(false),
             pairing: Mutex::new(pairing),
-            host_public_key: host.public_key_hex(),
+            host_public_key: host_public_key_hex.to_string(),
         }
     }
 
@@ -95,15 +125,54 @@ impl Service {
     pub fn new_for_tests() -> Arc<Self> {
         let dir = tempfile::tempdir().expect("temp dir for test trust store");
         let db = PairingDb::load(&dir.path().join("pairing.json")).expect("fresh store");
-        let host =
-            HostIdentity::load_or_create(&dir.path().join("host.key")).expect("host identity");
+        let host = crate::crypto::HostIdentity::load_or_create(&dir.path().join("host.key"))
+            .expect("host identity");
+        let host_hex = host.public_key_hex();
         // The store writes to this path for the life of the test process.
         std::mem::forget(dir);
-        Arc::new(Self::new(db, &host))
+        Arc::new(Self::new(db, &host_hex))
     }
 
     fn lock_pairing(&self) -> std::sync::MutexGuard<'_, PairingDb> {
         self.pairing.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Copy of the device table for the transport's default-deny check.
+    ///
+    /// The closure passed to the transport must not borrow the service (the
+    /// engine holds it), so we hand over an owned snapshot instead.
+    pub fn clone_pairing_snapshot(&self) -> Vec<DeviceSnapshot> {
+        self.lock_pairing()
+            .devices()
+            .into_iter()
+            .map(|d| DeviceSnapshot {
+                id: d.id,
+                public_key: d.public_key,
+                revoked: d.revoked,
+            })
+            .collect()
+    }
+
+    /// Record how many devices are connected to the streaming endpoint.
+    pub fn set_stream_peers(&self, count: usize) {
+        self.lock().stream_peers = count;
+    }
+
+    /// Take device ids revoked since the last call, so the engine can drop
+    /// their live sessions.
+    pub fn take_revoked(&self) -> Vec<[u8; 8]> {
+        std::mem::take(&mut self.lock().revoked_pending)
+    }
+
+    /// Ids of devices currently connected, for outbound sends.
+    pub fn connected_device_ids(&self) -> Vec<[u8; 8]> {
+        let mut out = Vec::new();
+        for d in self.lock_pairing().active_devices() {
+            if let Some(bytes) = decode_device_id(&d.id) {
+                out.push(bytes);
+            }
+        }
+        out
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -209,10 +278,21 @@ impl Service {
                 let active = devices.iter().filter(|d| !d.revoked).count();
                 ok_response(&id, json!({ "devices": devices, "active": active }))
             }
-            Command::Revoke(args) => match self.lock_pairing().revoke(&args.device) {
-                Ok(device) => ok_response(&id, json!({ "revoked": true, "device": device.id })),
-                Err(e) => err_response(&id, pairing_error_code(&e), e.to_string()),
-            },
+            Command::Revoke(args) => {
+                // Scope the pairing guard so it is released before `inner` is
+                // taken; see `status_payload` for the lock order.
+                let outcome = self.lock_pairing().revoke(&args.device);
+                match outcome {
+                    Ok(device) => {
+                        // Hand the id to the engine so the live session dies now.
+                        if let Some(bytes) = decode_device_id(&device.id) {
+                            self.lock().revoked_pending.push(bytes);
+                        }
+                        ok_response(&id, json!({ "revoked": true, "device": device.id }))
+                    }
+                    Err(e) => err_response(&id, pairing_error_code(&e), e.to_string()),
+                }
+            }
             Command::Select(args) => {
                 if args.targets.is_empty() {
                     let mut inner = self.lock();
@@ -320,6 +400,10 @@ impl Service {
     }
 
     fn status_payload(&self) -> serde_json::Value {
+        // Lock order matters: `inner` is taken first here, so anything that
+        // needs both must do the same. Acquire the pairing read before `inner`
+        // and release it, then take `inner`.
+        let paired_devices = self.lock_pairing().active_devices().len();
         let inner = self.lock();
         json!({
             "streaming": inner.streaming,
@@ -331,8 +415,8 @@ impl Service {
             "latency_ms": round2(inner.stats.last_latency_ms),
             "avg_latency_ms": round2(inner.stats.avg_latency_ms),
             "measured_fps": round2(inner.stats.measured_fps),
-            "connected_devices": 0,
-            "paired_devices": self.lock_pairing().active_devices().len(),
+            "connected_devices": inner.stream_peers,
+            "paired_devices": paired_devices,
             "last_error": inner.last_error,
             "protocol_version": PROTOCOL_VERSION,
             "host_public_key": self.host_public_key,
@@ -360,6 +444,8 @@ fn pairing_error_code(err: &PairingError) -> ErrorCode {
 pub struct Engine {
     queue: wayland_client::EventQueue<capture::State>,
     state: capture::State,
+    /// Streaming endpoint; bound even when idle so a device can pair and wait.
+    transport: Option<HostEndpoint>,
     output: wayland_client::protocol::wl_output::WlOutput,
     transform: wayland_client::protocol::wl_output::Transform,
     backend: Backend,
@@ -369,6 +455,31 @@ pub struct Engine {
 
 impl Engine {
     /// Connect to Wayland, enumerate outputs, and pick a backend/output.
+    /// Bind the streaming endpoint, if a port was requested.
+    ///
+    /// `identity` must be the host's persisted long-term identity: devices pin
+    /// that exact public key, and a different one would fail verification.
+    pub fn with_stream_port(
+        mut self,
+        port: Option<u16>,
+        identity: crate::crypto::DeviceIdentity,
+    ) -> anyhow::Result<Self> {
+        let Some(port) = port else {
+            self.transport = None;
+            return Ok(self);
+        };
+        self.transport = Some(
+            HostEndpoint::bind(&format!("0.0.0.0:{port}"), identity)
+                .map_err(|e| anyhow::anyhow!("could not bind UDP port {port}: {e}"))?,
+        );
+        Ok(self)
+    }
+
+    /// The streaming endpoint, once bound.
+    pub fn transport(&self) -> Option<&HostEndpoint> {
+        self.transport.as_ref()
+    }
+
     pub fn discover(pref: BackendPref) -> anyhow::Result<Self> {
         let conn = Connection::connect_to_env()
             .context("failed to connect to a Wayland compositor (is WAYLAND_DISPLAY set?)")?;
@@ -408,6 +519,7 @@ impl Engine {
         Ok(Self {
             queue,
             state,
+            transport: None,
             output,
             transform,
             backend,
@@ -431,11 +543,42 @@ impl Engine {
 }
 
 /// Run the engine until shutdown: capture while streaming, idle otherwise.
+///
+/// While a device is connected the captured frame is shipped over the
+/// encrypted transport. Frames are sent as a downscaled RGBA preview: the
+/// encoder stage has not landed yet, so a full 1080p RGBA frame would be ~8 MB
+/// per frame and is not something to put on a wire. The preview proves the
+/// path end to end; the encoder replaces it in M1.5.
 pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
     service.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
     let mut last_frame = Instant::now();
+    let mut timestamp: u32 = 0;
 
     while !service.is_shutting_down() && !crate::signal_received() {
+        // Always service the transport so a device can pair and connect even
+        // when we are not capturing.
+        if let Some(transport) = engine.transport.as_mut() {
+            // A revoked device loses its session immediately.
+            for id in service.take_revoked() {
+                if transport.disconnect(&id) {
+                    eprintln!(
+                        "emersia-daemon: revoked device {} disconnected from the stream",
+                        hex::encode(id)
+                    );
+                }
+            }
+            let pairing = service.clone_pairing_snapshot();
+            let mut allowed = move |id: &[u8; 8], pubkey: &[u8; 32]| {
+                pairing.iter().any(|d| {
+                    d.id == hex::encode(id)
+                        && d.public_key.eq_ignore_ascii_case(&hex::encode(pubkey))
+                        && !d.revoked
+                })
+            };
+            let _ = transport.pump(16, &mut allowed);
+            service.set_stream_peers(transport.peer_count());
+        }
+
         if !service.is_streaming() {
             std::thread::sleep(IDLE_TICK);
             last_frame = Instant::now();
@@ -444,6 +587,25 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
         let started = Instant::now();
         match engine.capture_once() {
             Ok(frame) => {
+                if let Some(transport) = engine.transport.as_mut() {
+                    if transport.peer_count() > 0 {
+                        // 90 kHz presentation clock, per ADR 0003.
+                        timestamp = timestamp.wrapping_add(
+                            ((VIDEO_CLOCK_HZ as u64 / service.fps_target().max(1) as u64) as u32)
+                                .max(1),
+                        );
+                        let preview = downscale_rgba(&frame, PREVIEW_MAX_WIDTH);
+                        for id in service.connected_device_ids() {
+                            let _ = transport.send_frame(
+                                &id,
+                                timestamp,
+                                true,
+                                crate::transport::PAYLOAD_TYPE_RAW,
+                                &preview,
+                            );
+                        }
+                    }
+                }
                 // Pace to the requested rate; drop frames if capture is slow.
                 let interval = Duration::from_secs_f64(1.0 / service.fps_target() as f64);
                 let elapsed = started.elapsed();
@@ -452,7 +614,6 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                 }
                 service.record_frame(started.elapsed(), last_frame.elapsed());
                 last_frame = Instant::now();
-                let _ = frame; // M1.3 pipes this into the encoder.
             }
             Err(err) => {
                 service.record_error(format!("{err:#}"));
@@ -460,6 +621,29 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
             }
         }
     }
+}
+
+/// Width of the preview shipped to a device before the encoder exists.
+const PREVIEW_MAX_WIDTH: u32 = 320;
+
+/// Nearest-neighbour downscale of an RGBA frame. No dependency, and adequate
+/// for proving the transport path; the encoder will replace this entirely.
+fn downscale_rgba(frame: &crate::frame::Frame, max_width: u32) -> Vec<u8> {
+    if frame.width <= max_width {
+        return frame.rgba.clone();
+    }
+    let out_w = max_width;
+    let out_h = ((frame.height as u64 * out_w as u64) / frame.width as u64).max(1) as u32;
+    let mut out = Vec::with_capacity((out_w * out_h * 4) as usize);
+    for y in 0..out_h {
+        let sy = ((y as u64 * frame.height as u64) / out_h as u64) as u32;
+        for x in 0..out_w {
+            let sx = ((x as u64 * frame.width as u64) / out_w as u64) as u32;
+            let si = ((sy * frame.width + sx) * 4) as usize;
+            out.extend_from_slice(&frame.rgba[si..si + 4]);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -471,8 +655,10 @@ mod tests {
     fn service_with_outputs() -> Service {
         let dir = tempfile::tempdir().expect("temp trust store");
         let db = PairingDb::load(&dir.path().join("pairing.json")).expect("fresh store");
-        let host = HostIdentity::load_or_create(&dir.path().join("host.key")).expect("host key");
-        let service = Service::new(db, &host);
+        let host = crate::crypto::HostIdentity::load_or_create(&dir.path().join("host.key"))
+            .expect("host key");
+        let host_hex = host.public_key_hex();
+        let service = Service::new(db, &host_hex);
         std::mem::forget(dir);
         service.publish_discovery(
             vec![

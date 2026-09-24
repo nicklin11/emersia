@@ -26,6 +26,7 @@ use std::path::Path;
 
 use aead::{Aead, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
+use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Bytes in a pairing code (6 digits ≈ 20 bits — see `generate_pairing_code`).
@@ -93,6 +94,22 @@ impl DeviceIdentity {
         }
     }
 
+    /// Export the private scalar as hex.
+    ///
+    /// This is a **secret**. It exists for provisioning a device (the private
+    /// half has to reach the headset somehow) and is only ever printed by
+    /// `emersia-daemon keygen`. Nothing on the host should call it in a loop.
+    pub fn private_key_hex(&self) -> String {
+        hex::encode(self.secret.to_bytes())
+    }
+
+    /// Rebuild an identity from a hex private key.
+    pub fn from_private_hex(hex_str: &str) -> Result<Self, CryptoError> {
+        let bytes = hex::decode(hex_str).map_err(|_| CryptoError::Hex)?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| CryptoError::Hex)?;
+        Ok(Self::from_private_bytes(arr))
+    }
+
     /// The public half, hex-encoded, for storage in the pairing database.
     pub fn public_key_hex(&self) -> String {
         hex::encode(self.public_key_bytes())
@@ -100,6 +117,13 @@ impl DeviceIdentity {
 
     pub fn public_key_bytes(&self) -> [u8; 32] {
         public_from_secret(&self.secret).to_bytes()
+    }
+
+    /// Private scalar bytes, for tests that need two identities to share the
+    /// same long-term key. Not reachable from production code paths.
+    #[cfg(test)]
+    pub fn private_bytes_for_test(&self) -> [u8; 32] {
+        self.secret.to_bytes()
     }
 
     /// Agree on a shared secret with a peer's public key.
@@ -153,6 +177,14 @@ impl HostIdentity {
     /// Hex-encoded host public key, safe to show to a user.
     pub fn public_key_hex(&self) -> String {
         self.inner.public_key_hex()
+    }
+
+    /// Consume the wrapper and take the identity.
+    ///
+    /// The streaming endpoint must use the *same* long-term key that devices
+    /// pin; a second key would make every device reject the handshake.
+    pub fn into_identity(self) -> DeviceIdentity {
+        self.inner
     }
 }
 
@@ -210,6 +242,7 @@ impl Direction {
 }
 
 /// Symmetric session keys for one direction of a channel.
+#[derive(Clone)]
 pub struct SessionKeys {
     key: [u8; 32],
 }
@@ -221,11 +254,22 @@ impl SessionKeys {
 }
 
 /// Both directions of a session, derived once from a shared secret.
+///
+/// Deliberately has no `Debug` that could print key material.
+#[derive(Clone)]
 pub struct Session {
     host_to_device: SessionKeys,
     device_to_host: SessionKeys,
     /// Salt used for this session, echoed by the responder.
     pub salt: [u8; SALT_LEN],
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("keys", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Session {
@@ -243,6 +287,22 @@ impl Session {
             host_to_device: SessionKeys::from_bytes(h2d),
             device_to_host: SessionKeys::from_bytes(d2h),
             salt,
+        })
+    }
+
+    /// Derive a session from arbitrary key material (the handshake path).
+    ///
+    /// `ikm` should already contain every Diffie-Hellman output the design
+    /// calls for; including the ephemeral pair is what buys forward secrecy.
+    pub fn from_key_material(ikm: &[u8], salt: &[u8], context: &[u8]) -> Result<Self, CryptoError> {
+        let mut h2d = [0u8; 32];
+        let mut d2h = [0u8; 32];
+        expand(ikm, salt, context, b"emersia/stream-key-v1", &mut h2d)?;
+        expand(ikm, salt, context, b"emersia/input-key-v1", &mut d2h)?;
+        Ok(Self {
+            host_to_device: SessionKeys::from_bytes(h2d),
+            device_to_host: SessionKeys::from_bytes(d2h),
+            salt: [0u8; SALT_LEN],
         })
     }
 
@@ -269,6 +329,18 @@ impl Session {
             Direction::DeviceToHost => &self.device_to_host,
         }
     }
+}
+
+/// Hash of a running handshake transcript, used as the HKDF salt so each
+/// message is bound to every message before it.
+pub fn transcript(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        // Length-prefix each part so concatenation is unambiguous.
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize().into()
 }
 
 /// HKDF-SHA256 extract-and-expand with a label as the `info` parameter.

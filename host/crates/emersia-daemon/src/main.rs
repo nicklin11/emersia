@@ -16,8 +16,10 @@ mod control;
 mod crypto;
 mod frame;
 mod pairing;
+mod receiver;
 mod service;
 mod shm;
+mod transport;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,6 +58,8 @@ struct CaptureOpts {
 struct ServeOpts {
     socket: Option<PathBuf>,
     backend: BackendPref,
+    /// UDP port for the encrypted stream; `None` disables streaming.
+    stream_port: Option<u16>,
 }
 
 fn main() {
@@ -73,6 +77,8 @@ fn main() {
     let result = match mode {
         Mode::Serve(opts) => run_serve(&opts),
         Mode::Capture(opts) => run_capture(&opts),
+        Mode::Receive => run_receive(),
+        Mode::Keygen => run_keygen(),
     };
     if let Err(err) = result {
         eprintln!("emersia-daemon: {err:#}");
@@ -83,6 +89,10 @@ fn main() {
 enum Mode {
     Serve(ServeOpts),
     Capture(CaptureOpts),
+    /// Headless test receiver: the device side of the transport.
+    Receive,
+    /// Generate a device keypair for provisioning (or a test receiver).
+    Keygen,
 }
 
 /// Parse the command line. `Ok(None)` means help/version was printed;
@@ -104,6 +114,15 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
         _ => {}
     }
 
+    // `receive` owns its entire argument list; hand it straight to the
+    // receiver rather than parsing the daemon's flags.
+    if first == Some("receive") {
+        return Ok(Some(Mode::Receive));
+    }
+    if first == Some("keygen") {
+        return Ok(Some(Mode::Keygen));
+    }
+
     let (mode, mut rest): (&str, _) = match first {
         Some("serve") => ("serve", rest),
         Some("capture") => ("capture", rest),
@@ -115,6 +134,7 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
     let mut output = None;
     let mut socket = None;
     let mut backend = BackendPref::Auto;
+    let mut stream_port: Option<u16> = None;
 
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -136,6 +156,18 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
                     .ok_or_else(|| "missing value for --backend".to_string())?;
                 backend = parse_backend(value)?;
             }
+            "--stream-port" => {
+                let value = rest
+                    .next()
+                    .ok_or_else(|| "missing value for --stream-port".to_string())?;
+                let port: u16 = value
+                    .parse()
+                    .map_err(|_| format!("--stream-port must be a port number, got {value:?}"))?;
+                if port == 0 {
+                    return Err("--stream-port must not be 0".to_string());
+                }
+                stream_port = Some(port);
+            }
             "--socket" => {
                 let value = rest
                     .next()
@@ -147,7 +179,12 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
     }
 
     let built = match mode {
-        "serve" => Mode::Serve(ServeOpts { socket, backend }),
+        "serve" => Mode::Serve(ServeOpts {
+            socket,
+            backend,
+            stream_port,
+        }),
+        "receive" => Mode::Receive,
         _ => Mode::Capture(CaptureOpts {
             out,
             output,
@@ -174,9 +211,12 @@ fn print_help() {
     println!("\nUsage: emersia-daemon [serve|capture] [OPTIONS]\n");
     println!("Modes:");
     println!("  serve     run the control socket and capture engine (default)");
+    println!("  receive   headless test receiver for the encrypted stream");
+    println!("  keygen    generate a device keypair for pairing");
     println!("  capture   grab one frame, write a PNG, exit (QA / one-shot)");
     println!("\nOptions:");
     println!("  --socket PATH        control socket path [default: $XDG_RUNTIME_DIR/emersia/control.sock]");
+    println!("  --stream-port N      bind the encrypted UDP stream to port N (default: off)");
     println!(
         "  --output NAME        output to capture (wl_output name, e.g. DP-1) [default: first]"
     );
@@ -200,11 +240,6 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
             .context("failed to determine the control socket path")?,
     };
 
-    // The engine owns the Wayland connection; discovery validates that a
-    // compositor and a usable backend exist before we bind anything.
-    let engine =
-        service::Engine::discover(opts.backend).context("capture engine discovery failed")?;
-
     // Load the trust store before anything can be controlled. A corrupt or
     // unreadable database is fatal: starting with an empty trust store would
     // silently mean "trust everything" (ADR 0005).
@@ -214,18 +249,30 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("pairing database at {}: {e}", pairing_path.display()))?;
     println!("pairing database: {}", pairing_path.display());
 
-    // The daemon's own long-term identity, generated on first run (ADR 0006).
+    // The host identity is loaded before the engine so the streaming endpoint
+    // can use the same long-term key that devices pin.
     let host_key_path = pairing_path.with_file_name("host.key");
     let host_identity = crypto::HostIdentity::load_or_create(&host_key_path)
         .map_err(|e| anyhow::anyhow!("host identity at {}: {e}", host_key_path.display()))?;
-    println!("host identity: {}", host_identity.public_key_hex());
+    let host_public_key = host_identity.public_key_hex();
+    println!("host identity: {host_public_key}");
 
-    let svc = Arc::new(service::Service::new(pairing_db, &host_identity));
+    // The engine owns the Wayland connection; discovery validates that a
+    // compositor and a usable backend exist before we bind anything.
+    let engine = service::Engine::discover(opts.backend)
+        .context("capture engine discovery failed")?
+        .with_stream_port(opts.stream_port, host_identity.into_identity())?;
+
+    let svc = Arc::new(service::Service::new(pairing_db, &host_public_key));
     let server = control::ControlServer::bind(&socket_path)?;
 
     println!("emersia-daemon {VERSION} — serving control socket");
     println!("control socket: {}", server.path().display());
     println!("capture backend: {}", engine.backend_name);
+    match engine.transport().and_then(|t| t.local_addr().ok()) {
+        Some(addr) => println!("stream endpoint: udp://{addr} (encrypted, paired devices only)"),
+        None => println!("stream endpoint: disabled (pass --stream-port to enable)"),
+    }
     for screen in &engine.screens {
         println!(
             "  output: {} {}x{}",
@@ -268,6 +315,33 @@ fn install_signal_handlers() {
 /// flag so the engine loop can observe the raw signal.
 pub fn signal_received() -> bool {
     SIGNALLED.load(Ordering::SeqCst)
+}
+
+/// Generate a device keypair. The private half is printed once and must be
+/// kept by the device; only the public half is ever paired.
+fn run_keygen() -> anyhow::Result<()> {
+    let identity = crypto::DeviceIdentity::generate()
+        .map_err(|e| anyhow::anyhow!("no entropy available: {e}"))?;
+    println!("private_key: {}", identity.private_key_hex());
+    println!("public_key:  {}", identity.public_key_hex());
+    eprintln!("Keep the private key secret; pair using the public key.");
+    Ok(())
+}
+
+/// Run the headless receiver subcommand.
+fn run_receive() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // The first argument is the subcommand itself.
+    let rest: Vec<String> = args.into_iter().skip(1).collect();
+    match receiver::run(&rest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.is_usage() => {
+            eprintln!("emersia-daemon receive: {}", e.message());
+            print!("{}", receiver::USAGE);
+            std::process::exit(EXIT_USAGE);
+        }
+        Err(e) => Err(anyhow::anyhow!(e.message().to_string())),
+    }
 }
 
 // ---------------------------------------------------------------------------
