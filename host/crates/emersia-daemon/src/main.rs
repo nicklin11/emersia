@@ -12,8 +12,10 @@
 //! M1.2 scope: no encoding, no transport, no input yet (see #3).
 
 mod capture;
+mod codec;
 mod control;
 mod crypto;
+mod encoder;
 mod frame;
 mod pairing;
 mod receiver;
@@ -60,6 +62,10 @@ struct ServeOpts {
     backend: BackendPref,
     /// UDP port for the encrypted stream; `None` disables streaming.
     stream_port: Option<u16>,
+    /// Encoder family: auto probes VAAPI/NVENC/AMF/QSV, then software.
+    encoder: encoder::EncoderChoice,
+    /// Target bitrate in bits per second.
+    bitrate: u32,
 }
 
 fn main() {
@@ -135,6 +141,8 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
     let mut socket = None;
     let mut backend = BackendPref::Auto;
     let mut stream_port: Option<u16> = None;
+    let mut encoder_choice = encoder::EncoderChoice::Auto;
+    let mut bitrate = encoder::EncoderConfig::default().bitrate;
 
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -155,6 +163,34 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
                     .next()
                     .ok_or_else(|| "missing value for --backend".to_string())?;
                 backend = parse_backend(value)?;
+            }
+            "--encoder" => {
+                let value = rest
+                    .next()
+                    .ok_or_else(|| "missing value for --encoder".to_string())?;
+                encoder_choice = encoder::EncoderChoice::parse(value).ok_or_else(|| {
+                    format!("--encoder must be auto, vaapi, nvenc, amf, qsv or sw, got {value:?}")
+                })?;
+            }
+            "--bitrate" => {
+                let value = rest
+                    .next()
+                    .ok_or_else(|| "missing value for --bitrate".to_string())?;
+                // Accept both "30M" and a plain bit count.
+                let parsed = if let Some(m) = value.strip_suffix('M') {
+                    m.parse::<u32>().ok().map(|v| v * 1_000_000)
+                } else if let Some(k) = value.strip_suffix('k') {
+                    k.parse::<u32>().ok().map(|v| v * 1_000)
+                } else {
+                    value.parse::<u32>().ok()
+                };
+                let bps = parsed.ok_or_else(|| {
+                    format!("--bitrate must be a number, optionally suffixed k or M, got {value:?}")
+                })?;
+                if bps == 0 {
+                    return Err("--bitrate must be greater than zero".to_string());
+                }
+                bitrate = bps;
             }
             "--stream-port" => {
                 let value = rest
@@ -183,6 +219,8 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
             socket,
             backend,
             stream_port,
+            encoder: encoder_choice,
+            bitrate,
         }),
         "receive" => Mode::Receive,
         _ => Mode::Capture(CaptureOpts {
@@ -217,6 +255,8 @@ fn print_help() {
     println!("\nOptions:");
     println!("  --socket PATH        control socket path [default: $XDG_RUNTIME_DIR/emersia/control.sock]");
     println!("  --stream-port N      bind the encrypted UDP stream to port N (default: off)");
+    println!("  --encoder NAME       auto | vaapi | nvenc | amf | qsv | sw (default: auto)");
+    println!("  --bitrate RATE       target bitrate, e.g. 30M or 8000k (default: 30M)");
     println!(
         "  --output NAME        output to capture (wl_output name, e.g. DP-1) [default: first]"
     );
@@ -261,7 +301,13 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
     // compositor and a usable backend exist before we bind anything.
     let engine = service::Engine::discover(opts.backend)
         .context("capture engine discovery failed")?
-        .with_stream_port(opts.stream_port, host_identity.into_identity())?;
+        .with_stream_port(opts.stream_port, host_identity.into_identity())?
+        .with_encoder(opts.encoder, Some(opts.bitrate));
+    println!(
+        "encoder: {:?}, target {:.1} Mbit/s",
+        opts.encoder,
+        opts.bitrate as f64 / 1e6
+    );
 
     let svc = Arc::new(service::Service::new(pairing_db, &host_public_key));
     let server = control::ControlServer::bind(&socket_path)?;

@@ -108,9 +108,6 @@ impl FrameHeader {
     }
 }
 
-/// Payload type currently emitted by the host (raw frame; encoder lands later).
-pub const PAYLOAD_TYPE_RAW: u8 = 96;
-
 /// Build a complete record (header + payload) ready to seal.
 #[allow(clippy::too_many_arguments)]
 pub fn build_record(
@@ -333,6 +330,7 @@ pub fn open_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::Codec;
     use crate::crypto::{DeviceIdentity, Session};
 
     fn session() -> Session {
@@ -352,7 +350,7 @@ mod tests {
         let h = FrameHeader {
             version: 1,
             keyframe: true,
-            payload_type: PAYLOAD_TYPE_RAW,
+            payload_type: Codec::H264.payload_type(),
             sequence: 0xdead_beef,
             frame_sequence: 0x0bad_f00d,
             timestamp: 123_456,
@@ -368,7 +366,17 @@ mod tests {
     #[test]
     fn record_roundtrips_with_payload() {
         let payload = vec![7u8; 300];
-        let record = build_record(5, 5, 90_000, true, PAYLOAD_TYPE_RAW, &payload, 0, 1).unwrap();
+        let record = build_record(
+            5,
+            5,
+            90_000,
+            true,
+            Codec::H264.payload_type(),
+            &payload,
+            0,
+            1,
+        )
+        .unwrap();
         let (header, parsed) = parse_record(&record).unwrap();
         assert_eq!(header.sequence, 5);
         assert!(header.keyframe);
@@ -379,7 +387,7 @@ mod tests {
     fn oversized_payload_is_rejected() {
         let huge = vec![0u8; 70_000];
         assert!(matches!(
-            build_record(1, 1, 0, false, PAYLOAD_TYPE_RAW, &huge, 0, 1),
+            build_record(1, 1, 0, false, Codec::H264.payload_type(), &huge, 0, 1),
             Err(TransportError::PayloadTooLarge(_))
         ));
     }
@@ -387,7 +395,8 @@ mod tests {
     #[test]
     fn truncated_and_unknown_records_are_rejected() {
         assert!(parse_record(&[1, 2, 3]).is_err());
-        let mut record = build_record(1, 1, 0, false, PAYLOAD_TYPE_RAW, b"abc", 0, 1).unwrap();
+        let mut record =
+            build_record(1, 1, 0, false, Codec::H264.payload_type(), b"abc", 0, 1).unwrap();
         record[0] = 9; // unknown version
         assert!(parse_record(&record).is_err());
         // Header claims more payload than is present.
@@ -446,7 +455,17 @@ mod tests {
     fn packet_seal_open_roundtrip() {
         let s = session();
         let payload = vec![42u8; 128];
-        let record = build_record(9, 9, 90_000, false, PAYLOAD_TYPE_RAW, &payload, 0, 1).unwrap();
+        let record = build_record(
+            9,
+            9,
+            90_000,
+            false,
+            Codec::H264.payload_type(),
+            &payload,
+            0,
+            1,
+        )
+        .unwrap();
         // Sequence travels in the clear so the receiver can order before/while
         // authenticating; the AEAD AAD binds it, so it cannot be altered.
         let mut packet = Vec::new();
@@ -465,7 +484,8 @@ mod tests {
     #[test]
     fn tampered_sequence_is_dropped() {
         let s = session();
-        let record = build_record(9, 9, 0, false, PAYLOAD_TYPE_RAW, b"payload", 0, 1).unwrap();
+        let record =
+            build_record(9, 9, 0, false, Codec::H264.payload_type(), b"payload", 0, 1).unwrap();
         let mut packet = vec![packet_type::DATA];
         packet.extend_from_slice(&9u32.to_be_bytes());
         packet.extend_from_slice(
@@ -483,7 +503,7 @@ mod tests {
     #[test]
     fn wrong_direction_packet_is_dropped() {
         let s = session();
-        let record = build_record(1, 1, 0, false, PAYLOAD_TYPE_RAW, b"x", 0, 1).unwrap();
+        let record = build_record(1, 1, 0, false, Codec::H264.payload_type(), b"x", 0, 1).unwrap();
         let mut packet = vec![packet_type::DATA];
         packet.extend_from_slice(&1u32.to_be_bytes());
         packet.extend_from_slice(
@@ -499,7 +519,7 @@ mod tests {
     #[test]
     fn replayed_packet_is_dropped_second_time() {
         let s = session();
-        let record = build_record(1, 1, 0, false, PAYLOAD_TYPE_RAW, b"x", 0, 1).unwrap();
+        let record = build_record(1, 1, 0, false, Codec::H264.payload_type(), b"x", 0, 1).unwrap();
         let mut packet = vec![packet_type::DATA];
         packet.extend_from_slice(&1u32.to_be_bytes());
         packet.extend_from_slice(
