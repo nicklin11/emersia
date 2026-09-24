@@ -45,6 +45,28 @@ const DEFAULT_FPS: u32 = 30;
 /// Engine idle tick — how often a stopped engine checks for new commands.
 const IDLE_TICK: Duration = Duration::from_millis(20);
 
+const MISSING_FFMPEG_ERROR: &str = "streaming needs the ffmpeg binary, which was not found on PATH";
+
+/// Report an encoder startup failure without terminating the daemon.
+///
+/// The service remains available for status, pairing, and an explicit retry
+/// after the operator fixes the environment. `record_error` stops streaming,
+/// so the next engine iteration idles instead of retrying once per frame.
+fn report_encoder_error(service: &Service, error: &crate::encoder::EncoderError) {
+    service.set_encoder(None, false, 0, 0);
+    if error.ffmpeg_missing() {
+        service.record_error(MISSING_FFMPEG_ERROR.to_string());
+        eprintln!(
+            "emersia-daemon: streaming requires ffmpeg on PATH. \
+             Install it (e.g. `apt install ffmpeg`, `pacman -S ffmpeg`) \
+             and start streaming again; the daemon and control socket remain available."
+        );
+    } else {
+        service.record_error(format!("encoder: {error}"));
+        eprintln!("emersia-daemon: encoder unavailable: {error}");
+    }
+}
+
 /// A capturable output as reported by `screens`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScreenInfo {
@@ -808,25 +830,12 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                         }
                         Ok(false) => {}
                         Err(e) => {
-                            // A missing ffmpeg is a setup problem, not a
-                            // stream problem, and it is worth saying so plainly
-                            // rather than logging it once per frame.
-                            if e.ffmpeg_missing() {
-                                service.record_error(
-                                    "streaming needs the ffmpeg binary, which was not found on PATH"
-                                        .to_string(),
-                                );
-                                eprintln!(
-                                    "emersia-daemon: streaming requires ffmpeg on PATH. \
-                                     Install it (e.g. `apt install ffmpeg`, `pacman -S ffmpeg`) \
-                                     and restart the daemon; capture and the control socket keep \
-                                     working without it."
-                                );
-                                service.request_shutdown();
-                            } else {
-                                service.record_error(format!("encoder: {e}"));
-                                eprintln!("emersia-daemon: encoder unavailable: {e}");
-                            }
+                            // A setup failure stops this stream, not the daemon.
+                            // In particular, a missing ffmpeg must leave status
+                            // and pairing available for an explicit retry.
+                            engine.encoder = None;
+                            report_encoder_error(&service, &e);
+                            continue;
                         }
                     }
                 }
@@ -1241,6 +1250,36 @@ mod tests {
         assert!(!s.is_streaming());
         let p = ok_payload(s.handle(req("2", Command::Status)));
         assert_eq!(p["last_error"], "backend died");
+    }
+
+    #[test]
+    fn missing_ffmpeg_keeps_daemon_available_for_retry() {
+        let s = service_with_outputs();
+        let err = crate::encoder::EncoderError::NoEncoder {
+            requested: crate::encoder::EncoderChoice::Auto,
+            attempts: vec![(
+                "ffmpeg".to_string(),
+                "could not start ffmpeg: executable not found".to_string(),
+            )],
+        };
+
+        report_encoder_error(&s, &err);
+        assert!(
+            !s.is_shutting_down(),
+            "an encoder setup error must not stop the daemon"
+        );
+        assert!(!s.is_streaming(), "the failed stream is stopped");
+        let status = ok_payload(s.handle(req("1", Command::Status)));
+        assert_eq!(status["last_error"], MISSING_FFMPEG_ERROR);
+        assert!(status["encoder"].is_null());
+
+        let restarted = ok_payload(s.handle(req("2", Command::Start(StartArgs::default()))));
+        assert_eq!(restarted["streaming"], true);
+        let status = ok_payload(s.handle(req("3", Command::Status)));
+        assert!(
+            status["last_error"].is_null(),
+            "an explicit start clears the old error"
+        );
     }
 
     #[test]
