@@ -451,15 +451,29 @@ pub fn open(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingCode(String);
 
+/// Map a random byte to a decimal digit, rejecting the incomplete final bucket.
+///
+/// 250 is the largest multiple of ten that fits in a byte. Rejecting 250..=255
+/// makes the accepted buckets exactly 25 bytes each, so every digit is equally
+/// likely.
+fn pairing_digit_from_byte(byte: u8) -> Option<u8> {
+    (byte < 250).then_some(byte % 10)
+}
+
+fn random_pairing_digit() -> Result<u8, CryptoError> {
+    loop {
+        let byte = random_bytes::<1>("pairing code")?[0];
+        if let Some(digit) = pairing_digit_from_byte(byte) {
+            return Ok(digit);
+        }
+    }
+}
+
 impl PairingCode {
     pub fn generate() -> Result<Self, CryptoError> {
-        let bytes: [u8; PAIRING_CODE_DIGITS] = random_bytes("pairing code")?;
-        // Map bytes onto 0..=9 without modulo bias.
         let mut code = String::with_capacity(PAIRING_CODE_DIGITS);
-        for b in bytes {
-            // 252 = 9*28 is the largest multiple of 10 that fits a byte.
-            let digit = if b >= 252 { b % 10 } else { (b / 25) % 10 };
-            code.push((b'0' + digit) as char);
+        for _ in 0..PAIRING_CODE_DIGITS {
+            code.push((b'0' + random_pairing_digit()?) as char);
         }
         Ok(Self(code))
     }
@@ -672,6 +686,26 @@ mod tests {
         assert_eq!(code.as_str().len(), 6);
         assert!(code.as_str().chars().all(|c| c.is_ascii_digit()));
         assert_eq!(code.to_string().len(), 7, "formatted as XXX-XXX");
+    }
+
+    #[test]
+    fn pairing_code_digit_mapping_is_uniform() {
+        let mut counts = [0u32; 10];
+        for byte in 0u16..250 {
+            let digit = pairing_digit_from_byte(byte as u8).expect("accepted bucket");
+            counts[digit as usize] += 1;
+        }
+        assert!(
+            counts.iter().all(|&count| count == 25),
+            "each digit must have the same 25-byte bucket: {counts:?}"
+        );
+        for byte in 250u16..=255 {
+            assert_eq!(
+                pairing_digit_from_byte(byte as u8),
+                None,
+                "incomplete buckets must be rejected"
+            );
+        }
     }
 
     #[test]
