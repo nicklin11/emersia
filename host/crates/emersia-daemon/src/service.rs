@@ -47,6 +47,9 @@ const IDLE_TICK: Duration = Duration::from_millis(20);
 
 const MISSING_FFMPEG_ERROR: &str = "streaming needs the ffmpeg binary, which was not found on PATH";
 
+/// Delay between attempts to replace a protocol-fatal Wayland connection.
+const WAYLAND_RECONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// Report an encoder startup failure without terminating the daemon.
 ///
 /// The service remains available for status, pairing, and an explicit retry
@@ -243,6 +246,22 @@ impl Service {
     /// Output name selected by the control plane for the next capture.
     pub fn selected_output(&self) -> Option<String> {
         self.lock().selected.clone()
+    }
+
+    /// Update the selected output after the Wayland registry is rebuilt.
+    pub fn set_selected_output(&self, selected: Option<String>) {
+        self.lock().selected = selected;
+    }
+
+    /// Set an error without stopping streaming, used while a fatal Wayland
+    /// connection is being replaced.
+    pub fn set_error(&self, message: String) {
+        self.lock().last_error = Some(message);
+    }
+
+    /// Clear a stale capture error after a successful recovery.
+    pub fn clear_error(&self) {
+        self.lock().last_error = None;
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -510,8 +529,13 @@ fn pairing_error_code(err: &PairingError) -> ErrorCode {
 
 /// Everything the engine needs to capture, discovered once at startup.
 pub struct Engine {
+    /// The connection is kept alongside the queue so a protocol error can be
+    /// detected after the queue reports a generic dispatch failure.
+    connection: Connection,
     queue: wayland_client::EventQueue<capture::State>,
     state: capture::State,
+    /// Backend preference supplied at startup, retained for reconnect.
+    backend_pref: BackendPref,
     /// Streaming endpoint; bound even when idle so a device can pair and wait.
     transport: Option<HostEndpoint>,
     /// Video encoder; started on the first streamed frame so the capture size
@@ -557,6 +581,43 @@ impl Engine {
     /// The streaming endpoint, once bound.
     pub fn transport(&self) -> Option<&HostEndpoint> {
         self.transport.as_ref()
+    }
+
+    /// Wayland protocol errors are terminal for a connection. `wayland-client`
+    /// exposes the terminal condition separately from the queue's dispatch
+    /// error, which otherwise makes a reconnect look like a transient capture
+    /// failure.
+    fn wayland_protocol_failed(&self) -> bool {
+        self.connection.protocol_error().is_some()
+    }
+
+    /// Replace a protocol-fatal Wayland connection while retaining the UDP
+    /// endpoint and encoder policy. The caller retries this method with a short
+    /// delay if the compositor is temporarily unavailable.
+    ///
+    /// The returned name is the selected output that was restored. `None` means
+    /// the previously selected output disappeared and discovery selected the
+    /// first available output instead.
+    fn reconnect(&mut self, selected: Option<&str>) -> anyhow::Result<Option<String>> {
+        // A protocol-fatal connection cannot service the old encoder's input
+        // or Wayland state. Drop it before rediscovering so helper threads do
+        // not keep running against a socket that is known to be invalid.
+        self.encoder.take();
+
+        let mut fresh = Self::discover(self.backend_pref)?;
+        let restored =
+            selected.and_then(|name| fresh.set_output(name).is_ok().then(|| name.to_owned()));
+
+        // Do not take the transport until discovery succeeds: a failed
+        // reconnect must leave the existing UDP endpoint and all paired peers
+        // intact for the next retry.
+        let transport = self.transport.take();
+        fresh.transport = transport;
+        fresh.encoder_choice = self.encoder_choice;
+        fresh.bitrate = self.bitrate;
+        fresh.codec = self.codec;
+        *self = fresh;
+        Ok(restored)
     }
 
     /// Choose the encoder family and bitrate. Does not start anything: the
@@ -675,8 +736,10 @@ impl Engine {
         let screens = screen_infos(&state);
 
         Ok(Self {
+            connection: conn,
             queue,
             state,
+            backend_pref: pref,
             transport: None,
             encoder: None,
             encoder_choice: crate::encoder::EncoderChoice::Auto,
@@ -786,10 +849,51 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
             last_frame = Instant::now();
             continue;
         }
+
+        // A compositor protocol error permanently poisons the Wayland socket.
+        // Reusing that queue can only produce more undefined requests, so
+        // rebuild the connection before attempting another capture.
+        if engine.wayland_protocol_failed() {
+            let selected = service.selected_output();
+            let had_selection = selected.is_some();
+            match engine.reconnect(selected.as_deref()) {
+                Ok(restored) => {
+                    if had_selection && restored.is_none() {
+                        if let Some(fallback) =
+                            engine.screens.first().map(|screen| screen.name.clone())
+                        {
+                            service.set_selected_output(Some(fallback));
+                        }
+                    }
+                    service.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
+                    service.set_encoder(None, false, 0, 0);
+                    service.clear_error();
+                    applied_output = service.selected_output();
+                    last_frame = Instant::now();
+                    eprintln!(
+                        "emersia-daemon: Wayland connection replaced after a protocol error; \
+                         capture backend is {}",
+                        engine.backend_name
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    service.set_encoder(None, false, 0, 0);
+                    service.set_error(format!("Wayland reconnect failed: {err:#}"));
+                    eprintln!("emersia-daemon: Wayland reconnect failed: {err:#}");
+                    last_frame = Instant::now();
+                    std::thread::sleep(WAYLAND_RECONNECT_RETRY_DELAY);
+                    continue;
+                }
+            }
+        }
+
         if let Some(name) = service.selected_output() {
             if let Err(e) = engine.set_output(&name) {
-                service.record_error(format!("output selection: {e:#}"));
-                eprintln!("emersia-daemon: output selection failed: {e:#}");
+                if !engine.wayland_protocol_failed() {
+                    service.record_error(format!("output selection: {e:#}"));
+                    eprintln!("emersia-daemon: output selection failed: {e:#}");
+                }
                 continue;
             }
             if applied_output.as_deref() != Some(name.as_str()) {
@@ -923,6 +1027,13 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                 last_frame = Instant::now();
             }
             Err(err) => {
+                if engine.wayland_protocol_failed() {
+                    // Leave streaming enabled; the next loop iteration replaces
+                    // the poisoned Wayland connection. Retrying this queue
+                    // would violate the Wayland protocol error contract.
+                    eprintln!("emersia-daemon: Wayland capture connection poisoned: {err:#}");
+                    continue;
+                }
                 service.record_error(format!("{err:#}"));
                 eprintln!("emersia-daemon: capture failed: {err:#}");
             }
@@ -1379,6 +1490,19 @@ mod tests {
         assert!(!s.is_streaming());
         let p = ok_payload(s.handle(req("2", Command::Status)));
         assert_eq!(p["last_error"], "backend died");
+    }
+
+    #[test]
+    fn recovery_error_keeps_streaming_for_reconnect_retry() {
+        let s = service_with_outputs();
+        ok_payload(s.handle(req("1", Command::Start(StartArgs::default()))));
+        s.set_error("Wayland reconnect failed".into());
+        assert!(s.is_streaming());
+        let p = ok_payload(s.handle(req("2", Command::Status)));
+        assert_eq!(p["last_error"], "Wayland reconnect failed");
+        s.clear_error();
+        let p = ok_payload(s.handle(req("3", Command::Status)));
+        assert!(p["last_error"].is_null());
     }
 
     #[test]
