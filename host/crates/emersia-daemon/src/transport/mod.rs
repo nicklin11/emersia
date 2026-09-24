@@ -167,25 +167,15 @@ impl ReplayWindow {
     /// Width of the accepted reordering window, in sequence numbers.
     pub const WIDTH: u32 = 64;
 
-    /// Record `seq`; return `true` if it is acceptable, `false` if it is a
-    /// duplicate or too old.
-    pub fn accept(&mut self, seq: u32) -> bool {
+    /// Check whether `seq` would be fresh without changing window state.
+    pub fn check(&self, seq: u32) -> bool {
         let Some(highest) = self.highest else {
-            self.highest = Some(seq);
-            self.bitmap = 1;
             return true;
         };
         // Serial-number arithmetic: sequence numbers wrap at 2^32, so compare
         // the signed difference rather than the raw values.
         let forward = seq.wrapping_sub(highest);
         if forward != 0 && forward < 0x8000_0000 {
-            let shift = forward;
-            self.bitmap = if shift >= Self::WIDTH {
-                1
-            } else {
-                (self.bitmap << shift) | 1
-            };
-            self.highest = Some(seq);
             return true;
         }
         if forward == 0 {
@@ -196,11 +186,35 @@ impl ReplayWindow {
             // Too old to distinguish from the far past.
             return false;
         }
-        let mask = 1u64 << behind;
-        if self.bitmap & mask != 0 {
-            return false; // already seen
+        self.bitmap & (1u64 << behind) == 0
+    }
+
+    /// Commit a sequence that passed `check` and authenticated successfully.
+    ///
+    /// Keeping the mutation separate makes it impossible for a receive path to
+    /// advance the window while handling unauthenticated wire data.
+    pub fn commit(&mut self, seq: u32) -> bool {
+        if !self.check(seq) {
+            return false;
         }
-        self.bitmap |= mask;
+        let Some(highest) = self.highest else {
+            self.highest = Some(seq);
+            self.bitmap = 1;
+            return true;
+        };
+        let forward = seq.wrapping_sub(highest);
+        if forward != 0 && forward < 0x8000_0000 {
+            let shift = forward;
+            self.bitmap = if shift >= Self::WIDTH {
+                1
+            } else {
+                (self.bitmap << shift) | 1
+            };
+            self.highest = Some(seq);
+        } else {
+            let behind = highest.wrapping_sub(seq);
+            self.bitmap |= 1u64 << behind;
+        }
         true
     }
 }
@@ -299,7 +313,7 @@ pub fn seal_packet(
     Ok(out)
 }
 
-/// Open a data packet, enforcing the replay window first.
+/// Open a data packet, enforcing the replay window before and after authentication.
 pub fn open_packet(
     session: &Session,
     direction: Direction,
@@ -309,21 +323,26 @@ pub fn open_packet(
     if packet.first() != Some(&packet_type::DATA) {
         return Err(TransportError::Dropped("not a data packet"));
     }
-    // Peek at the header to learn the sequence used as associated data. The
-    // AEAD check below is what actually authenticates it, so an attacker
-    // cannot spoof a sequence into acceptance.
+    // Peek at the header to reject obvious replays without mutating the window.
+    // The sequence is still untrusted until the AEAD check below succeeds.
     // Layout: type || sequence || nonce || ciphertext (see `seal_packet`).
     let sealed = &packet[1..];
     if sealed.len() < 4 {
         return Err(TransportError::Dropped("packet too short"));
     }
     let sequence = u32::from_be_bytes([sealed[0], sealed[1], sealed[2], sealed[3]]);
-    if !window.accept(sequence) {
+    if !window.check(sequence) {
         return Err(TransportError::Dropped("replayed or too old"));
     }
     let plaintext = crate::crypto::open(session, direction, sequence as u64, &sealed[4..])
         .map_err(|_| TransportError::Dropped("authentication failed"))?;
     let (header, payload) = parse_record(&plaintext)?;
+    if header.sequence != sequence {
+        return Err(TransportError::MalformedRecord);
+    }
+    if !window.commit(sequence) {
+        return Err(TransportError::Dropped("replayed or too old"));
+    }
     Ok((header, payload.to_vec()))
 }
 
@@ -343,6 +362,13 @@ mod tests {
             b"emersia/v1",
         )
         .unwrap()
+    }
+
+    fn accept_after_check(window: &mut ReplayWindow, sequence: u32) -> bool {
+        if !window.check(sequence) {
+            return false;
+        }
+        window.commit(sequence)
     }
 
     #[test]
@@ -410,33 +436,36 @@ mod tests {
     fn replay_window_accepts_in_order_stream() {
         let mut w = ReplayWindow::default();
         for seq in 0..1000 {
-            assert!(w.accept(seq), "seq {seq} should be fresh");
+            assert!(accept_after_check(&mut w, seq), "seq {seq} should be fresh");
         }
     }
 
     #[test]
     fn replay_window_rejects_duplicates() {
         let mut w = ReplayWindow::default();
-        assert!(w.accept(10));
-        assert!(!w.accept(10), "exact duplicate must be rejected");
+        assert!(accept_after_check(&mut w, 10));
+        assert!(
+            !accept_after_check(&mut w, 10),
+            "exact duplicate must be rejected"
+        );
     }
 
     #[test]
     fn replay_window_allows_reordering_within_window() {
         let mut w = ReplayWindow::default();
-        assert!(w.accept(100));
-        assert!(w.accept(101));
+        assert!(accept_after_check(&mut w, 100));
+        assert!(accept_after_check(&mut w, 101));
         // Late but inside the window: acceptable exactly once.
-        assert!(w.accept(99));
-        assert!(!w.accept(99), "and only once");
+        assert!(accept_after_check(&mut w, 99));
+        assert!(!accept_after_check(&mut w, 99), "and only once");
     }
 
     #[test]
     fn replay_window_rejects_too_old() {
         let mut w = ReplayWindow::default();
-        assert!(w.accept(10_000));
+        assert!(accept_after_check(&mut w, 10_000));
         assert!(
-            !w.accept(10_000 - ReplayWindow::WIDTH),
+            !accept_after_check(&mut w, 10_000 - ReplayWindow::WIDTH),
             "outside the window must be dropped"
         );
     }
@@ -445,10 +474,13 @@ mod tests {
     fn replay_window_handles_sequence_wrap() {
         let mut w = ReplayWindow::default();
         // Just below the wrap point, then just above it.
-        assert!(w.accept(u32::MAX - 1));
-        assert!(w.accept(u32::MAX));
-        assert!(w.accept(0), "wrapped sequence is newer");
-        assert!(!w.accept(u32::MAX), "the pre-wrap value is now far behind");
+        assert!(accept_after_check(&mut w, u32::MAX - 1));
+        assert!(accept_after_check(&mut w, u32::MAX));
+        assert!(accept_after_check(&mut w, 0), "wrapped sequence is newer");
+        assert!(
+            !accept_after_check(&mut w, u32::MAX),
+            "the pre-wrap value is now far behind"
+        );
     }
 
     #[test]
@@ -498,6 +530,54 @@ mod tests {
             open_packet(&s, Direction::HostToDevice, &mut w, &packet),
             Err(TransportError::Dropped(_))
         ));
+    }
+
+    #[test]
+    fn unauthenticated_sequence_does_not_advance_replay_window() {
+        let s = session();
+        let forged_record =
+            build_record(1, 1, 0, false, Codec::H264.payload_type(), b"forged", 0, 1).unwrap();
+        let mut forged = seal_packet(&s, Direction::HostToDevice, 1, &forged_record).unwrap();
+        // The clear sequence is attacker-controlled until AEAD authenticates it.
+        forged[1..5].copy_from_slice(&10_000u32.to_be_bytes());
+
+        let mut w = ReplayWindow::default();
+        assert!(matches!(
+            open_packet(&s, Direction::HostToDevice, &mut w, &forged),
+            Err(TransportError::Dropped(_))
+        ));
+
+        let valid_record =
+            build_record(0, 0, 0, false, Codec::H264.payload_type(), b"valid", 0, 1).unwrap();
+        let valid = seal_packet(&s, Direction::HostToDevice, 0, &valid_record).unwrap();
+        assert!(open_packet(&s, Direction::HostToDevice, &mut w, &valid).is_ok());
+    }
+
+    #[test]
+    fn authenticated_header_sequence_must_match_wire_sequence() {
+        let s = session();
+        let mismatched_record = build_record(
+            2,
+            2,
+            0,
+            false,
+            Codec::H264.payload_type(),
+            b"mismatch",
+            0,
+            1,
+        )
+        .unwrap();
+        let mismatched = seal_packet(&s, Direction::HostToDevice, 1, &mismatched_record).unwrap();
+        let mut w = ReplayWindow::default();
+        assert!(matches!(
+            open_packet(&s, Direction::HostToDevice, &mut w, &mismatched),
+            Err(TransportError::MalformedRecord)
+        ));
+
+        let valid_record =
+            build_record(0, 0, 0, false, Codec::H264.payload_type(), b"valid", 0, 1).unwrap();
+        let valid = seal_packet(&s, Direction::HostToDevice, 0, &valid_record).unwrap();
+        assert!(open_packet(&s, Direction::HostToDevice, &mut w, &valid).is_ok());
     }
 
     #[test]
