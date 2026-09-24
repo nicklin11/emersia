@@ -10,8 +10,9 @@
 //!   maintain or cross-compile. Encoder support then tracks the ffmpeg build
 //!   the user already has, which is the same build their other tools use.
 //! - **Against:** a process boundary per stream, and no in-process API control.
-//!   Frame delivery is via pipes, so a stalled encoder is visible as pipe
-//!   backpressure rather than a hang.
+//!   Frame delivery is via pipes; a bounded writer queue keeps a stalled
+//!   encoder from blocking the capture loop, while dedicated drain threads keep
+//!   the child's other pipes from filling.
 //!
 //! Hardware encode is the default. Software (`libx264`) exists as `--encoder
 //! sw` for debugging and as a last-resort fallback, and is labelled as such
@@ -29,11 +30,127 @@
 //! Selection therefore *runs* each candidate encoder on one small frame and
 //! keeps the first that produces output.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::codec::{AccessUnit, AnnexBParser, Codec, CodecError};
+
+/// Keep a small diagnostic tail rather than allowing ffmpeg's stderr pipe to
+/// fill while nobody reads it.
+const STDERR_TAIL_LINES: usize = 32;
+const STDERR_TAIL_BYTES: usize = 16 * 1024;
+const STDERR_MAX_LINE_BYTES: usize = 4 * 1024;
+
+/// A frame may be waiting for the writer, and the writer may be blocked in the
+/// OS pipe. Keep only one additional frame so `encode` can return immediately.
+const STDIN_QUEUE_CAPACITY: usize = 1;
+
+/// Do not let child teardown block the capture loop indefinitely. A kill has
+/// already been requested; helper threads are detached if the child remains
+/// unkillable long enough to hit this bound.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// A bounded rolling view of the encoder's most recent stderr lines.
+#[derive(Debug, Default)]
+struct StderrTail {
+    lines: VecDeque<String>,
+    bytes: usize,
+}
+
+impl StderrTail {
+    fn push_line(&mut self, line: &str) {
+        let mut line = line.to_owned();
+        if line.len() > STDERR_MAX_LINE_BYTES {
+            let mut end = STDERR_MAX_LINE_BYTES;
+            while end > 0 && !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            line.truncate(end);
+            line.push_str("...");
+        }
+
+        self.bytes += line.len() + 1;
+        self.lines.push_back(line);
+        while self.lines.len() > STDERR_TAIL_LINES || self.bytes > STDERR_TAIL_BYTES {
+            let Some(old) = self.lines.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(old.len() + 1);
+        }
+    }
+
+    fn text(&self) -> String {
+        self.lines.iter().cloned().collect::<Vec<_>>().join("\n")
+    }
+}
+
+/// Read stderr continuously and keep only its bounded tail.
+///
+/// Reading a fixed-size chunk keeps both the retained data and the per-line
+/// scratch buffer bounded even if ffmpeg emits a line without a newline.
+fn drain_stderr(mut stderr: ChildStderr, tail: std::sync::Arc<std::sync::Mutex<StderrTail>>) {
+    let mut buf = [0u8; 4096];
+    let mut line = Vec::new();
+    let mut truncated = false;
+    loop {
+        match stderr.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                for &byte in &buf[..n] {
+                    if byte == b'\n' {
+                        push_stderr_line(&tail, &line, truncated);
+                        line.clear();
+                        truncated = false;
+                    } else if line.len() < STDERR_MAX_LINE_BYTES {
+                        line.push(byte);
+                    } else {
+                        truncated = true;
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    if !line.is_empty() || truncated {
+        push_stderr_line(&tail, &line, truncated);
+    }
+}
+
+fn push_stderr_line(
+    tail: &std::sync::Arc<std::sync::Mutex<StderrTail>>,
+    line: &[u8],
+    truncated: bool,
+) {
+    let mut text = String::from_utf8_lossy(line).into_owned();
+    if truncated {
+        text.push_str("...");
+    }
+    if text.ends_with('\r') {
+        text.pop();
+    }
+    tail.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push_line(&text);
+}
+
+/// The result of offering a frame to the bounded writer queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueResult {
+    Queued,
+    Dropped,
+    Closed,
+}
+
+fn try_queue_frame(tx: &std::sync::mpsc::SyncSender<Vec<u8>>, frame: Vec<u8>) -> QueueResult {
+    match tx.try_send(frame) {
+        Ok(()) => QueueResult::Queued,
+        Err(std::sync::mpsc::TrySendError::Full(_)) => QueueResult::Dropped,
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => QueueResult::Closed,
+    }
+}
 
 /// Which encoder family to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,7 +305,7 @@ pub enum EncoderError {
     },
     /// The child process died.
     ChildFailed { encoder: String, status: String },
-    /// Writing a frame to the encoder blocked or failed.
+    /// Writing or queueing a frame to the encoder failed.
     Write(std::io::Error),
     /// Bitstream parsing failed.
     Codec(CodecError),
@@ -265,18 +382,29 @@ impl From<CodecError> for EncoderError {
 /// encoder does not necessarily emit anything for each frame we write (it
 /// buffers, and B-frame reordering would reorder output anyway), so a blocking
 /// read on the writer's thread waits for output that only a later write can
-/// cause. The two pipes are therefore driven from different threads:
+/// cause. The three pipes are therefore driven from separate threads:
 ///
-/// - the caller's thread writes RGBA frames to stdin;
+/// - a bounded input queue feeds a writer thread that owns stdin;
 /// - a reader thread drains stdout, parses Annex-B, and hands access units back
-///   over a channel.
+///   over a channel;
+/// - a stderr thread continuously drains diagnostics into a bounded tail.
 ///
-/// `encode` never blocks on output. It writes the frame and returns whatever
-/// has already arrived, which is the property the capture loop needs: encoding
-/// lag shows up as a slightly stale stream, not as a stalled engine.
+/// `encode` never blocks on output or on the input pipe. It offers the frame to
+/// the bounded queue and returns whatever access unit has already arrived. If
+/// the writer cannot keep up, the new frame is dropped rather than stalling the
+/// capture loop.
 pub struct Encoder {
     child: Child,
-    stdin: Option<ChildStdin>,
+    /// Sender for RGBA frames. `None` closes the queue during shutdown.
+    stdin: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    /// Writer thread owning the child stdin pipe.
+    writer: Option<std::thread::JoinHandle<()>>,
+    /// Error reported by the writer after its pipe failed.
+    writer_error: std::sync::Arc<std::sync::Mutex<Option<std::io::Error>>>,
+    /// Shared bounded stderr diagnostics.
+    stderr_tail: std::sync::Arc<std::sync::Mutex<StderrTail>>,
+    /// Stderr drain thread.
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
     /// Access units from the reader thread.
     rx: std::sync::mpsc::Receiver<ReaderMessage>,
     /// Units the reader has produced. `encode` compares this against
@@ -287,8 +415,6 @@ pub struct Encoder {
     reader: Option<std::thread::JoinHandle<()>>,
     /// Set when the reader thread reported the encoder had stopped.
     finished: bool,
-    /// A reader-side failure noticed while polling, surfaced on the next call.
-    deferred_error: Option<String>,
     /// Set by `request_keyframe`; the GOP is the only mechanism available over
     /// a raw pipe, so this records intent rather than acting on it.
     keyframe_requested: bool,
@@ -300,6 +426,7 @@ pub struct Encoder {
     /// Rolling measurement of how long a frame takes to hand to the encoder.
     last_encode: Option<Duration>,
     frames_in: u64,
+    frames_dropped: u64,
     frames_out: u64,
 }
 
@@ -327,6 +454,7 @@ impl std::fmt::Debug for Encoder {
         f.debug_struct("Encoder")
             .field("candidate", &self.candidate)
             .field("frames_in", &self.frames_in)
+            .field("frames_dropped", &self.frames_dropped)
             .field("frames_out", &self.frames_out)
             .field("finished", &self.finished)
             .finish()
@@ -465,6 +593,36 @@ impl Encoder {
             .map_err(|e| format!("could not start ffmpeg: {e}"))?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+
+        // Stderr is a finite OS pipe, not an optional diagnostic. Drain it
+        // continuously so ffmpeg cannot wedge itself by waiting for a reader.
+        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(StderrTail::default()));
+        let stderr_tail_by_reader = std::sync::Arc::clone(&stderr_tail);
+        let stderr_reader = std::thread::spawn(move || {
+            drain_stderr(stderr, stderr_tail_by_reader);
+        });
+
+        // A synchronous bounded queue keeps the engine thread out of the child
+        // stdin pipe. One queued frame is enough to smooth a scheduling hiccup
+        // without retaining a large backlog of RGBA buffers.
+        let (stdin_tx, stdin_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(STDIN_QUEUE_CAPACITY);
+        let writer_error = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let writer_error_by_thread = std::sync::Arc::clone(&writer_error);
+        let writer = std::thread::spawn(move || {
+            let mut stdin = stdin;
+            while let Ok(frame) = stdin_rx.recv() {
+                if let Err(e) = stdin.write_all(&frame) {
+                    let mut slot = writer_error_by_thread
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if slot.is_none() {
+                        *slot = Some(e);
+                    }
+                    break;
+                }
+            }
+        });
 
         // The reader thread owns stdout for the life of the encoder.
         let codec = candidate.codec;
@@ -527,18 +685,22 @@ impl Encoder {
 
         let mut encoder = Self {
             child,
-            stdin: Some(stdin),
+            stdin: Some(stdin_tx),
+            writer: Some(writer),
+            writer_error,
+            stderr_tail,
+            stderr_reader: Some(stderr_reader),
             rx,
             produced,
             reader: Some(reader),
             finished: false,
-            deferred_error: None,
             keyframe_requested: false,
             parameter_sets: Vec::new(),
             candidate,
             config: config.clone(),
             last_encode: None,
             frames_in: 0,
+            frames_dropped: 0,
             frames_out: 0,
         };
 
@@ -547,9 +709,129 @@ impl Encoder {
         // reported now, while probing, rather than on the first frame.
         std::thread::sleep(Duration::from_millis(30));
         match encoder.child.try_wait() {
-            Ok(Some(status)) => Err(format!("exited immediately with {status}")),
+            Ok(Some(status)) => {
+                // The process is gone, so its stderr pipe is closed. Joining the
+                // drain thread makes the complete tail available to the probe.
+                if let Some(stderr_reader) = encoder.stderr_reader.take() {
+                    let _ = stderr_reader.join();
+                }
+                let why = format!("exited immediately with {status}");
+                Err(encoder.with_stderr(why))
+            }
             Ok(None) => Ok(encoder),
-            Err(e) => Err(format!("could not query the encoder process: {e}")),
+            Err(e) => {
+                let why = format!("could not query the encoder process: {e}");
+                Err(encoder.with_stderr(why))
+            }
+        }
+    }
+
+    fn writer_has_failed(&self) -> bool {
+        self.writer_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    fn take_writer_error_opt(&self) -> Option<std::io::Error> {
+        self.writer_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    fn take_writer_error(&self) -> std::io::Error {
+        self.take_writer_error_opt().unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "encoder stdin writer stopped",
+            )
+        })
+    }
+
+    fn writer_failure(&mut self) -> EncoderError {
+        let error = self.take_writer_error();
+        let exit_status = self.child.try_wait().ok().flatten();
+        if exit_status.is_some() {
+            self.join_stderr_bounded();
+        }
+        let status = exit_status
+            .map(|status| format!("encoder exited with {status}"))
+            .unwrap_or_else(|| "encoder child did not exit".to_string());
+        EncoderError::ChildFailed {
+            encoder: self.candidate.name.clone(),
+            status: self.with_stderr(format!("stdin writer failed: {error}; {status}")),
+        }
+    }
+
+    fn with_stderr(&self, status: String) -> String {
+        let tail = self
+            .stderr_tail
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .text();
+        if tail.is_empty() {
+            status
+        } else {
+            format!("{status}; ffmpeg stderr:\n{tail}")
+        }
+    }
+
+    fn join_stderr_bounded(&mut self) {
+        let Some(handle) = self.stderr_reader.take() else {
+            return;
+        };
+        let deadline = Instant::now() + TEARDOWN_TIMEOUT;
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        }
+    }
+
+    /// Convert an unexpected end of stdout into a terminal encoder error.
+    fn output_ended(&mut self) -> Result<Option<AccessUnit>, EncoderError> {
+        self.finished = true;
+        self.stdin.take();
+        let status = self
+            .child
+            .try_wait()
+            .ok()
+            .flatten()
+            .map(|status| format!("encoder exited with {status}"))
+            .unwrap_or_else(|| "encoder output ended before finish".to_string());
+        Err(EncoderError::ChildFailed {
+            encoder: self.candidate.name.clone(),
+            status: self.with_stderr(status),
+        })
+    }
+
+    /// Close all three pipes and bound teardown so a stuck child cannot freeze
+    /// the capture loop. A completed helper is joined; an unfinished helper is
+    /// detached after SIGKILL has been requested.
+    fn stop_child_and_join(&mut self) {
+        self.stdin.take();
+        let _ = self.child.kill();
+        let deadline = Instant::now() + TEARDOWN_TIMEOUT;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) if Instant::now() >= deadline => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        for handle in [
+            self.reader.take(),
+            self.writer.take(),
+            self.stderr_reader.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
         }
     }
 
@@ -568,25 +850,32 @@ impl Encoder {
         &self.config
     }
 
-    /// Frames written to the encoder.
+    /// Frames accepted by the bounded writer queue. A frame can still be
+    /// waiting for the writer when this counter is read.
     pub fn frames_in(&self) -> u64 {
         self.frames_in
     }
 
-    /// Access units produced.
+    /// Frames dropped because the bounded input queue was full.
+    pub fn frames_dropped(&self) -> u64 {
+        self.frames_dropped
+    }
+
+    /// Access units consumed from the reader by the caller.
     pub fn frames_out(&self) -> u64 {
         self.frames_out
     }
 
-    /// How long the most recent frame took to hand to the encoder.
+    /// How long the most recent frame took to enqueue.
     pub fn last_encode_time(&self) -> Option<Duration> {
         self.last_encode
     }
 
     /// Feed one RGBA frame.
     ///
-    /// Returns `Encoded` when an access unit became available. Never blocks
-    /// waiting for encoder output.
+    /// Returns `Encoded` when an access unit became available. The frame is
+    /// offered to a bounded queue with [`std::sync::mpsc::SyncSender::try_send`],
+    /// so a slow encoder drops this frame instead of blocking the capture loop.
     pub fn encode(&mut self, rgba: &[u8]) -> Result<EncodeOutcome, EncoderError> {
         let expected = (self.config.width as usize)
             .saturating_mul(self.config.height as usize)
@@ -600,15 +889,35 @@ impl Encoder {
             )));
         }
 
+        if self.finished {
+            return Err(EncoderError::Rejected("encoder is finished".into()));
+        }
+        if self.writer_has_failed() {
+            self.stdin.take();
+            return Err(self.writer_failure());
+        }
+
         let started = Instant::now();
-        {
+        let queued = {
             let stdin = self
                 .stdin
-                .as_mut()
+                .as_ref()
                 .ok_or_else(|| EncoderError::Rejected("encoder is finished".into()))?;
-            stdin.write_all(rgba).map_err(EncoderError::Write)?;
+            match try_queue_frame(stdin, rgba.to_vec()) {
+                QueueResult::Queued => true,
+                QueueResult::Dropped => {
+                    self.frames_dropped += 1;
+                    false
+                }
+                QueueResult::Closed => {
+                    self.stdin.take();
+                    return Err(self.writer_failure());
+                }
+            }
+        };
+        if queued {
+            self.frames_in += 1;
         }
-        self.frames_in += 1;
         self.last_encode = Some(started.elapsed());
 
         // Report whether the reader has anything ready, without taking it.
@@ -624,11 +933,16 @@ impl Encoder {
     }
 
     /// Take the next complete access unit if one is already available.
+    ///
+    /// This compatibility wrapper keeps the original non-fallible API. The
+    /// streaming loop uses [`Self::next_access_unit_result`] so a reader or
+    /// child failure is reported instead of silently becoming an empty poll.
     pub fn next_access_unit(&mut self) -> Option<AccessUnit> {
-        if self.deferred_error.take().is_some() {
-            self.finished = true;
-            return None;
-        }
+        self.next_access_unit_result().ok().flatten()
+    }
+
+    /// Poll for an access unit and surface reader/child failures.
+    pub fn next_access_unit_result(&mut self) -> Result<Option<AccessUnit>, EncoderError> {
         match self.rx.try_recv() {
             Ok(ReaderMessage::Unit(au, sets)) => {
                 self.frames_out += 1;
@@ -636,19 +950,27 @@ impl Encoder {
                 if au.keyframe {
                     self.keyframe_requested = false;
                 }
-                Some(*au)
+                Ok(Some(*au))
             }
             Ok(ReaderMessage::End(Err(why))) => {
                 self.finished = true;
-                self.deferred_error = Some(why);
-                None
+                self.stdin.take();
+                Err(EncoderError::ChildFailed {
+                    encoder: self.candidate.name.clone(),
+                    status: self.with_stderr(why),
+                })
             }
-            Ok(ReaderMessage::End(Ok(()))) => {
-                self.finished = true;
-                None
-            }
+            Ok(ReaderMessage::End(Ok(()))) => self.output_ended(),
             // Empty channel: nothing ready yet.
-            Err(_) => None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.finished = true;
+                self.stdin.take();
+                Err(EncoderError::ChildFailed {
+                    encoder: self.candidate.name.clone(),
+                    status: self.with_stderr("encoder output reader stopped unexpectedly".into()),
+                })
+            }
         }
     }
 
@@ -669,22 +991,25 @@ impl Encoder {
                 }
                 Ok(Some(*au))
             }
-            Ok(ReaderMessage::End(Ok(()))) => {
-                self.finished = true;
-                Ok(None)
-            }
+            Ok(ReaderMessage::End(Ok(()))) => self.output_ended(),
             Ok(ReaderMessage::End(Err(why))) => {
                 self.finished = true;
+                self.stdin.take();
+                let status = self.with_stderr(why);
                 Err(EncoderError::ChildFailed {
                     encoder: self.candidate.name.clone(),
-                    status: why,
+                    status,
                 })
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
             // The reader thread ended without a message: treat as stream end.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 self.finished = true;
-                Ok(None)
+                self.stdin.take();
+                Err(EncoderError::ChildFailed {
+                    encoder: self.candidate.name.clone(),
+                    status: self.with_stderr("encoder output reader stopped unexpectedly".into()),
+                })
             }
         }
     }
@@ -732,28 +1057,73 @@ impl Encoder {
     /// Finish the stream: close stdin, drain the rest, and return the tail.
     pub fn finish(mut self) -> Result<Vec<AccessUnit>, EncoderError> {
         // Closing stdin tells ffmpeg the input ended; it flushes and exits.
-        self.stdin = None;
+        self.stdin.take();
         let mut out = Vec::new();
-        while let Ok(msg) = self.rx.recv_timeout(Duration::from_secs(2)) {
-            match msg {
-                ReaderMessage::Unit(au, sets) => {
+        let mut reader_error = None;
+        let mut stream_ended = false;
+        loop {
+            match self.rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(ReaderMessage::Unit(au, sets)) => {
                     self.parameter_sets = sets;
                     out.push(*au)
                 }
-                ReaderMessage::End(Ok(())) => break,
-                ReaderMessage::End(Err(why)) => {
-                    return Err(EncoderError::ChildFailed {
-                        encoder: self.candidate.name.clone(),
-                        status: why,
-                    })
+                Ok(ReaderMessage::End(Ok(()))) => {
+                    stream_ended = true;
+                    break;
+                }
+                Ok(ReaderMessage::End(Err(why))) => {
+                    reader_error = Some(why);
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    reader_error = Some("timed out waiting for encoder output".to_string());
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    reader_error = Some("encoder output reader stopped unexpectedly".to_string());
+                    break;
                 }
             }
         }
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+
+        // Capture the child's status before the intentional kill. A clean
+        // stdout EOF can race a writer that is still unwinding from EPIPE;
+        // an unsuccessful child status remains a real failure, while an EPIPE
+        // caused only by our shutdown is ignored.
+        let status_before_stop = self.child.try_wait().ok().flatten();
+        let writer_error_before_stop = self.writer_has_failed().then(|| self.take_writer_error());
+        self.stop_child_and_join();
+        let status_after_stop = self.child.try_wait().ok().flatten();
+        let child_status = status_before_stop.or(status_after_stop);
+        let writer_error_after_stop = self.take_writer_error_opt();
+
+        if let Some(why) = reader_error {
+            let mut status = self.with_stderr(why);
+            if let Some(e) = writer_error_before_stop.or(writer_error_after_stop) {
+                status.push_str(&format!("; stdin writer: {e}"));
+            }
+            return Err(EncoderError::ChildFailed {
+                encoder: self.candidate.name.clone(),
+                status,
+            });
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(status) = child_status {
+            if !status.success() {
+                let mut why = self.with_stderr(format!("encoder exited with {status}"));
+                if let Some(e) = writer_error_before_stop.or(writer_error_after_stop) {
+                    why.push_str(&format!("; stdin writer: {e}"));
+                }
+                return Err(EncoderError::ChildFailed {
+                    encoder: self.candidate.name.clone(),
+                    status: why,
+                });
+            }
+        }
+        if !stream_ended {
+            if let Some(e) = writer_error_before_stop.or(writer_error_after_stop) {
+                return Err(EncoderError::Write(e));
+            }
+        }
         Ok(out)
     }
 }
@@ -761,20 +1131,47 @@ impl Encoder {
 impl Drop for Encoder {
     fn drop(&mut self) {
         // Make sure ffmpeg is not left running if the encoder is dropped
-        // without an explicit finish.
-        self.stdin = None;
-        if let Some(reader) = self.reader.take() {
-            // Detach: the thread ends when its pipe closes.
-            drop(reader);
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // without an explicit finish. Killing and reaping the child first
+        // closes all three pipes, so every helper thread can be joined.
+        self.stop_child_and_join();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stderr_tail_keeps_bounded_last_lines() {
+        let mut tail = StderrTail::default();
+        for i in 0..(STDERR_TAIL_LINES + 7) {
+            tail.push_line(&format!("encoder line {i}"));
+        }
+
+        let text = tail.text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), STDERR_TAIL_LINES);
+        assert_eq!(lines[0], "encoder line 7");
+        assert_eq!(
+            lines[lines.len() - 1],
+            format!("encoder line {}", STDERR_TAIL_LINES + 6)
+        );
+        assert!(!text.contains("encoder line 0\n"));
+        assert!(tail.bytes <= STDERR_TAIL_BYTES);
+    }
+
+    #[test]
+    fn bounded_stdin_queue_drops_instead_of_waiting() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(STDIN_QUEUE_CAPACITY);
+        assert_eq!(try_queue_frame(&tx, vec![1]), QueueResult::Queued);
+        // No receiver is running, so this queue is full. `try_send` must report
+        // a drop immediately rather than waiting for the writer to make room.
+        assert_eq!(try_queue_frame(&tx, vec![2]), QueueResult::Dropped);
+        assert_eq!(rx.try_recv(), Ok(vec![1]));
+
+        drop(rx);
+        assert_eq!(try_queue_frame(&tx, vec![3]), QueueResult::Closed);
+    }
 
     #[test]
     fn encoder_choice_parses() {
@@ -936,11 +1333,12 @@ mod tests {
         let tail = enc.finish().expect("flush should succeed");
         produced += tail.len() as u64;
 
+        assert!(frames_in > 0, "at least one frame should be accepted");
         assert_eq!(
-            produced, n as u64,
-            "every fed frame produces exactly one access unit"
+            produced, frames_in,
+            "every accepted frame produces exactly one access unit"
         );
-        assert_eq!(frames_in, n as u64);
+        assert!(frames_in <= n as u64, "the bounded queue may drop frames");
     }
 
     /// Feeds a realistic 1080p60 workload and reports what came out.
@@ -1101,6 +1499,7 @@ mod tests {
         for _ in 0..n {
             enc.encode(&frame).unwrap();
         }
+        let frames_in = enc.frames_in();
         // Everything the encoder produced must still be collectable.
         let mut collected = 0u64;
         while enc.next_access_unit().is_some() {
@@ -1108,8 +1507,8 @@ mod tests {
         }
         let collected = collected + enc.finish().unwrap().len() as u64;
         assert_eq!(
-            collected, n as u64,
-            "no access unit may be lost between the encoder and the caller"
+            collected, frames_in,
+            "no accepted access unit may be lost between the encoder and the caller"
         );
     }
 
@@ -1139,7 +1538,13 @@ mod tests {
             for p in frame.iter_mut() {
                 *p = p.wrapping_add(1).wrapping_add(i as u8);
             }
-            enc.encode(&frame).unwrap();
+            // Keep this end-to-end test paced by accepted frames, not wall-clock
+            // sleeps. The production queue intentionally drops bursts, so waiting
+            // for the next accepted frame makes the GOP assertion deterministic.
+            while enc.frames_in() < u64::from(i + 1) {
+                enc.encode(&frame).unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
             while let Some(au) = enc.next_access_unit() {
                 if au.keyframe {
                     keyframes += 1;
@@ -1147,6 +1552,7 @@ mod tests {
                 units += 1;
             }
         }
+        let frames_in = enc.frames_in();
         // Count the tail too: for a short clip the encoder may hold everything
         // back until stdin closes, so keyframes can arrive at finish.
         for au in enc.finish().unwrap() {
@@ -1155,10 +1561,13 @@ mod tests {
             }
             units += 1;
         }
-        assert_eq!(units, n as usize, "one access unit per frame");
+        assert_eq!(
+            units, frames_in as usize,
+            "one access unit per accepted frame"
+        );
         assert!(
             keyframes >= 2,
-            "a 6-frame GOP over 12 frames must contain at least two keyframes, got {keyframes}"
+            "a 6-frame GOP over accepted frames must contain at least two keyframes, got {keyframes}"
         );
     }
 }
