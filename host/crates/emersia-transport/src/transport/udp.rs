@@ -70,12 +70,26 @@ struct Pending {
     created_at: Instant,
 }
 
+/// Upper bound on queued control records, so a chatty (or hostile but
+/// paired) device cannot grow host memory without bound.
+const MAX_INBOX: usize = 1024;
+
+/// An authenticated device → host control record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlRecord {
+    pub device_id: [u8; DEVICE_ID_LEN],
+    pub payload_type: u8,
+    pub payload: Vec<u8>,
+}
+
 /// Host-side UDP endpoint.
 pub struct HostEndpoint {
     socket: UdpSocket,
     host_identity: DeviceIdentity,
     pending: HashMap<SocketAddr, Pending>,
     peers: HashMap<[u8; DEVICE_ID_LEN], Peer>,
+    /// Control records from connected devices, oldest first.
+    inbox: std::collections::VecDeque<ControlRecord>,
 }
 
 /// Decides whether a device may start a handshake.
@@ -94,6 +108,7 @@ impl HostEndpoint {
             host_identity,
             pending: HashMap::new(),
             peers: HashMap::new(),
+            inbox: std::collections::VecDeque::new(),
         })
     }
 
@@ -226,16 +241,51 @@ impl HostEndpoint {
     }
 
     fn handle_data(&mut self, packet: &[u8], from: SocketAddr) {
-        let Some((_, peer)) = self.peers.iter_mut().find(|(_, p)| p.addr == from) else {
+        let Some((id, peer)) = self.peers.iter_mut().find(|(_, p)| p.addr == from) else {
             return;
         };
         // Replay and authentication failures are silent by design.
-        let _ = open_packet(
+        let Ok((header, payload)) = open_packet(
             &peer.session,
             crate::crypto::Direction::DeviceToHost,
             &mut peer.window,
             packet,
-        );
+        ) else {
+            return;
+        };
+        if self.inbox.len() >= MAX_INBOX {
+            self.inbox.pop_front();
+        }
+        self.inbox.push_back(ControlRecord {
+            device_id: *id,
+            payload_type: header.payload_type,
+            payload,
+        });
+    }
+
+    /// Drain authenticated control records received since the last call.
+    pub fn take_control(&mut self) -> Vec<ControlRecord> {
+        self.inbox.drain(..).collect()
+    }
+
+    /// A second handle on the endpoint's socket, so a dedicated thread can
+    /// block in `recv_from` without holding whatever lock guards the endpoint.
+    pub fn try_clone_socket(&self) -> std::io::Result<UdpSocket> {
+        self.socket.try_clone()
+    }
+
+    /// Handle one datagram received elsewhere (see `try_clone_socket`) and
+    /// send any reply it calls for. The `pump` loop body, for one packet.
+    pub fn dispatch(
+        &mut self,
+        packet: &[u8],
+        from: SocketAddr,
+        authorized: &mut Authorizer<'_>,
+    ) -> std::io::Result<()> {
+        if let HostOutcome::Reply(bytes) = self.handle_packet(packet, from, authorized) {
+            self.socket.send_to(&bytes, from)?;
+        }
+        Ok(())
     }
 
     /// Read and dispatch whatever is waiting, up to `max` datagrams.
@@ -351,6 +401,8 @@ pub struct ClientEndpoint {
     handshake: Option<HandshakeClient>,
     session: Option<Session>,
     window: ReplayWindow,
+    /// Next outbound (device → host) record sequence.
+    next_sequence: u32,
 }
 
 impl ClientEndpoint {
@@ -370,6 +422,7 @@ impl ClientEndpoint {
             handshake: Some(HandshakeClient::new(device_id, identity, host_static)),
             session: None,
             window: ReplayWindow::default(),
+            next_sequence: 0,
         })
     }
 
@@ -454,6 +507,28 @@ impl ClientEndpoint {
             .map_err(|_| TransportError::Dropped("send confirm failed"))?;
         self.session = Some(session.clone());
         Ok(session)
+    }
+
+    /// Send one authenticated control record to the host (e.g.
+    /// `control::KEYFRAME_REQUEST`). Requires an established session.
+    pub fn send_control(&mut self, payload_type: u8, payload: &[u8]) -> Result<(), TransportError> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or(TransportError::Dropped("no session"))?;
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        let record = build_record(sequence, sequence, 0, false, payload_type, payload, 0, 1)?;
+        let packet = seal_packet(
+            session,
+            crate::crypto::Direction::DeviceToHost,
+            sequence,
+            &record,
+        )?;
+        self.socket
+            .send(&packet)
+            .map(|_| ())
+            .map_err(|_| TransportError::Dropped("send failed"))
     }
 
     /// Blocking receive of one record, for a real socket read.
@@ -573,6 +648,59 @@ mod tests {
         let (n, _) = host.socket.recv_from(&mut buf).unwrap();
         let confirm = buf[..n].to_vec();
         (host, confirm, from, id, device_pub)
+    }
+
+    #[test]
+    fn control_records_reach_the_host_authenticated_and_once() {
+        let (mut host, mut client, id) = established();
+        client
+            .send_control(crate::transport::control::KEYFRAME_REQUEST, b"")
+            .unwrap();
+        client
+            .send_control(crate::transport::control::INPUT, b"evt")
+            .unwrap();
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let mut deny = |_: &[u8; DEVICE_ID_LEN], _: &[u8; 32]| false;
+        let mut raw = Vec::new();
+        for _ in 0..2 {
+            let (n, from) = host.socket.recv_from(&mut buf).unwrap();
+            raw.push((buf[..n].to_vec(), from));
+            host.dispatch(&buf[..n], from, &mut deny).unwrap();
+        }
+        let records = host.take_control();
+        assert_eq!(
+            records,
+            vec![
+                ControlRecord {
+                    device_id: id,
+                    payload_type: crate::transport::control::KEYFRAME_REQUEST,
+                    payload: vec![],
+                },
+                ControlRecord {
+                    device_id: id,
+                    payload_type: crate::transport::control::INPUT,
+                    payload: b"evt".to_vec(),
+                },
+            ]
+        );
+        // A replayed control record is dropped.
+        let (packet, from) = &raw[0];
+        host.dispatch(packet, *from, &mut deny).unwrap();
+        assert!(host.take_control().is_empty());
+    }
+
+    #[test]
+    fn control_from_unknown_address_is_ignored() {
+        let (mut host, mut client, _) = established();
+        client
+            .send_control(crate::transport::control::KEYFRAME_REQUEST, b"")
+            .unwrap();
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (n, _) = host.socket.recv_from(&mut buf).unwrap();
+        let elsewhere: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let mut deny = |_: &[u8; DEVICE_ID_LEN], _: &[u8; 32]| false;
+        host.dispatch(&buf[..n], elsewhere, &mut deny).unwrap();
+        assert!(host.take_control().is_empty());
     }
 
     #[test]

@@ -15,6 +15,7 @@ mod capture;
 mod control;
 mod encoder;
 mod frame;
+mod network;
 mod pairing;
 mod receiver;
 mod service;
@@ -313,7 +314,10 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
     println!("emersia-daemon {VERSION} — serving control socket");
     println!("control socket: {}", server.path().display());
     println!("capture backend: {}", engine.backend_name);
-    match engine.transport().and_then(|t| t.local_addr().ok()) {
+    match engine
+        .transport()
+        .and_then(|t| network::lock(t).local_addr().ok())
+    {
         Some(addr) => println!("stream endpoint: udp://{addr} (encrypted, paired devices only)"),
         None => println!("stream endpoint: disabled (pass --stream-port to enable)"),
     }
@@ -329,6 +333,13 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
     let server_thread =
         std::thread::spawn(move || -> anyhow::Result<()> { server.serve(serve_svc) });
 
+    let net_thread = match engine.transport() {
+        Some(endpoint) => Some(
+            network::spawn(Arc::clone(endpoint), Arc::clone(&svc))
+                .context("could not start the stream receive thread")?,
+        ),
+        None => None,
+    };
     service::run_engine(engine, Arc::clone(&svc));
 
     // Engine exited (signal): stop the accept loop and clean up the socket.
@@ -337,6 +348,11 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
         Ok(Ok(())) => {}
         Ok(Err(err)) => eprintln!("emersia-daemon: control server: {err:#}"),
         Err(_) => eprintln!("emersia-daemon: control server thread panicked"),
+    }
+    if let Some(net) = net_thread {
+        if net.join().is_err() {
+            eprintln!("emersia-daemon: stream receive thread panicked");
+        }
     }
     println!("emersia-daemon: shut down cleanly");
     Ok(())

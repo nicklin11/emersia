@@ -227,6 +227,8 @@ pub struct Service {
     /// The daemon's own long-term identity (ADR 0006). Devices need this to
     /// pin the host they are talking to.
     host_public_key: String,
+    /// Set by the network thread when a device asks for an IDR.
+    keyframe_requested: AtomicBool,
 }
 
 impl Service {
@@ -239,6 +241,7 @@ impl Service {
             shutdown: AtomicBool::new(false),
             pairing: Mutex::new(pairing),
             host_public_key: host_public_key_hex.to_string(),
+            keyframe_requested: AtomicBool::new(false),
         }
     }
 
@@ -302,6 +305,16 @@ impl Service {
     /// Record how many devices are connected to the streaming endpoint.
     pub fn set_stream_peers(&self, count: usize) {
         self.lock().stream_peers = count;
+    }
+
+    /// A device lost its reference chain and asked for a keyframe.
+    pub fn request_keyframe(&self) {
+        self.keyframe_requested.store(true, Ordering::Relaxed);
+    }
+
+    /// Consume a pending keyframe request.
+    pub fn take_keyframe_request(&self) -> bool {
+        self.keyframe_requested.swap(false, Ordering::Relaxed)
     }
 
     /// Take device ids revoked since the last call, so the engine can drop
@@ -665,7 +678,7 @@ pub struct Engine {
     /// Backend preference supplied at startup, retained for reconnect.
     backend_pref: BackendPref,
     /// Streaming endpoint; bound even when idle so a device can pair and wait.
-    transport: Option<HostEndpoint>,
+    transport: Option<crate::network::SharedEndpoint>,
     /// Video encoder; started on the first streamed frame so the capture size
     /// and the encoder configuration are known before anything is spawned.
     encoder: Option<crate::encoder::Encoder>,
@@ -699,15 +712,15 @@ impl Engine {
             self.transport = None;
             return Ok(self);
         };
-        self.transport = Some(
+        self.transport = Some(std::sync::Arc::new(std::sync::Mutex::new(
             HostEndpoint::bind(&format!("0.0.0.0:{port}"), identity)
                 .map_err(|e| anyhow::anyhow!("could not bind UDP port {port}: {e}"))?,
-        );
+        )));
         Ok(self)
     }
 
     /// The streaming endpoint, once bound.
-    pub fn transport(&self) -> Option<&HostEndpoint> {
+    pub fn transport(&self) -> Option<&crate::network::SharedEndpoint> {
         self.transport.as_ref()
     }
 
@@ -924,47 +937,23 @@ impl Engine {
 /// encoder stage has not landed yet, so a full 1080p RGBA frame would be ~8 MB
 /// per frame and is not something to put on a wire. The preview proves the
 /// path end to end; the encoder replaces it in M1.5.
+/// Minimum spacing between keyframes forced by device requests. Each one costs
+/// an encoder restart, and a burst of loss produces a burst of requests.
+const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
 pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
     service.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
     let mut last_frame = Instant::now();
     let mut timestamp: u32 = 0;
     let mut last_peers = 0usize;
     let mut applied_output: Option<String> = None;
+    let mut last_forced_keyframe = Instant::now();
 
     while !service.is_shutting_down() && !crate::signal_received() {
-        // Always service the transport so a device can pair and connect even
-        // when we are not capturing.
-        if let Some(transport) = engine.transport.as_mut() {
-            // A revoked device loses its session immediately.
-            for id in service.take_revoked() {
-                if transport.disconnect(&id) {
-                    eprintln!(
-                        "emersia-daemon: revoked device {} disconnected from the stream",
-                        hex::encode(id)
-                    );
-                }
-            }
-            // The authorizer reads the trust store at the moment of the
-            // decision rather than from a snapshot taken at the top of the
-            // loop.
-            //
-            // A snapshot is stale for up to a whole engine iteration (a few
-            // hundred ms), and a device that pairs and immediately connects
-            // lands squarely in that window: it was refused as unpaired, and
-            // because a client sends `init` only once, the connection failed
-            // until the user retried. The lock is taken per handshake, not per
-            // frame, so the cost is irrelevant next to the correctness.
-            let mut allowed = |id: &[u8; 8], pubkey: &[u8; 32]| {
-                let got_id = hex::encode(id);
-                let got_key = hex::encode(pubkey);
-                service.lock_pairing().devices().iter().any(|d| {
-                    d.id == got_id && d.public_key.eq_ignore_ascii_case(&got_key) && !d.revoked
-                })
-            };
-            if let Err(e) = transport.pump(16, &mut allowed) {
-                eprintln!("emersia-daemon: stream pump error: {e}");
-            }
-            let peers = transport.peer_count();
+        // Receiving (handshakes, revocation, device messages) runs on the
+        // network thread; the engine only watches the peer count.
+        if let Some(transport) = engine.transport.as_ref() {
+            let peers = crate::network::lock(transport).peer_count();
             if peers > last_peers {
                 // A device just connected. It has no prior frames, so it cannot
                 // decode anything until a keyframe arrives. Dropping the
@@ -979,7 +968,17 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                 engine.encoder = None;
             }
             last_peers = peers;
-            service.set_stream_peers(peers);
+            // A device lost a frame and cannot decode until an IDR. Restarting
+            // the encoder is the only way to force one through the ffmpeg
+            // pipe, so requests are coalesced and rate-limited.
+            if service.take_keyframe_request()
+                && engine.encoder.is_some()
+                && last_forced_keyframe.elapsed() >= KEYFRAME_REQUEST_MIN_INTERVAL
+            {
+                eprintln!("emersia-daemon: keyframe requested by a device");
+                engine.encoder = None;
+                last_forced_keyframe = Instant::now();
+            }
         }
 
         if !service.is_streaming() {
@@ -1048,7 +1047,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                 if engine
                     .transport
                     .as_ref()
-                    .is_some_and(|t| t.peer_count() > 0)
+                    .is_some_and(|t| crate::network::lock(t).peer_count() > 0)
                 {
                     // Start or restart the encoder for this geometry. A failure
                     // is reported but does not stop the daemon: the user may be
@@ -1081,7 +1080,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                             let ids = engine
                                 .transport
                                 .as_ref()
-                                .map(|transport| transport.peer_ids())
+                                .map(|transport| crate::network::lock(transport).peer_ids())
                                 .unwrap_or_default();
                             let mut shipped = 0u32;
                             let mut output_failed = false;
@@ -1112,8 +1111,9 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                                     .map(|e| e.payload_for(&au))
                                     .unwrap_or_else(|| au.annexb.clone());
                                 for id in &ids {
-                                    match engine.transport.as_mut().map(|t| {
-                                        t.send_frame(id, timestamp, keyframe, pt, &payload)
+                                    match engine.transport.as_ref().map(|t| {
+                                        crate::network::lock(t)
+                                            .send_frame(id, timestamp, keyframe, pt, &payload)
                                     }) {
                                         Some(Ok(_)) => shipped += 1,
                                         Some(Err(e)) => {
