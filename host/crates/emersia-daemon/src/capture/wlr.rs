@@ -13,7 +13,7 @@ use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::{
     Event as FrameEvent, Flags, ZwlrScreencopyFrameV1,
 };
 
-use crate::frame::{decode, flip_rows, untransform, Frame};
+use crate::frame::{flip_rows, pack, untransform, Frame};
 use crate::shm::ShmBuffer;
 
 use super::{wait_until, CaptureTimings, CapturedFrame, State, CONSTRAINT_TIMEOUT, FRAME_TIMEOUT};
@@ -96,16 +96,16 @@ pub fn capture(
     let data = shm_buffer.read_pixels(stride, height)?;
     let shm_read = shm_read_started.elapsed();
     let decode_started = Instant::now();
-    let mut rgba = decode(format, width, height, stride, &data)?;
+    let (mut pixels, pixel_format) = pack(format, width, height, stride, data)?;
     let decode = decode_started.elapsed();
     let transform_started = Instant::now();
     if y_invert {
-        rgba = flip_rows(&rgba, width, height);
+        pixels = flip_rows(&pixels, width, height);
     }
-    let (rgba, out_w, out_h) = untransform(&rgba, width, height, transform);
+    let (pixels, out_w, out_h) = untransform(pixels, width, height, transform);
     let transform = transform_started.elapsed();
     Ok(CapturedFrame {
-        frame: Frame::new(out_w, out_h, rgba),
+        frame: Frame::new(out_w, out_h, pixels, pixel_format),
         timings: CaptureTimings {
             constraints,
             frame_wait,

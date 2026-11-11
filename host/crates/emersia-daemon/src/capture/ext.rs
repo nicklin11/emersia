@@ -14,7 +14,7 @@ use wayland_protocols::ext::image_copy_capture::v1::client::{
     ext_image_copy_capture_session_v1::{Event as SessionEvent, ExtImageCopyCaptureSessionV1},
 };
 
-use crate::frame::{decode, untransform, Frame};
+use crate::frame::{pack, untransform, Frame};
 use crate::shm::ShmBuffer;
 
 use super::{
@@ -101,18 +101,18 @@ pub fn capture(
         bail!("the capture session stopped before a frame was produced");
     }
 
-    // 3. Read back and convert to an upright RGBA image.
+    // 3. Read back as native packed pixels, upright.
     let shm_read_started = Instant::now();
     let data = shm_buffer.read_pixels(stride, height)?;
     let shm_read = shm_read_started.elapsed();
     let decode_started = Instant::now();
-    let rgba = decode(format, width, height, stride, &data)?;
+    let (pixels, pixel_format) = pack(format, width, height, stride, data)?;
     let decode = decode_started.elapsed();
     let transform_started = Instant::now();
-    let (rgba, out_w, out_h) = untransform(&rgba, width, height, transform);
+    let (pixels, out_w, out_h) = untransform(pixels, width, height, transform);
     let transform = transform_started.elapsed();
     Ok(CapturedFrame {
-        frame: Frame::new(out_w, out_h, rgba),
+        frame: Frame::new(out_w, out_h, pixels, pixel_format),
         timings: CaptureTimings {
             constraints,
             frame_wait,

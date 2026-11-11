@@ -36,6 +36,7 @@ use std::process::{Child, ChildStderr, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::codec::{AccessUnit, AnnexBParser, Codec, CodecError};
+use crate::frame::PixelFormat;
 
 /// Keep a small diagnostic tail rather than allowing ffmpeg's stderr pipe to
 /// fill while nobody reads it.
@@ -275,6 +276,8 @@ pub struct EncoderConfig {
     pub width: u32,
     /// Height of the frames that will be fed in.
     pub height: u32,
+    /// Byte order of the frames that will be fed in.
+    pub input_format: PixelFormat,
 }
 
 impl Default for EncoderConfig {
@@ -289,6 +292,7 @@ impl Default for EncoderConfig {
             fps: 60,
             width: 1920,
             height: 1080,
+            input_format: PixelFormat::Bgr0,
         }
     }
 }
@@ -579,7 +583,7 @@ impl Encoder {
             "-f",
             "rawvideo",
             "-pix_fmt",
-            "rgba",
+            config.input_format.ffmpeg_name(),
             "-s",
             &format!("{}x{}", config.width, config.height),
             "-r",
@@ -589,16 +593,27 @@ impl Encoder {
         ]);
 
         if candidate.needs_vaapi_device() {
-            // Upload first, then format: `format` applies to the surface.
-            cmd.args(["-vf", "format=nv12,hwupload"]);
+            // Upload the compositor's native RGB layout and convert to NV12 on
+            // the GPU: a CPU swscale pass cost ~5 ms per 1080p frame. BT.709
+            // limited range, matching the VUI tags below, which is also what
+            // the Quest's decoder assumes.
+            cmd.args([
+                "-vf",
+                "hwupload,scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=tv",
+            ]);
             // The default (2) pipelines encodes, so each frame's output only
             // appeared once the *next* frame went in: a whole frame interval
             // of latency, unbounded on an idle damage-driven desktop.
             cmd.args(["-async_depth", "1"]);
         } else {
             // Software and the other vendors take system memory; convert here
-            // so the encoder never sees RGBA.
-            cmd.args(["-pix_fmt", "yuv420p"]);
+            // so the encoder never sees RGB. Explicit BT.709 limited range:
+            // swscale's default matrix is BT.601, which decoders that read
+            // the (BT.709) tags render with shifted colours.
+            cmd.args([
+                "-vf",
+                "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
+            ]);
         }
 
         cmd.args(["-c:v", &candidate.name]);
@@ -610,6 +625,17 @@ impl Encoder {
             },
         ]);
         cmd.args(["-b:v", &format!("{}k", config.bitrate / 1000)]);
+        // Tag the colour space so every decoder converts back the same way.
+        cmd.args([
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-color_range",
+            "tv",
+        ]);
         // Keyframes on a *time* interval, not a frame count.
         //
         // `-g` counts frames, so a GOP of 120 frames is 2 s at the target rate
@@ -972,8 +998,8 @@ impl Encoder {
     /// Returns `Encoded` when an access unit became available. The frame is
     /// offered to a bounded queue with [`std::sync::mpsc::SyncSender::try_send`],
     /// so a slow encoder drops this frame instead of blocking the capture loop.
-    pub fn encode(&mut self, rgba: &[u8]) -> Result<EncodeOutcome, EncoderError> {
-        self.encode_captured_at(rgba, Instant::now())
+    pub fn encode(&mut self, pixels: &[u8]) -> Result<EncodeOutcome, EncoderError> {
+        self.encode_captured_at(pixels.to_vec(), Instant::now())
     }
 
     /// [`encode`](Self::encode), recording when the frame was captured so the
@@ -981,7 +1007,7 @@ impl Encoder {
     /// [`last_unit_capture`](Self::last_unit_capture)).
     pub fn encode_captured_at(
         &mut self,
-        rgba: &[u8],
+        rgba: Vec<u8>,
         captured_at: Instant,
     ) -> Result<EncodeOutcome, EncoderError> {
         let expected = (self.config.width as usize)
@@ -1010,7 +1036,8 @@ impl Encoder {
                 .stdin
                 .as_ref()
                 .ok_or_else(|| EncoderError::Rejected("encoder is finished".into()))?;
-            match try_queue_frame(stdin, rgba.to_vec()) {
+            // Moved, not copied: the frame is handed straight to the writer.
+            match try_queue_frame(stdin, rgba) {
                 QueueResult::Queued => true,
                 QueueResult::Dropped => {
                     self.frames_dropped += 1;
@@ -1054,7 +1081,41 @@ impl Encoder {
 
     /// Poll for an access unit and surface reader/child failures.
     pub fn next_access_unit_result(&mut self) -> Result<Option<AccessUnit>, EncoderError> {
-        match self.rx.try_recv() {
+        let message = self.rx.try_recv();
+        self.on_reader_message(message)
+    }
+
+    /// Like [`next_access_unit_result`](Self::next_access_unit_result), but
+    /// when a frame has gone in and its unit has not come out yet, wait up to
+    /// `wait` for it.
+    ///
+    /// The engine used to poll right after feeding a frame — before the
+    /// encoder (≈2.5 ms on VCN at 1080p) had produced it — so every unit sat
+    /// until the next loop iteration: a whole frame interval of latency.
+    pub fn next_access_unit_within(
+        &mut self,
+        wait: Duration,
+    ) -> Result<Option<AccessUnit>, EncoderError> {
+        if wait.is_zero() || self.frames_out >= self.frames_in {
+            return self.next_access_unit_result();
+        }
+        let message = match self.rx.recv_timeout(wait) {
+            Ok(m) => Ok(m),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            }
+        };
+        self.on_reader_message(message)
+    }
+
+    fn on_reader_message(
+        &mut self,
+        message: Result<ReaderMessage, std::sync::mpsc::TryRecvError>,
+    ) -> Result<Option<AccessUnit>, EncoderError> {
+        match message {
             Ok(ReaderMessage::Unit(au, sets)) => {
                 self.frames_out += 1;
                 self.last_unit_capture = self.capture_times.pop_front();
@@ -1426,6 +1487,7 @@ mod tests {
             choice: EncoderChoice::Software,
             width: 641,
             height: 480,
+            input_format: PixelFormat::Rgba,
             ..Default::default()
         };
         cfg.width = 641;
@@ -1455,6 +1517,7 @@ mod tests {
             choice: EncoderChoice::Software,
             width: 64,
             height: 64,
+            input_format: PixelFormat::Rgba,
             ..Default::default()
         };
         let mut enc = match Encoder::start(cfg) {
@@ -1483,6 +1546,7 @@ mod tests {
             fps: 12,
             width: w,
             height: h,
+            input_format: PixelFormat::Rgba,
         };
         let mut enc = match Encoder::start(cfg) {
             Ok(e) => e,
@@ -1543,6 +1607,7 @@ mod tests {
             fps: 12,
             width: w,
             height: h,
+            input_format: PixelFormat::Rgba,
         };
         let mut enc = match Encoder::start(cfg) {
             Ok(e) => e,
@@ -1564,7 +1629,7 @@ mod tests {
             // Irregular spacing, like damage-driven capture.
             let at = base + Duration::from_millis(i * i * 13);
             let before = enc.frames_in();
-            enc.encode_captured_at(&frame, at).expect("frame accepted");
+            enc.encode_captured_at(frame, at).expect("frame accepted");
             if enc.frames_in() > before {
                 fed.push(at);
             }
@@ -1602,6 +1667,7 @@ mod tests {
             fps: 60,
             width: w,
             height: h,
+            input_format: PixelFormat::Rgba,
         };
         let mut enc = match Encoder::start(cfg) {
             Ok(e) => e,
@@ -1655,6 +1721,7 @@ mod tests {
                 fps: 60,
                 width: w,
                 height: h,
+                input_format: PixelFormat::Rgba,
             };
             let mut enc = match Encoder::start(cfg) {
                 Ok(e) => e,
@@ -1697,6 +1764,7 @@ mod tests {
                 choice,
                 width: 1920,
                 height: 1080,
+                input_format: PixelFormat::Rgba,
                 fps: 60,
                 ..Default::default()
             };
@@ -1733,6 +1801,7 @@ mod tests {
             fps: 8,
             width: w,
             height: h,
+            input_format: PixelFormat::Rgba,
         };
         let mut enc = match Encoder::start(cfg) {
             Ok(e) => e,
@@ -1766,6 +1835,7 @@ mod tests {
             fps: 12,
             width: w,
             height: h,
+            input_format: PixelFormat::Rgba,
             ..Default::default()
         };
         let mut enc = match Encoder::start(cfg) {

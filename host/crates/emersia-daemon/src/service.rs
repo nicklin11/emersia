@@ -837,6 +837,7 @@ impl Engine {
         &mut self,
         width: u32,
         height: u32,
+        input_format: crate::frame::PixelFormat,
         target_fps: u32,
         measured_fps: f64,
     ) -> Result<bool, crate::encoder::EncoderError> {
@@ -849,7 +850,10 @@ impl Engine {
         if let Some(enc) = &self.encoder {
             // A geometry change means the running encoder is wrong for the
             // new frames; restart rather than feed it mismatched bytes.
-            if enc.config().width != width || enc.config().height != height {
+            if enc.config().width != width
+                || enc.config().height != height
+                || enc.config().input_format != input_format
+            {
                 self.encoder = None;
             } else if (enc.config().fps as i64 - effective as i64).abs()
                 > (effective as i64 / 4).max(1)
@@ -872,6 +876,7 @@ impl Engine {
             fps: effective,
             width,
             height,
+            input_format,
         };
         let encoder = crate::encoder::Encoder::start(config)?;
         self.codec = encoder.candidate().codec;
@@ -982,6 +987,11 @@ pub fn rtp_timestamp(epoch: Instant, at: Instant) -> u32 {
     let micros = at.saturating_duration_since(epoch).as_micros();
     (micros * u128::from(VIDEO_CLOCK_HZ) / 1_000_000) as u32
 }
+
+/// Longest the engine waits for the unit of the frame it just fed. Hardware
+/// encoders answer in a few ms; the bound keeps a stalled encoder from
+/// stalling capture (the unit then ships on a later iteration, as before).
+const UNIT_WAIT: Duration = Duration::from_millis(30);
 
 /// Minimum spacing between keyframes forced by device requests. Each one costs
 /// an encoder restart, and a burst of loss produces a burst of requests.
@@ -1094,8 +1104,12 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
         let started = Instant::now();
         match engine.capture_once() {
             Ok(captured) => {
-                let captured_at = Instant::now();
                 let capture::CapturedFrame { frame, timings } = captured;
+                // The pixels are as old as the compositor's copy: subtract our
+                // own readback/packing so latency figures start from there.
+                let captured_at = Instant::now()
+                    .checked_sub(timings.shm_read + timings.decode + timings.transform)
+                    .unwrap_or_else(Instant::now);
                 service.record_capture(timings);
                 if engine
                     .transport
@@ -1108,12 +1122,13 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                     match engine.ensure_encoder(
                         frame.width,
                         frame.height,
+                        frame.format,
                         service.fps_target().max(1),
                         service.measured_fps().max(engine.measured_fps),
                     ) {
                         Ok(true) => {
                             if let Some(enc) = engine.encoder.as_mut() {
-                                if let Err(e) = enc.encode_captured_at(&frame.rgba, captured_at) {
+                                if let Err(e) = enc.encode_captured_at(frame.pixels, captured_at) {
                                     service.record_error(format!("encode: {e}"));
                                     eprintln!("emersia-daemon: encode failed: {e}");
                                     engine.encoder = None;
@@ -1131,11 +1146,17 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                                 .unwrap_or_default();
                             let mut shipped = 0u32;
                             let mut output_failed = false;
-                            while let Some(next) = engine
-                                .encoder
-                                .as_mut()
-                                .map(|encoder| encoder.next_access_unit_result())
-                            {
+                            // Ship until every fed frame's unit is out, waiting
+                            // (bounded) for the ones still in the encoder. A
+                            // loop that stopped after the first unit stayed one
+                            // frame behind forever once a slow first frame (an
+                            // encoder start) had put it there.
+                            let unit_deadline = Instant::now() + UNIT_WAIT;
+                            while let Some(next) = engine.encoder.as_mut().map(|encoder| {
+                                encoder.next_access_unit_within(
+                                    unit_deadline.saturating_duration_since(Instant::now()),
+                                )
+                            }) {
                                 let au = match next {
                                     Ok(Some(au)) => au,
                                     Ok(None) => break,

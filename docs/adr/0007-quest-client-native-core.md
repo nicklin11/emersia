@@ -63,6 +63,10 @@ resizable, passthrough-aware panel.
   lowest-RTT sample of 8): **capture → frame received 18.6 ms, hardware
   decode 5.3 ms, ≈ 24 ms capture → decoded**, Wi-Fi RTT 1.5 ms, at 59 fps.
   "Capture" is when the host finished reading the frame back; the compositor
-  wait before it and the headset's own scan-out are not included. Most of the
-  host share is CPU readback/conversion and the RGBA pipe into ffmpeg — the
-  dmabuf path (#35) is the next big win.
+  wait before it and the headset's own scan-out are not included.
+- After #91 (native BGRX passed through, GPU colour conversion, units shipped
+  as soon as the encoder emits them): **capture → received 10.5 ms** (now
+  measured from the compositor's copy, before readback), decode 5.5 ms,
+  **≈ 16 ms capture → decoded**; host capture work 14 → 5.7 ms per frame.
+  The engine had been shipping every unit one loop iteration late (≈ 16 ms);
+  the encoder itself returns a desktop frame in ≈ 7 ms.
