@@ -30,6 +30,20 @@ portal/PipeWire ([#35](https://github.com/nicklin11/emersia/issues/35)).
 `uinput` input injection, sway/hyprland QA, and a packaged systemd service are
 still outstanding.
 
+### Try it: mirror your screen to a Quest
+
+With the headset on USB (developer mode, USB debugging allowed) and on the same
+network as the host:
+
+```sh
+scripts/quest-mirror.sh --output DP-1     # builds, installs, pairs, streams
+```
+
+The desktop appears as a floating panel. Needs the Android SDK/NDK and a Rust
+toolchain with `aarch64-linux-android` (see `client/android/build.sh`). If a
+host firewall is active, allow the stream port (UDP 47800 by default); the
+script prints the exact `ufw` command when it detects one.
+
 ### Planned milestones
 
 - **M0** Foundation — complete: repo, CI, ADRs, project board + workflow automation
@@ -59,7 +73,7 @@ Headset: Meta Quest 2 / 3 / 3S / Pro (OpenXR).
 ```
 host/     Rust workspace: emersia-daemon (streaming engine), emersia (CLI),
           emersia-transport (wire protocol shared with the client), emersia-protocol
-client/   Godot 4 OpenXR Quest client        (from M2)
+client/   Quest client: Rust core (decode/transport) + Android panel shell (M2)
 gui/      Tauri companion app                (from M4)
 docs/     ADRs and design documents
 scripts/  development & validation tooling
