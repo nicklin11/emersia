@@ -76,16 +76,38 @@ jobs:
       - name: clippy (aarch64-linux-android)
         run: cargo clippy --manifest-path client/android/native/Cargo.toml --target aarch64-linux-android -- -D warnings
 
+  # End-to-end against a real compositor: headless sway (no display, no GPU),
+  # a runtime-created virtual output, capture -> software encode -> encrypted
+  # UDP -> decode-verified receive. scripts/qa-sway-headless.sh.
+  sway:
+    name: sway-e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host
+      - name: Install sway and ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends sway ffmpeg
+          sway --version
+      - name: Build
+        run: cargo build --release --manifest-path host/Cargo.toml
+      - name: Headless sway end-to-end
+        run: scripts/qa-sway-headless.sh --encoder sw
+
   # Aggregate check — this is the single required status on `main`.
   ci:
     name: ci
-    needs: [validation, rust, client]
+    needs: [validation, rust, client, sway]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: All jobs green?
         run: |
-          if [ "${{ needs.validation.result }}" != "success" ] || [ "${{ needs.rust.result }}" != "success" ] || [ "${{ needs.client.result }}" != "success" ]; then
+          if [ "${{ needs.validation.result }}" != "success" ] || [ "${{ needs.rust.result }}" != "success" ] || [ "${{ needs.client.result }}" != "success" ] || [ "${{ needs.sway.result }}" != "success" ]; then
             echo "required jobs did not succeed"
             exit 1
           fi
