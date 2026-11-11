@@ -63,7 +63,10 @@ pub enum PairingError {
 impl std::fmt::Display for PairingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoConfigDir => write!(f, "{CONFIG_DIR_ENV} is not set"),
+            Self::NoConfigDir => write!(
+                f,
+                "neither {CONFIG_DIR_ENV} nor HOME is set to an absolute path"
+            ),
             Self::Io(m) => write!(f, "pairing database I/O failed: {m}"),
             Self::Corrupt(m) => write!(
                 f,
@@ -144,10 +147,34 @@ fn hash_code(code: &str, salt_hex: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Default database location: `$XDG_CONFIG_HOME/emersia/pairing.json`.
+/// Resolve the per-user config base directory per the XDG Base Directory spec.
+///
+/// An absolute `XDG_CONFIG_HOME` wins. An unset, empty or relative value is
+/// ignored (the spec says relative paths are invalid) and `$HOME/.config` is
+/// used instead. Pure so the precedence rules are testable without touching
+/// the process environment.
+pub fn resolve_config_base(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let absolute = |v: &std::ffi::OsStr| {
+        let p = Path::new(v);
+        (!v.is_empty() && p.is_absolute()).then(|| p.to_path_buf())
+    };
+    xdg_config_home
+        .and_then(absolute)
+        .or_else(|| home.and_then(absolute).map(|h| h.join(".config")))
+}
+
+/// Default database location: `<config base>/emersia/pairing.json`, where the
+/// base is `$XDG_CONFIG_HOME` or, failing that, `$HOME/.config`.
 pub fn default_db_path() -> Result<PathBuf, PairingError> {
-    let base = std::env::var_os(CONFIG_DIR_ENV).ok_or(PairingError::NoConfigDir)?;
-    Ok(Path::new(&base).join(CONFIG_SUBDIR).join(PAIRING_FILE))
+    let base = resolve_config_base(
+        std::env::var_os(CONFIG_DIR_ENV).as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+    .ok_or(PairingError::NoConfigDir)?;
+    Ok(base.join(CONFIG_SUBDIR).join(PAIRING_FILE))
 }
 
 /// The pairing store.
@@ -366,6 +393,33 @@ fn derive_device_id(public_key_hex: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn config_base_prefers_absolute_xdg() {
+        assert_eq!(
+            resolve_config_base(Some(OsStr::new("/x/cfg")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/x/cfg"))
+        );
+    }
+
+    #[test]
+    fn config_base_falls_back_to_home_when_xdg_unset_empty_or_relative() {
+        for xdg in [None, Some(OsStr::new("")), Some(OsStr::new("rel/cfg"))] {
+            assert_eq!(
+                resolve_config_base(xdg, Some(OsStr::new("/home/u"))),
+                Some(PathBuf::from("/home/u/.config")),
+                "xdg = {xdg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_base_needs_some_absolute_root() {
+        assert_eq!(resolve_config_base(None, None), None);
+        assert_eq!(resolve_config_base(None, Some(OsStr::new("relhome"))), None);
+    }
+
     use super::*;
     use crate::crypto::DeviceIdentity;
 

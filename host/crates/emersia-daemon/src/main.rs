@@ -284,7 +284,7 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
     // unreadable database is fatal: starting with an empty trust store would
     // silently mean "trust everything" (ADR 0005).
     let pairing_path = pairing::default_db_path()
-        .context("failed to determine the pairing database path (is XDG_CONFIG_HOME set?)")?;
+        .context("failed to determine the pairing database path (set XDG_CONFIG_HOME or HOME)")?;
     let pairing_db = pairing::PairingDb::load(&pairing_path)
         .map_err(|e| anyhow::anyhow!("pairing database at {}: {e}", pairing_path.display()))?;
     println!("pairing database: {}", pairing_path.display());
