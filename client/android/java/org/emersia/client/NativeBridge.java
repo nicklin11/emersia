@@ -21,4 +21,16 @@ final class NativeBridge {
 
     /** Human-readable status block for the overlay. */
     static native String nativeStatus(long handle);
+
+    /** Pointer position on the video, 0..1 on each axis. */
+    static native void nativePointer(long handle, float x, float y);
+
+    /** Button 0 = left, 1 = right, 2 = middle. */
+    static native void nativeButton(long handle, int button, boolean down);
+
+    /** Scroll in wheel detents; positive = right / down. */
+    static native void nativeScroll(long handle, float dx, float dy);
+
+    /** Linux evdev key code. */
+    static native void nativeKey(long handle, int code, boolean down);
 }

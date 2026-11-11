@@ -11,8 +11,10 @@ use std::time::{Duration, Instant};
 
 use emersia_transport::codec::Codec;
 use emersia_transport::crypto::{device_id_bytes, DeviceIdentity};
+use emersia_transport::input::{self, InputEvent};
 use emersia_transport::transport::udp::ClientEndpoint;
 use emersia_transport::transport::{control, FrameHeader, Reassembler, VIDEO_CLOCK_HZ};
+use std::sync::mpsc::Receiver;
 
 /// How long to wait for the host's handshake response.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -75,6 +77,7 @@ pub struct Stats {
     pub bytes_received: AtomicU64,
     pub handshake_us: AtomicU64,
     pub keyframe_requests: AtomicU64,
+    pub input_events: AtomicU64,
     last_error: Mutex<Option<String>>,
     decoder: Mutex<Option<String>>,
 }
@@ -219,6 +222,7 @@ pub fn run(
     config: &Config,
     identity: &DeviceIdentity,
     sink: &mut dyn VideoSink,
+    input: Option<&Receiver<InputEvent>>,
     stop: &AtomicBool,
     stats: &Stats,
 ) {
@@ -231,7 +235,11 @@ pub fn run(
                 backoff = BACKOFF_MIN;
                 stats.sessions.fetch_add(1, Ordering::Relaxed);
                 sink.reset();
-                stream(client, sink, stop, stats);
+                // Input queued while disconnected is stale; never replay it.
+                if let Some(rx) = input {
+                    while rx.try_recv().is_ok() {}
+                }
+                stream(client, sink, input, stop, stats);
             }
             Err(err) => {
                 stats.set_error(err);
@@ -283,7 +291,52 @@ fn connect(
     Ok(client)
 }
 
-fn stream(mut client: ClientEndpoint, sink: &mut dyn VideoSink, stop: &AtomicBool, stats: &Stats) {
+/// Drain queued input into as few records as possible. Consecutive pointer
+/// moves collapse to the newest, since only the final position matters.
+pub fn batch_input(rx: &Receiver<InputEvent>) -> Vec<Vec<InputEvent>> {
+    let mut batches = Vec::new();
+    let mut current: Vec<InputEvent> = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let (Some(InputEvent::Pointer { .. }), InputEvent::Pointer { .. }) =
+            (current.last(), event)
+        {
+            *current.last_mut().expect("checked") = event;
+            continue;
+        }
+        if current.len() == input::MAX_EVENTS {
+            batches.push(std::mem::take(&mut current));
+        }
+        current.push(event);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+fn send_input(client: &mut ClientEndpoint, rx: &Receiver<InputEvent>, stats: &Stats) {
+    for batch in batch_input(rx) {
+        let Ok(payload) = input::encode(&batch) else {
+            continue; // only invalid key codes fail; drop the batch
+        };
+        match client.send_control(control::INPUT, &payload) {
+            Ok(()) => {
+                stats
+                    .input_events
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+            }
+            Err(e) => log::warn!("input: {e}"),
+        }
+    }
+}
+
+fn stream(
+    mut client: ClientEndpoint,
+    sink: &mut dyn VideoSink,
+    input: Option<&Receiver<InputEvent>>,
+    stop: &AtomicBool,
+    stats: &Stats,
+) {
     stats.set_phase(Phase::WaitingForKeyframe);
     let mut reassembler = Reassembler::default();
     let mut gate = KeyframeGate::default();
@@ -305,6 +358,10 @@ fn stream(mut client: ClientEndpoint, sink: &mut dyn VideoSink, stop: &AtomicBoo
     };
 
     while !stop.load(Ordering::Relaxed) {
+        // At most one READ_SLICE (2 ms) between an input event and its send.
+        if let Some(rx) = input {
+            send_input(&mut client, rx, stats);
+        }
         let (header, payload) = match client.recv_record(READ_SLICE) {
             Ok(record) => record,
             Err(_) => {
@@ -419,6 +476,51 @@ mod tests {
     }
 
     #[test]
+    fn input_batches_coalesce_pointer_moves_only() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        use emersia_transport::input::Button;
+        for e in [
+            InputEvent::Pointer { x: 1, y: 1 },
+            InputEvent::Pointer { x: 2, y: 2 },
+            InputEvent::Button {
+                button: Button::Left,
+                down: true,
+            },
+            InputEvent::Pointer { x: 3, y: 3 },
+            InputEvent::Pointer { x: 4, y: 4 },
+            InputEvent::Button {
+                button: Button::Left,
+                down: false,
+            },
+        ] {
+            tx.send(e).unwrap();
+        }
+        assert_eq!(
+            batch_input(&rx),
+            vec![vec![
+                InputEvent::Pointer { x: 2, y: 2 },
+                InputEvent::Button {
+                    button: Button::Left,
+                    down: true
+                },
+                InputEvent::Pointer { x: 4, y: 4 },
+                InputEvent::Button {
+                    button: Button::Left,
+                    down: false
+                },
+            ]]
+        );
+        // Long runs of non-pointer events split into bounded records.
+        for _ in 0..(input::MAX_EVENTS + 5) {
+            tx.send(InputEvent::Scroll { dx: 0, dy: 120 }).unwrap();
+        }
+        let batches = batch_input(&rx);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), input::MAX_EVENTS);
+        assert_eq!(batches[1].len(), 5);
+    }
+
+    #[test]
     fn pts_clock_is_monotonic_across_wrap() {
         let mut clock = PtsClock::default();
         assert_eq!(clock.micros(u32::MAX - 899), 0);
@@ -458,12 +560,13 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Stats::default());
         let (tx, rx) = std::sync::mpsc::channel();
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
         let client = {
             let (stop, stats) = (stop.clone(), stats.clone());
             std::thread::spawn(move || {
                 let mut sink = Recorder::default();
                 let config = Config { server, host_key };
-                run(&config, &device, &mut sink, &stop, &stats);
+                run(&config, &device, &mut sink, Some(&input_rx), &stop, &stats);
                 tx.send(sink).unwrap();
             })
         };
@@ -489,6 +592,37 @@ mod tests {
             assert!(Instant::now() < deadline, "frames did not arrive");
             std::thread::sleep(Duration::from_millis(5));
         }
+        // Input from the "UI thread" reaches the host as one decoded record.
+        let click = [
+            InputEvent::Pointer { x: 100, y: 200 },
+            InputEvent::Button {
+                button: emersia_transport::input::Button::Left,
+                down: true,
+            },
+        ];
+        for e in click {
+            input_tx.send(e).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut records = Vec::new();
+        let mut control_seen = Vec::new();
+        while Instant::now() < deadline {
+            host.pump(16, |_, _| false).unwrap();
+            let batch = host.take_control();
+            records.extend(
+                batch
+                    .iter()
+                    .filter(|r| r.payload_type == control::INPUT)
+                    .cloned(),
+            );
+            control_seen.extend(batch);
+            if !records.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(records.len(), 1);
+        assert_eq!(input::decode(&records[0].payload).unwrap(), click.to_vec());
+
         stop.store(true, Ordering::Relaxed);
         client.join().unwrap();
         let sink = rx.recv().unwrap();
@@ -502,14 +636,11 @@ mod tests {
         assert_eq!(stats.frames_skipped.load(Ordering::Relaxed), 1);
         // The skipped pre-keyframe delta made the client ask for an IDR.
         assert_eq!(stats.keyframe_requests.load(Ordering::Relaxed), 1);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut requests = Vec::new();
-        while requests.is_empty() && Instant::now() < deadline {
-            host.pump(16, |_, _| false).unwrap();
-            requests = host.take_control();
-        }
+        let requests: Vec<_> = control_seen
+            .iter()
+            .filter(|r| r.payload_type == control::KEYFRAME_REQUEST)
+            .collect();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].payload_type, control::KEYFRAME_REQUEST);
         assert_eq!(requests[0].device_id, device_id);
         assert_eq!(stats.losses.load(Ordering::Relaxed), 0);
         assert_eq!(stats.phase(), Phase::Stopped);
@@ -529,7 +660,14 @@ mod tests {
             let (stop, stats) = (stop.clone(), stats.clone());
             std::thread::spawn(move || {
                 let device = DeviceIdentity::generate().unwrap();
-                run(&config, &device, &mut Recorder::default(), &stop, &stats);
+                run(
+                    &config,
+                    &device,
+                    &mut Recorder::default(),
+                    None,
+                    &stop,
+                    &stats,
+                );
             })
         };
         let deadline = Instant::now() + Duration::from_secs(5);

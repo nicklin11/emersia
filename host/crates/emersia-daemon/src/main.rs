@@ -15,13 +15,14 @@ mod capture;
 mod control;
 mod encoder;
 mod frame;
+mod inject;
 mod network;
 mod pairing;
 mod receiver;
 mod service;
 mod shm;
 
-use emersia_transport::{codec, crypto, transport};
+use emersia_transport::{codec, crypto, input, transport};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -65,6 +66,8 @@ struct ServeOpts {
     encoder: encoder::EncoderChoice,
     /// Target bitrate in bits per second.
     bitrate: u32,
+    /// Accept pointer/keyboard input from paired devices.
+    input: bool,
 }
 
 fn main() {
@@ -140,6 +143,7 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
     let mut socket = None;
     let mut backend = BackendPref::Auto;
     let mut stream_port: Option<u16> = None;
+    let mut input = true;
     let mut encoder_choice = encoder::EncoderChoice::Auto;
     let mut bitrate = encoder::EncoderConfig::default().bitrate;
 
@@ -203,6 +207,7 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
                 }
                 stream_port = Some(port);
             }
+            "--no-input" => input = false,
             "--socket" => {
                 let value = rest
                     .next()
@@ -220,6 +225,7 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
             stream_port,
             encoder: encoder_choice,
             bitrate,
+            input,
         }),
         "receive" => Mode::Receive,
         _ => Mode::Capture(CaptureOpts {
@@ -254,6 +260,7 @@ fn print_help() {
     println!("\nOptions:");
     println!("  --socket PATH        control socket path [default: $XDG_RUNTIME_DIR/emersia/control.sock]");
     println!("  --stream-port N      bind the encrypted UDP stream to port N (default: off)");
+    println!("  --no-input           ignore pointer/keyboard input from paired devices");
     println!("  --encoder NAME       auto | vaapi | nvenc | amf | qsv | sw (default: auto)");
     println!("  --bitrate RATE       target bitrate, e.g. 30M or 8000k (default: 30M)");
     println!(
@@ -335,7 +342,7 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
 
     let net_thread = match engine.transport() {
         Some(endpoint) => Some(
-            network::spawn(Arc::clone(endpoint), Arc::clone(&svc))
+            network::spawn(Arc::clone(endpoint), Arc::clone(&svc), opts.input)
                 .context("could not start the stream receive thread")?,
         ),
         None => None,

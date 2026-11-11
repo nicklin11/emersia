@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::inject::Injector;
 use crate::service::Service;
 use crate::transport::control;
 use crate::transport::udp::HostEndpoint;
@@ -31,16 +32,26 @@ pub fn lock(endpoint: &SharedEndpoint) -> MutexGuard<'_, HostEndpoint> {
 }
 
 /// Start the receive thread. It exits when the service shuts down.
-pub fn spawn(endpoint: SharedEndpoint, service: Arc<Service>) -> std::io::Result<JoinHandle<()>> {
+pub fn spawn(
+    endpoint: SharedEndpoint,
+    service: Arc<Service>,
+    input_enabled: bool,
+) -> std::io::Result<JoinHandle<()>> {
     let socket = lock(&endpoint).try_clone_socket()?;
     socket.set_read_timeout(Some(READ_TIMEOUT))?;
     std::thread::Builder::new()
         .name("emersia-net".into())
-        .spawn(move || run(socket, endpoint, service))
+        .spawn(move || run(socket, endpoint, service, input_enabled))
 }
 
-fn run(socket: std::net::UdpSocket, endpoint: SharedEndpoint, service: Arc<Service>) {
+fn run(
+    socket: std::net::UdpSocket,
+    endpoint: SharedEndpoint,
+    service: Arc<Service>,
+    input_enabled: bool,
+) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut injector = Injector::default();
     while !service.is_shutting_down() && !crate::signal_received() {
         let received = match socket.recv_from(&mut buf) {
             Ok(v) => Some(v),
@@ -87,12 +98,27 @@ fn run(socket: std::net::UdpSocket, endpoint: SharedEndpoint, service: Arc<Servi
                 eprintln!("emersia-daemon: stream reply failed: {e}");
             }
         }
-        for record in ep.take_control() {
-            // Input lands in M2.5; other record types are ignored.
-            if record.payload_type == control::KEYFRAME_REQUEST {
-                service.request_keyframe();
+        let records = ep.take_control();
+        let peers = ep.peer_count();
+        // Inject outside the endpoint lock: uinput writes must not delay the
+        // engine's frame sends.
+        drop(ep);
+        for record in records {
+            match record.payload_type {
+                control::KEYFRAME_REQUEST => service.request_keyframe(),
+                control::INPUT if input_enabled => match crate::input::decode(&record.payload) {
+                    Ok(events) => injector.apply(&events, service.input_layout()),
+                    Err(e) => eprintln!(
+                        "emersia-daemon: bad input record from {}: {e}",
+                        hex::encode(record.device_id)
+                    ),
+                },
+                _ => {}
             }
         }
-        service.set_stream_peers(ep.peer_count());
+        if peers == 0 {
+            injector.release_all();
+        }
+        service.set_stream_peers(peers);
     }
 }

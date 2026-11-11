@@ -11,6 +11,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
@@ -41,11 +43,25 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     private SurfaceHolder holder;
     private long handle;
     private WifiManager.WifiLock wifiLock;
+    private InputMapper input;
+    /** When streaming began, for auto-hiding the overlay; 0 = not streaming. */
+    private long streamingSince;
+    /** The overlay stays this long after streaming starts, then gets out of the way. */
+    private static final long OVERLAY_LINGER_MS = 5000;
 
     private final Runnable poll = new Runnable() {
         @Override public void run() {
             if (handle != 0) {
-                status.setText(NativeBridge.nativeStatus(handle));
+                String text = NativeBridge.nativeStatus(handle);
+                status.setText(text);
+                long now = System.currentTimeMillis();
+                if (text.contains(" · streaming\n")) {
+                    if (streamingSince == 0) streamingSince = now;
+                } else {
+                    streamingSince = 0;
+                }
+                boolean show = streamingSince == 0 || now - streamingSince < OVERLAY_LINGER_MS;
+                status.setVisibility(show ? View.VISIBLE : View.GONE);
             }
             ui.postDelayed(this, STATUS_PERIOD_MS);
         }
@@ -70,9 +86,11 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         int pad = (int) (8 * getResources().getDisplayMetrics().density);
         status.setPadding(pad, pad, pad, pad);
         root.addView(status, new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.START));
-        // Tap to hide/show the overlay.
-        root.setOnClickListener(v -> status.setVisibility(
-                status.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
+        // Pointer input on the video goes to the host desktop.
+        input = new InputMapper(video);
+        video.setOnTouchListener((v, e) -> input.onTouch(e));
+        video.setOnGenericMotionListener((v, e) -> input.onGenericMotion(e));
+        status.setFocusable(false);
         setContentView(root);
 
         video.getHolder().setFixedSize(VIDEO_W, VIDEO_H);
@@ -126,6 +144,8 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             return;
         }
         handle = NativeBridge.nativeStart(holder.getSurface(), files, server, key);
+        input.setHandle(handle);
+        streamingSince = 0;
         if (handle == 0) {
             status.setText("could not start (bad settings?) — see `adb logcat -s emersia`");
         }
@@ -133,6 +153,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
     private void stop() {
         if (handle != 0) {
+            input.setHandle(0);
             NativeBridge.nativeStop(handle);
             handle = 0;
         }
@@ -146,6 +167,10 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
                 + "Public key: " + parts[0] + "\n\n"
                 + "With the headset on USB, run scripts/quest-mirror.sh on the host.\n"
                 + "Or pair by hand: emersia pair new; emersia pair accept CODE --name quest --public-key <key>";
+    }
+
+    @Override public boolean dispatchKeyEvent(KeyEvent e) {
+        return (input != null && input.onKey(e)) || super.dispatchKeyEvent(e);
     }
 
     @Override public void surfaceCreated(SurfaceHolder h) {
