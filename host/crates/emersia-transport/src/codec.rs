@@ -161,9 +161,14 @@ impl NalUnit {
 
     /// True if this is a slice (VCL) NAL, i.e. actual picture data.
     pub fn is_vcl(&self, codec: Codec) -> bool {
+        Self::type_is_vcl(self.nal_type, codec)
+    }
+
+    /// Whether a NAL type carries picture data.
+    pub fn type_is_vcl(nal_type: u8, codec: Codec) -> bool {
         match codec {
-            Codec::H264 => matches!(self.nal_type, 1..=5),
-            Codec::Hevc => (0..=31).contains(&self.nal_type),
+            Codec::H264 => matches!(nal_type, 1..=5),
+            Codec::Hevc => (0..=31).contains(&nal_type),
         }
     }
 }
@@ -338,6 +343,52 @@ impl AnnexBParser {
             out.push(au);
         }
         Ok(out)
+    }
+
+    /// Complete the access unit in progress because the producer has gone
+    /// quiet, without ending the stream.
+    ///
+    /// Annex-B has no length fields, so a picture is normally only known to be
+    /// finished when the *next* one starts — on a damage-driven desktop stream
+    /// that can be seconds later, and the last change on screen (the final
+    /// keystroke) would wait for it. ffmpeg writes each packet in one flushed
+    /// write, so once its pipe has been idle briefly, a trailing picture NAL is
+    /// complete. Returns `None` unless that unit contains picture data; a
+    /// lone parameter-set prefix keeps waiting for its picture.
+    pub fn flush_idle(&mut self) -> Result<Vec<AccessUnit>, CodecError> {
+        let mut out = Vec::new();
+        let starts = start_code_positions(&self.buffer);
+        match starts.len() {
+            0 => {}
+            1 => {
+                let (start, sc_len) = starts[0];
+                let is_vcl = self
+                    .buffer
+                    .get(start + sc_len..)
+                    .and_then(|body| nal_type(body, self.codec))
+                    .is_some_and(|t| NalUnit::type_is_vcl(t, self.codec));
+                if !is_vcl {
+                    return Ok(out);
+                }
+                if let Some(nal) = self.take_next_nal(true)? {
+                    // May complete the previous picture if this NAL starts a
+                    // new one.
+                    out.extend(self.accept_nal(nal)?);
+                }
+            }
+            // `push` drains every bounded NAL, so several start codes only
+            // remain if it was interrupted; leave them for the next push.
+            _ => return Ok(out),
+        }
+        if self.current_has_vcl {
+            out.extend(self.flush_current());
+        }
+        Ok(out)
+    }
+
+    /// Whether picture data is buffered that `flush_idle` could complete.
+    pub fn has_pending_picture(&self) -> bool {
+        self.current_has_vcl || !self.buffer.is_empty()
     }
 
     /// Remove and return the next complete NAL unit, or `None` if the buffer
@@ -600,6 +651,53 @@ fn header_len(body: &[u8], codec: Codec) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H.264 IDR (type 5) / non-IDR (type 1) slice NAL with first_mb = 0.
+    fn slice(nal_header: u8, fill: u8) -> Vec<u8> {
+        let mut v = vec![0, 0, 0, 1, nal_header, 0x88];
+        v.extend(std::iter::repeat_n(fill, 40));
+        v
+    }
+
+    #[test]
+    fn idle_flush_completes_the_trailing_picture_without_the_next_one() {
+        let mut p = AnnexBParser::new(Codec::H264);
+        let mut first = vec![0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1f, 0xac];
+        first.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80]);
+        first.extend(slice(0x65, 0x11));
+        // Without a following start code the IDR slice is not bounded yet.
+        assert!(p.push(&first).unwrap().is_empty());
+        assert!(p.has_pending_picture());
+        let units = p.flush_idle().unwrap();
+        assert_eq!(units.len(), 1);
+        assert!(units[0].keyframe);
+        assert_eq!(units[0].annexb, first);
+        assert!(!p.has_pending_picture());
+
+        // The stream continues normally afterwards.
+        let second = slice(0x41, 0x22);
+        assert!(p.push(&second).unwrap().is_empty());
+        let units = p.flush_idle().unwrap();
+        assert_eq!(units.len(), 1);
+        assert!(!units[0].keyframe);
+        assert_eq!(units[0].annexb, second);
+    }
+
+    #[test]
+    fn idle_flush_waits_for_a_picture_after_bare_parameter_sets() {
+        let mut p = AnnexBParser::new(Codec::H264);
+        assert!(p
+            .push(&[0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1f, 0xac])
+            .unwrap()
+            .is_empty());
+        assert!(p.flush_idle().unwrap().is_empty(), "no picture yet");
+        let mut rest = vec![0, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80];
+        rest.extend(slice(0x65, 0x33));
+        p.push(&rest).unwrap();
+        let units = p.flush_idle().unwrap();
+        assert_eq!(units.len(), 1);
+        assert!(units[0].keyframe);
+    }
 
     /// Build an Annex-B NAL of `codec` with the given type and payload length.
     ///

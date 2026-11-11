@@ -969,6 +969,13 @@ impl Engine {
 /// encoder stage has not landed yet, so a full 1080p RGBA frame would be ~8 MB
 /// per frame and is not something to put on a wire. The preview proves the
 /// path end to end; the encoder replaces it in M1.5.
+/// 90 kHz RTP timestamp of `at`, counted from `epoch` and wrapping at 2^32
+/// (about 13 h 15 min), as RTP timestamps do.
+pub fn rtp_timestamp(epoch: Instant, at: Instant) -> u32 {
+    let micros = at.saturating_duration_since(epoch).as_micros();
+    (micros * u128::from(VIDEO_CLOCK_HZ) / 1_000_000) as u32
+}
+
 /// Minimum spacing between keyframes forced by device requests. Each one costs
 /// an encoder restart, and a burst of loss produces a burst of requests.
 const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
@@ -977,7 +984,9 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
     service.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
     service.set_input_layout(engine.input_layout());
     let mut last_frame = Instant::now();
-    let mut timestamp: u32 = 0;
+    // Fixed for the daemon's life, so timestamps stay monotonic across
+    // encoder restarts (a device joining, a keyframe request).
+    let stream_epoch = Instant::now();
     let mut last_peers = 0usize;
     let mut applied_output: Option<String> = None;
     let mut last_forced_keyframe = Instant::now();
@@ -1077,6 +1086,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
         let started = Instant::now();
         match engine.capture_once() {
             Ok(captured) => {
+                let captured_at = Instant::now();
                 let capture::CapturedFrame { frame, timings } = captured;
                 service.record_capture(timings);
                 if engine
@@ -1094,14 +1104,8 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                         service.measured_fps().max(engine.measured_fps),
                     ) {
                         Ok(true) => {
-                            // 90 kHz presentation clock, per ADR 0003.
-                            timestamp = timestamp.wrapping_add(
-                                ((VIDEO_CLOCK_HZ as u64 / service.fps_target().max(1) as u64)
-                                    as u32)
-                                    .max(1),
-                            );
                             if let Some(enc) = engine.encoder.as_mut() {
-                                if let Err(e) = enc.encode(&frame.rgba) {
+                                if let Err(e) = enc.encode_captured_at(&frame.rgba, captured_at) {
                                     service.record_error(format!("encode: {e}"));
                                     eprintln!("emersia-daemon: encode failed: {e}");
                                     engine.encoder = None;
@@ -1138,6 +1142,15 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                                 };
                                 let pt = au.codec_payload_type();
                                 let keyframe = au.keyframe;
+                                // 90 kHz presentation clock (ADR 0003) from the
+                                // frame's real capture time, not the target
+                                // rate: capture is damage-driven and variable.
+                                let captured = engine
+                                    .encoder
+                                    .as_ref()
+                                    .and_then(|e| e.last_unit_capture())
+                                    .unwrap_or_else(Instant::now);
+                                let timestamp = rtp_timestamp(stream_epoch, captured);
                                 // Prefix the parameter sets so a delta packet is
                                 // still self-describing.
                                 let payload = engine
@@ -1220,6 +1233,23 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rtp_timestamp_follows_real_time_not_the_target_rate() {
+        let epoch = Instant::now();
+        // 400 ms between frames (2.5 fps capture) is 36,000 ticks whatever
+        // fps_target says — the #43 bug stamped them 1/fps apart.
+        assert_eq!(
+            rtp_timestamp(epoch, epoch + Duration::from_millis(400)),
+            36_000
+        );
+        assert_eq!(rtp_timestamp(epoch, epoch), 0);
+        // Before the epoch saturates rather than wrapping backwards.
+        assert_eq!(rtp_timestamp(epoch + Duration::from_secs(1), epoch), 0);
+        // Wraps at 2^32 ticks.
+        let wrap = Duration::from_micros((1u64 << 32) * 1_000_000 / 90_000 + 1_000);
+        assert!(rtp_timestamp(epoch, epoch + wrap) < 90_000);
+    }
     use emersia_protocol::{Command, ResponseErr, ResponseOk, RevokeArgs, StartArgs};
     use wayland_client::backend::protocol::ProtocolError;
     use wayland_client::backend::WaylandError;

@@ -428,7 +428,35 @@ pub struct Encoder {
     frames_in: u64,
     frames_dropped: u64,
     frames_out: u64,
+    /// Capture instants of frames handed to ffmpeg and not yet emitted, in
+    /// order. With B-frames off and `-fps_mode passthrough`, ffmpeg emits
+    /// exactly one access unit per input frame, in input order, so the front
+    /// of this queue is the capture time of the next unit out.
+    capture_times: VecDeque<Instant>,
+    /// Capture instant of the unit most recently returned.
+    last_unit_capture: Option<Instant>,
 }
+
+/// How long ffmpeg's output must stay quiet before a pending picture is
+/// treated as complete. ffmpeg writes each packet in one flushed write, so the
+/// bytes of one picture arrive back to back; 2 ms is far above that gap and far
+/// below a frame interval.
+const IDLE_FLUSH: Duration = Duration::from_millis(2);
+
+/// Whether `fd` becomes readable within `timeout`.
+fn pipe_ready(fd: &impl std::os::fd::AsFd, timeout: Duration) -> bool {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    let mut fds = [PollFd::new(fd, PollFlags::IN)];
+    let Ok(ts) = Timespec::try_from(timeout) else {
+        return true;
+    };
+    // Errors (EINTR) count as "ready": the read that follows reports them.
+    !matches!(poll(&mut fds, Some(&ts)), Ok(0))
+}
+
+/// Bound on queued capture instants; only reached if the 1:1 frame/unit
+/// assumption were ever broken, and then it keeps memory bounded.
+const MAX_PENDING_CAPTURE_TIMES: usize = 256;
 
 /// What the reader thread sends back.
 enum ReaderMessage {
@@ -563,6 +591,10 @@ impl Encoder {
         if candidate.needs_vaapi_device() {
             // Upload first, then format: `format` applies to the surface.
             cmd.args(["-vf", "format=nv12,hwupload"]);
+            // The default (2) pipelines encodes, so each frame's output only
+            // appeared once the *next* frame went in: a whole frame interval
+            // of latency, unbounded on an idle damage-driven desktop.
+            cmd.args(["-async_depth", "1"]);
         } else {
             // Software and the other vendors take system memory; convert here
             // so the encoder never sees RGBA.
@@ -597,12 +629,23 @@ impl Encoder {
         // For a low-latency stream that is exactly backwards, so the codec
         // ladder starts without them.
         cmd.args(["-bf", "0"]);
+        // One output unit per input frame, never a duplicate or a drop: the
+        // capture-time queue above relies on it, and frames arrive at the
+        // compositor's (variable) pace anyway.
+        cmd.args(["-fps_mode", "passthrough"]);
         if candidate.software {
-            cmd.args(["-preset", "veryfast"]);
+            // zerolatency disables x264's lookahead, frame threading and
+            // mb-tree: without it libx264 holds a window of frames before
+            // emitting the first unit, i.e. that many frames of latency.
+            cmd.args(["-preset", "veryfast", "-tune", "zerolatency"]);
         }
 
         // Annex-B out, so the bitstream can be parsed into NAL units. The
         // muxer name follows the codec.
+        // Flush every packet: ffmpeg otherwise buffers output in 32 KiB AVIO
+        // blocks, so a unit could wait in the buffer for the *next* frame to
+        // push it out — a full frame of latency on a damage-driven stream.
+        cmd.args(["-flush_packets", "1"]);
         cmd.args(["-f", candidate.codec.name(), "pipe:1"]);
         cmd.stdout(Stdio::piped())
             .stdin(Stdio::piped())
@@ -654,6 +697,31 @@ impl Encoder {
             let mut stdout = stdout;
             let mut buf = vec![0u8; 64 * 1024];
             loop {
+                // A finished picture is only bounded by the *next* one in
+                // Annex-B. If ffmpeg's pipe stays quiet briefly with a picture
+                // pending, that picture is complete: emit it now rather than
+                // when the screen next changes (see AnnexBParser::flush_idle).
+                if parser.has_pending_picture() && !pipe_ready(&stdout, IDLE_FLUSH) {
+                    match parser.flush_idle() {
+                        Ok(units) => {
+                            let sets = parser.parameter_sets().to_vec();
+                            for au in units {
+                                produced_by_reader
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if tx
+                                    .send(ReaderMessage::Unit(Box::new(au), sets.clone()))
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ReaderMessage::End(Err(e.to_string())));
+                            return;
+                        }
+                    }
+                }
                 match stdout.read(&mut buf) {
                     Ok(0) => {
                         // EOF: flush whatever the parser is holding.
@@ -722,6 +790,8 @@ impl Encoder {
             frames_in: 0,
             frames_dropped: 0,
             frames_out: 0,
+            capture_times: VecDeque::new(),
+            last_unit_capture: None,
         };
 
         // The encoder may fail at startup (bad profile, no device) without
@@ -876,6 +946,12 @@ impl Encoder {
         self.frames_in
     }
 
+    /// When the frame behind the most recently returned access unit was
+    /// captured. `None` before the first unit.
+    pub fn last_unit_capture(&self) -> Option<Instant> {
+        self.last_unit_capture
+    }
+
     /// Frames dropped because the bounded input queue was full.
     pub fn frames_dropped(&self) -> u64 {
         self.frames_dropped
@@ -897,6 +973,17 @@ impl Encoder {
     /// offered to a bounded queue with [`std::sync::mpsc::SyncSender::try_send`],
     /// so a slow encoder drops this frame instead of blocking the capture loop.
     pub fn encode(&mut self, rgba: &[u8]) -> Result<EncodeOutcome, EncoderError> {
+        self.encode_captured_at(rgba, Instant::now())
+    }
+
+    /// [`encode`](Self::encode), recording when the frame was captured so the
+    /// access unit it becomes can carry that time (see
+    /// [`last_unit_capture`](Self::last_unit_capture)).
+    pub fn encode_captured_at(
+        &mut self,
+        rgba: &[u8],
+        captured_at: Instant,
+    ) -> Result<EncodeOutcome, EncoderError> {
         let expected = (self.config.width as usize)
             .saturating_mul(self.config.height as usize)
             .saturating_mul(4);
@@ -937,6 +1024,10 @@ impl Encoder {
         };
         if queued {
             self.frames_in += 1;
+            if self.capture_times.len() == MAX_PENDING_CAPTURE_TIMES {
+                self.capture_times.pop_front();
+            }
+            self.capture_times.push_back(captured_at);
         }
         self.last_encode = Some(started.elapsed());
 
@@ -966,6 +1057,7 @@ impl Encoder {
         match self.rx.try_recv() {
             Ok(ReaderMessage::Unit(au, sets)) => {
                 self.frames_out += 1;
+                self.last_unit_capture = self.capture_times.pop_front();
                 self.parameter_sets = sets;
                 if au.keyframe {
                     self.keyframe_requested = false;
@@ -1436,6 +1528,61 @@ mod tests {
             "every accepted frame produces exactly one access unit"
         );
         assert!(frames_in <= n as u64, "the bounded queue may drop frames");
+    }
+
+    /// Each access unit carries the capture time of the frame it encodes
+    /// (#43): units come back in feed order with exactly the instants fed.
+    #[test]
+    fn access_units_carry_their_frames_capture_time() {
+        let (w, h) = (128u32, 64u32);
+        let cfg = EncoderConfig {
+            choice: EncoderChoice::Software,
+            codec: Codec::H264,
+            bitrate: 1_000_000,
+            gop: 6,
+            fps: 12,
+            width: w,
+            height: h,
+        };
+        let mut enc = match Encoder::start(cfg) {
+            Ok(e) => e,
+            Err(e) if e.ffmpeg_missing() => {
+                eprintln!("skipping: {e}");
+                return;
+            }
+            Err(e) => panic!("software encoder should be available: {e}"),
+        };
+        let base = Instant::now();
+        let mut fed = Vec::new();
+        let mut seen = Vec::new();
+        for i in 0..12u64 {
+            let mut frame = vec![0u8; (w * h * 4) as usize];
+            frame
+                .iter_mut()
+                .enumerate()
+                .for_each(|(k, b)| *b = ((k as u64 + i * 7) % 251) as u8);
+            // Irregular spacing, like damage-driven capture.
+            let at = base + Duration::from_millis(i * i * 13);
+            let before = enc.frames_in();
+            enc.encode_captured_at(&frame, at).expect("frame accepted");
+            if enc.frames_in() > before {
+                fed.push(at);
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while seen.len() < fed.len() && Instant::now() < deadline {
+                match enc.next_access_unit_result() {
+                    Ok(Some(_)) => seen.push(enc.last_unit_capture().expect("time recorded")),
+                    Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+                    Err(e) => panic!("encoder failed: {e}"),
+                }
+            }
+        }
+        assert!(!seen.is_empty(), "the encoder emitted units");
+        assert_eq!(
+            seen[..],
+            fed[..seen.len()],
+            "times follow their frames in order"
+        );
     }
 
     /// Feeds a realistic 1080p60 workload and reports what came out.
