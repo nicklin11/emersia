@@ -229,6 +229,9 @@ pub struct Service {
     host_public_key: String,
     /// Set by the network thread when a device asks for an IDR.
     keyframe_requested: AtomicBool,
+    /// `(streamed output, global layout bounds)` in logical coordinates, for
+    /// mapping headset pointer input. Published by the engine.
+    input_layout: Mutex<Option<(crate::capture::Rect, crate::capture::Rect)>>,
 }
 
 impl Service {
@@ -242,6 +245,7 @@ impl Service {
             pairing: Mutex::new(pairing),
             host_public_key: host_public_key_hex.to_string(),
             keyframe_requested: AtomicBool::new(false),
+            input_layout: Mutex::new(None),
         }
     }
 
@@ -305,6 +309,14 @@ impl Service {
     /// Record how many devices are connected to the streaming endpoint.
     pub fn set_stream_peers(&self, count: usize) {
         self.lock().stream_peers = count;
+    }
+
+    pub fn set_input_layout(&self, layout: Option<(crate::capture::Rect, crate::capture::Rect)>) {
+        *self.input_layout.lock().unwrap_or_else(|e| e.into_inner()) = layout;
+    }
+
+    pub fn input_layout(&self) -> Option<(crate::capture::Rect, crate::capture::Rect)> {
+        *self.input_layout.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A device lost its reference chain and asked for a keyframe.
@@ -874,6 +886,11 @@ impl Engine {
         queue
             .roundtrip(&mut state)
             .context("failed while reading output descriptions")?;
+        // Logical geometry places headset pointer input in the global layout.
+        state.request_logical_geometry(&qh);
+        queue
+            .roundtrip(&mut state)
+            .context("failed while reading output layout")?;
 
         let labels = state.output_labels();
         let has_ext = state.ext_source_mgr.is_some() && state.ext_copy_mgr.is_some();
@@ -916,6 +933,21 @@ impl Engine {
         Ok(())
     }
 
+    /// The selected output and the global layout bounds, in logical
+    /// coordinates. Without `xdg-output` the output is assumed to be the
+    /// whole layout (correct for a single monitor).
+    pub fn input_layout(&self) -> Option<(capture::Rect, capture::Rect)> {
+        let info = self.state.outputs.iter().find(|o| o.proxy == self.output)?;
+        let output = info.logical.unwrap_or(capture::Rect {
+            x: 0,
+            y: 0,
+            width: i32::try_from(info.width).ok()?,
+            height: i32::try_from(info.height).ok()?,
+        });
+        let bounds = self.state.layout_bounds().unwrap_or(output);
+        Some((output, bounds))
+    }
+
     /// Capture exactly one frame with the selected backend.
     pub fn capture_once(&mut self) -> anyhow::Result<capture::CapturedFrame> {
         match self.backend {
@@ -943,6 +975,7 @@ const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
 pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
     service.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
+    service.set_input_layout(engine.input_layout());
     let mut last_frame = Instant::now();
     let mut timestamp: u32 = 0;
     let mut last_peers = 0usize;
@@ -1003,6 +1036,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                         }
                     }
                     service.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
+                    service.set_input_layout(engine.input_layout());
                     service.set_encoder(None, false, 0, 0);
                     service.clear_error();
                     service.reset_capture_metrics();
@@ -1036,6 +1070,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
             }
             if applied_output.as_deref() != Some(name.as_str()) {
                 service.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
+                service.set_input_layout(engine.input_layout());
                 applied_output = Some(name);
             }
         }

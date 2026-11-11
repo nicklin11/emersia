@@ -27,7 +27,7 @@ control CLI, and encrypted pairing with revocation ([#3](https://github.com/nick
 M1.6 capture telemetry is also in place, but the ≥60 fps acceptance gate remains
 open pending a compositor/hardware-backed decision between dmabuf and
 portal/PipeWire ([#35](https://github.com/nicklin11/emersia/issues/35)).
-`uinput` input injection, sway/hyprland QA, and a packaged systemd service are
+sway/hyprland QA, and a packaged systemd service are
 still outstanding.
 
 ### Try it: mirror your screen to a Quest
@@ -39,7 +39,11 @@ network as the host:
 scripts/quest-mirror.sh --output DP-1     # builds, installs, pairs, streams
 ```
 
-The desktop appears as a floating panel. Needs the Android SDK/NDK and a Rust
+The desktop appears as a floating panel. Point at it with a controller or
+hand and pinch/trigger to click, use the thumbstick to scroll; a Bluetooth
+keyboard paired to the headset types into the host. The daemon injects this
+through `/dev/uinput` (your user needs the `input` group; `--no-input` turns it
+off). Needs the Android SDK/NDK and a Rust
 toolchain with `aarch64-linux-android` (see `client/android/build.sh`). If a
 host firewall is active, allow the stream port (UDP 47800 by default); the
 script prints the exact `ufw` command when it detects one.

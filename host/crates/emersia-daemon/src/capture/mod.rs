@@ -28,6 +28,10 @@ use wayland_protocols::ext::image_capture_source::v1::client::{
     ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
 };
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1;
+use wayland_protocols::xdg::xdg_output::zv1::client::{
+    zxdg_output_manager_v1::ZxdgOutputManagerV1,
+    zxdg_output_v1::{self, ZxdgOutputV1},
+};
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 
 /// How long to wait for the compositor to publish capture constraints.
@@ -147,6 +151,34 @@ pub struct OutputInfo {
     pub height: u32,
     pub scale: i32,
     pub transform: wl_output::Transform,
+    /// Position and size in the compositor's global (logical) space, from
+    /// `xdg-output`. `None` when the compositor does not offer it.
+    pub logical: Option<Rect>,
+}
+
+/// A rectangle in compositor logical coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl Rect {
+    /// Smallest rectangle covering both.
+    pub fn union(self, other: Rect) -> Rect {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = (self.x + self.width).max(other.x + other.width);
+        let bottom = (self.y + self.height).max(other.y + other.height);
+        Rect {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        }
+    }
 }
 
 impl OutputInfo {
@@ -161,6 +193,7 @@ impl OutputInfo {
             height: 0,
             scale: 1,
             transform: wl_output::Transform::Normal,
+            logical: None,
         }
     }
 
@@ -219,6 +252,7 @@ pub struct State {
     pub ext_source_mgr: Option<ExtOutputImageCaptureSourceManagerV1>,
     pub ext_copy_mgr: Option<ExtImageCopyCaptureManagerV1>,
     pub wlr_mgr: Option<ZwlrScreencopyManagerV1>,
+    pub xdg_output_mgr: Option<ZxdgOutputManagerV1>,
     pub outputs: Vec<OutputInfo>,
     pub ext: ExtState,
     pub wlr: WlrState,
@@ -231,6 +265,7 @@ impl State {
             ext_source_mgr: None,
             ext_copy_mgr: None,
             wlr_mgr: None,
+            xdg_output_mgr: None,
             outputs: Vec::new(),
             ext: ExtState::default(),
             wlr: WlrState::default(),
@@ -324,6 +359,11 @@ impl Dispatch<WlRegistry, ()> for State {
                 "ext_image_copy_capture_manager_v1" => {
                     state.ext_copy_mgr = Some(registry.bind(name, version.min(1), qh, ()));
                 }
+                "zxdg_output_manager_v1" => {
+                    // v2+ sends `done` semantics we rely on via wl_output; v3
+                    // drops the per-object `done`. Either works for geometry.
+                    state.xdg_output_mgr = Some(registry.bind(name, version.min(3), qh, ()));
+                }
                 "zwlr_screencopy_manager_v1" => {
                     state.wlr_mgr = Some(registry.bind(name, version.min(3), qh, ()));
                 }
@@ -331,6 +371,70 @@ impl Dispatch<WlRegistry, ()> for State {
             },
             wl_registry::Event::GlobalRemove { name } => {
                 state.outputs.retain(|output| output.global_name != name);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl State {
+    /// Ask for `xdg-output` geometry of every known output. The caller
+    /// roundtrips afterwards to receive it.
+    pub fn request_logical_geometry(&self, qh: &QueueHandle<Self>) {
+        if let Some(mgr) = &self.xdg_output_mgr {
+            for output in &self.outputs {
+                mgr.get_xdg_output(&output.proxy, qh, output.global_name);
+            }
+        }
+    }
+
+    /// Union of every output's logical rectangle: the space an absolute
+    /// pointer device spans on wlroots compositors and niri.
+    pub fn layout_bounds(&self) -> Option<Rect> {
+        self.outputs
+            .iter()
+            .filter_map(|o| o.logical)
+            .reduce(Rect::union)
+    }
+}
+
+impl Dispatch<ZxdgOutputManagerV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &ZxdgOutputManagerV1,
+        _: <ZxdgOutputManagerV1 as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZxdgOutputV1, u32> for State {
+    fn event(
+        state: &mut Self,
+        _: &ZxdgOutputV1,
+        event: zxdg_output_v1::Event,
+        global_name: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(info) = state
+            .outputs
+            .iter_mut()
+            .find(|o| o.global_name == *global_name)
+        else {
+            return;
+        };
+        let rect = info.logical.get_or_insert_with(Rect::default);
+        match event {
+            zxdg_output_v1::Event::LogicalPosition { x, y } => {
+                rect.x = x;
+                rect.y = y;
+            }
+            zxdg_output_v1::Event::LogicalSize { width, height } => {
+                rect.width = width;
+                rect.height = height;
             }
             _ => {}
         }
@@ -458,5 +562,50 @@ mod tests {
         assert_eq!(pick_shm_format(&[F::Rgba8888]).unwrap(), F::Rgba8888);
         assert!(pick_shm_format(&[F::Rgb565]).is_err());
         assert!(pick_shm_format(&[]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod rect_tests {
+    use super::Rect;
+
+    #[test]
+    fn union_covers_side_by_side_outputs() {
+        let left = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let right = Rect {
+            x: 1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        assert_eq!(
+            left.union(right),
+            Rect {
+                x: 0,
+                y: 0,
+                width: 3840,
+                height: 1080
+            }
+        );
+        let above = Rect {
+            x: 100,
+            y: -720,
+            width: 1280,
+            height: 720,
+        };
+        assert_eq!(
+            left.union(above),
+            Rect {
+                x: 0,
+                y: -720,
+                width: 1920,
+                height: 1800
+            }
+        );
     }
 }
