@@ -1,0 +1,30 @@
+# Emersia host daemon as a systemd *user* service.
+#
+# Installed by scripts/install.sh to ~/.config/systemd/user/. It is tied to
+# graphical-session.target because it needs the compositor: niri (niri-session),
+# GNOME and KDE import WAYLAND_DISPLAY into the user manager automatically;
+# under sway/hyprland add
+#   exec systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP
+# to the compositor config.
+#
+# Override options without editing this file:
+#   systemctl --user edit emersia-daemon   # e.g. ExecStart= with --stream-port
+[Unit]
+Description=Emersia host daemon (VR desktop streaming)
+Documentation=https://github.com/nicklin11/emersia
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/emersia-daemon serve --stream-port 47800
+Restart=on-failure
+RestartSec=2
+# Capture + encode are latency-sensitive; ask for a little scheduling priority.
+Nice=-5
+# The daemon only needs its config dir, the runtime dir and /dev (uinput, DRM).
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target
