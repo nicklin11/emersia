@@ -32,6 +32,32 @@ pub mod control {
     pub const KEYFRAME_REQUEST: u8 = 120;
     /// Input events (M2.5).
     pub const INPUT: u8 = 121;
+    /// Clock probe, device → host: `device_us: u64`.
+    pub const PING: u8 = 122;
+    /// Clock reply, host → device (a one-fragment DATA record):
+    /// `device_us: u64 || host_us: u64`, where `host_us` is on the same clock
+    /// as frame timestamps (90 kHz ticks = `host_us * 9 / 100`).
+    pub const PONG: u8 = 123;
+
+    /// Encode a PONG payload.
+    pub fn pong(device_us: u64, host_us: u64) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&device_us.to_be_bytes());
+        out[8..].copy_from_slice(&host_us.to_be_bytes());
+        out
+    }
+
+    /// Decode a PONG payload into `(device_us, host_us)`.
+    pub fn parse_pong(payload: &[u8]) -> Option<(u64, u64)> {
+        let device = u64::from_be_bytes(payload.get(..8)?.try_into().ok()?);
+        let host = u64::from_be_bytes(payload.get(8..16)?.try_into().ok()?);
+        Some((device, host))
+    }
+
+    /// Decode a PING payload.
+    pub fn parse_ping(payload: &[u8]) -> Option<u64> {
+        Some(u64::from_be_bytes(payload.get(..8)?.try_into().ok()?))
+    }
 }
 
 /// Size of the cleartext frame header inside an encrypted record.

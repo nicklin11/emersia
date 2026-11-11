@@ -99,6 +99,15 @@ fn run(
             }
         }
         let records = ep.take_control();
+        // Clock probes are answered at once, under the lock already held, so
+        // the reply's host time is as close to the probe's arrival as possible.
+        for record in records.iter().filter(|r| r.payload_type == control::PING) {
+            if let Some(device_us) = control::parse_ping(&record.payload) {
+                let host_us = service.stream_epoch().elapsed().as_micros() as u64;
+                let pong = control::pong(device_us, host_us);
+                let _ = ep.send_frame(&record.device_id, 0, false, control::PONG, &pong);
+            }
+        }
         let peers = ep.peer_count();
         // Inject outside the endpoint lock: uinput writes must not delay the
         // engine's frame sends.

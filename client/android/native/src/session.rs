@@ -31,6 +31,10 @@ const BACKOFF_MAX: Duration = Duration::from_secs(3);
 /// Minimum spacing of keyframe requests while out of sync. The host rate-limits
 /// too; this just keeps a loss burst from becoming a request burst.
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(300);
+/// How often the client probes the host clock.
+const PING_INTERVAL: Duration = Duration::from_secs(1);
+/// Clock samples kept; the lowest-RTT one wins (its offset error is smallest).
+const CLOCK_SAMPLES: usize = 8;
 /// Receive buffer requested from the kernel (see `set_recv_buffer`).
 const RECV_BUFFER: usize = 4 << 20;
 
@@ -78,6 +82,13 @@ pub struct Stats {
     pub handshake_us: AtomicU64,
     pub keyframe_requests: AtomicU64,
     pub input_events: AtomicU64,
+    /// Smoothed host capture → frame fully received on the headset, µs.
+    /// Zero until the clock offset is known.
+    pub capture_to_rx_us: AtomicU64,
+    /// Smoothed decoder latency (queued → output ready), µs.
+    pub decode_us: AtomicU64,
+    /// Best recent round-trip time to the host, µs.
+    pub rtt_us: AtomicU64,
     last_error: Mutex<Option<String>>,
     decoder: Mutex<Option<String>>,
 }
@@ -192,6 +203,87 @@ impl KeyframeGate {
 
     pub fn synced(&self) -> bool {
         self.synced
+    }
+
+    /// Account for a non-video record (e.g. PONG) in the sequence space, so
+    /// it is not mistaken for a lost frame. Returns whether it revealed a gap.
+    pub fn observe_other(&mut self, header: &FrameHeader) -> bool {
+        let lost = self
+            .expected
+            .is_some_and(|expected| expected != header.frame_sequence);
+        self.expected = Some(
+            header
+                .frame_sequence
+                .wrapping_add(u32::from(header.frag_count))
+                .wrapping_add(1),
+        );
+        if lost {
+            self.synced = false;
+        }
+        lost
+    }
+}
+
+/// Exponentially smoothed value (1/8 weight), stored as µs in an atomic.
+pub fn smooth(slot: &AtomicU64, sample_us: u64) {
+    let old = slot.load(Ordering::Relaxed);
+    let new = if old == 0 {
+        sample_us
+    } else {
+        (old * 7 + sample_us) / 8
+    };
+    slot.store(new.max(1), Ordering::Relaxed);
+}
+
+/// Host ↔ device clock offset from ping/pong pairs (NTP-style).
+#[derive(Debug, Default)]
+pub struct ClockSync {
+    /// `(rtt_us, host_minus_device_us)` of recent probes.
+    samples: std::collections::VecDeque<(u64, i64)>,
+}
+
+impl ClockSync {
+    /// Record a reply: probe sent at `sent_us`, answered with `host_us`,
+    /// received at `now_us` (device clock).
+    pub fn sample(&mut self, sent_us: u64, host_us: u64, now_us: u64) -> Option<u64> {
+        let rtt = now_us.checked_sub(sent_us)?;
+        // The host read its clock roughly half way through the round trip.
+        let offset = host_us as i64 - (sent_us + rtt / 2) as i64;
+        if self.samples.len() == CLOCK_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples.push_back((rtt, offset));
+        Some(rtt)
+    }
+
+    /// `host - device` in µs, from the lowest-RTT recent sample.
+    pub fn offset(&self) -> Option<i64> {
+        self.samples.iter().min_by_key(|(rtt, _)| *rtt).map(|s| s.1)
+    }
+
+    pub fn best_rtt(&self) -> Option<u64> {
+        self.samples.iter().map(|s| s.0).min()
+    }
+}
+
+/// Unwraps the 32-bit 90 kHz timestamp into absolute host microseconds since
+/// the host's stream epoch (the clock PONG replies use).
+#[derive(Debug, Default)]
+struct HostClock {
+    last: Option<u32>,
+    wraps: u64,
+}
+
+impl HostClock {
+    fn micros(&mut self, timestamp: u32) -> u64 {
+        if let Some(last) = self.last {
+            // A large backwards jump is a wrap; small ones are reordering.
+            if timestamp < last && last - timestamp > 0x8000_0000 {
+                self.wraps += 1;
+            }
+        }
+        self.last = Some(timestamp);
+        ((self.wraps << 32) + u64::from(timestamp)) * 1_000_000 / u64::from(VIDEO_CLOCK_HZ)
     }
 }
 
@@ -343,6 +435,11 @@ fn stream(
     let mut clock = PtsClock::default();
     let mut last_datagram = Instant::now();
     let mut last_request: Option<Instant> = None;
+    let epoch = Instant::now();
+    let now_us = || epoch.elapsed().as_micros() as u64;
+    let mut clock_sync = ClockSync::default();
+    let mut host_clock = HostClock::default();
+    let mut last_ping: Option<Instant> = None;
     // Ask for an IDR, at most once per interval.
     let mut request_keyframe = |client: &mut ClientEndpoint| {
         if last_request.is_some_and(|t| t.elapsed() < KEYFRAME_REQUEST_INTERVAL) {
@@ -362,6 +459,17 @@ fn stream(
         if let Some(rx) = input {
             send_input(&mut client, rx, stats);
         }
+        if last_ping.is_none_or(|t| t.elapsed() >= PING_INTERVAL) {
+            last_ping = Some(Instant::now());
+            let _ = client.send_control(control::PING, &now_us().to_be_bytes());
+            log::debug!(
+                "latency capture→rx {} µs, decode {} µs, rtt {} µs, frames {}",
+                stats.capture_to_rx_us.load(Ordering::Relaxed),
+                stats.decode_us.load(Ordering::Relaxed),
+                stats.rtt_us.load(Ordering::Relaxed),
+                stats.frames_submitted.load(Ordering::Relaxed),
+            );
+        }
         let (header, payload) = match client.recv_record(READ_SLICE) {
             Ok(record) => record,
             Err(_) => {
@@ -379,6 +487,18 @@ fn stream(
             .bytes_received
             .fetch_add(payload.len() as u64, Ordering::Relaxed);
         let Some(codec) = Codec::from_payload_type(header.payload_type) else {
+            if header.payload_type == control::PONG {
+                if let Some((sent, host_us)) = control::parse_pong(&payload) {
+                    if clock_sync.sample(sent, host_us, now_us()).is_some() {
+                        if let Some(rtt) = clock_sync.best_rtt() {
+                            stats.rtt_us.store(rtt.max(1), Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            if gate.observe_other(&header) {
+                stats.losses.fetch_add(1, Ordering::Relaxed);
+            }
             continue; // not video
         };
         let Some(frame) = reassembler.push(header, &payload) else {
@@ -386,6 +506,15 @@ fn stream(
         };
         stats.frames_received.fetch_add(1, Ordering::Relaxed);
         let pts = clock.micros(header.timestamp);
+        let captured_host_us = host_clock.micros(header.timestamp);
+        if let Some(offset) = clock_sync.offset() {
+            // Capture time on the device clock, then how long ago that was.
+            let captured_device_us = captured_host_us as i64 - offset;
+            let latency = now_us() as i64 - captured_device_us;
+            if (0..10_000_000).contains(&latency) {
+                smooth(&stats.capture_to_rx_us, latency as u64);
+            }
+        }
         match gate.admit(&header) {
             Gate::Pass => {}
             Gate::Skip { lost } => {
@@ -518,6 +647,39 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].len(), input::MAX_EVENTS);
         assert_eq!(batches[1].len(), 5);
+    }
+
+    #[test]
+    fn clock_sync_prefers_the_lowest_rtt_sample() {
+        let mut sync = ClockSync::default();
+        // Host clock is device + 1_000_000 µs. Symmetric 10 ms RTT.
+        assert_eq!(sync.sample(0, 1_005_000, 10_000), Some(10_000));
+        assert_eq!(sync.offset(), Some(1_000_000));
+        // A slow, asymmetric probe (reply delayed) has a worse estimate...
+        sync.sample(100_000, 1_102_000, 190_000);
+        // ...but the 10 ms one still wins.
+        assert_eq!(sync.offset(), Some(1_000_000));
+        assert_eq!(sync.best_rtt(), Some(10_000));
+        // A reply from before the probe is ignored.
+        assert_eq!(sync.sample(500, 0, 100), None);
+    }
+
+    #[test]
+    fn host_clock_unwraps_timestamps() {
+        let mut c = HostClock::default();
+        assert_eq!(c.micros(90_000), 1_000_000);
+        let before_wrap = c.micros(u32::MAX);
+        let after_wrap = c.micros(89); // 90 ticks later
+        assert_eq!(after_wrap - before_wrap, 1_000);
+    }
+
+    #[test]
+    fn gate_counts_non_video_records_in_the_sequence() {
+        let mut gate = KeyframeGate::default();
+        assert_eq!(gate.admit(&header(0, 1, true)), Gate::Pass);
+        // A PONG takes sequence 2; the next video frame at 4 is not a loss.
+        assert!(!gate.observe_other(&header(2, 1, false)));
+        assert_eq!(gate.admit(&header(4, 1, false)), Gate::Pass);
     }
 
     #[test]

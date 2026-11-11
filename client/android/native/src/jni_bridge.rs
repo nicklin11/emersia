@@ -33,7 +33,7 @@ fn init_logging() {
     android_logger::init_once(
         android_logger::Config::default()
             .with_tag("emersia")
-            .with_max_level(log::LevelFilter::Info),
+            .with_max_level(log::LevelFilter::Debug),
     );
 }
 

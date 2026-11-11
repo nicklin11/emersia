@@ -232,6 +232,8 @@ pub struct Service {
     /// `(streamed output, global layout bounds)` in logical coordinates, for
     /// mapping headset pointer input. Published by the engine.
     input_layout: Mutex<Option<(crate::capture::Rect, crate::capture::Rect)>>,
+    /// Origin of frame timestamps and of PONG clock replies.
+    stream_epoch: Instant,
 }
 
 impl Service {
@@ -246,6 +248,7 @@ impl Service {
             host_public_key: host_public_key_hex.to_string(),
             keyframe_requested: AtomicBool::new(false),
             input_layout: Mutex::new(None),
+            stream_epoch: Instant::now(),
         }
     }
 
@@ -309,6 +312,10 @@ impl Service {
     /// Record how many devices are connected to the streaming endpoint.
     pub fn set_stream_peers(&self, count: usize) {
         self.lock().stream_peers = count;
+    }
+
+    pub fn stream_epoch(&self) -> Instant {
+        self.stream_epoch
     }
 
     pub fn set_input_layout(&self, layout: Option<(crate::capture::Rect, crate::capture::Rect)>) {
@@ -985,8 +992,9 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
     service.set_input_layout(engine.input_layout());
     let mut last_frame = Instant::now();
     // Fixed for the daemon's life, so timestamps stay monotonic across
-    // encoder restarts (a device joining, a keyframe request).
-    let stream_epoch = Instant::now();
+    // encoder restarts (a device joining, a keyframe request). Shared with the
+    // network thread, which answers clock probes on the same clock.
+    let stream_epoch = service.stream_epoch();
     let mut last_peers = 0usize;
     let mut applied_output: Option<String> = None;
     let mut last_forced_keyframe = Instant::now();

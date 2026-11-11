@@ -58,5 +58,11 @@ resizable, passthrough-aware panel.
 - Delivered frame rate equals the host capture rate (≈4 fps on a mostly idle
   niri desktop — the damage-driven `wlr-screencopy` limit tracked in #35, not a
   client limit). With an active desktop (#83 test): **60 fps, 8.9 Mbit/s,
-  1,428 frames, 0 lost, 0 skipped**. Glass-to-glass latency is not yet
-  measured.
+  1,428 frames, 0 lost, 0 skipped**.
+- Latency (#85, after the #88 encoder fixes; clock offset from ping/pong,
+  lowest-RTT sample of 8): **capture → frame received 18.6 ms, hardware
+  decode 5.3 ms, ≈ 24 ms capture → decoded**, Wi-Fi RTT 1.5 ms, at 59 fps.
+  "Capture" is when the host finished reading the frame back; the compositor
+  wait before it and the headset's own scan-out are not included. Most of the
+  host share is CPU readback/conversion and the RGBA pipe into ffmpeg — the
+  dmabuf path (#35) is the next big win.
