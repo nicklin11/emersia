@@ -519,9 +519,29 @@ impl Encoder {
             // A render node must be named explicitly, or hwupload has no
             // device to upload into.
             let device = std::env::var("EMERSIA_VAAPI_DEVICE")
-                .unwrap_or_else(|_| "/dev/dri/renderD128".to_string());
+                .ok()
+                .or_else(first_render_node)
+                .unwrap_or_else(|| "/dev/dri/renderD128".to_string());
             if !std::path::Path::new(&device).exists() {
                 return Err(format!("no VAAPI device at {device}"));
+            }
+            // A session-wide LIBVA_DRIVER_NAME for a different GPU (a laptop
+            // config carried over to a desktop, say) makes libva load a driver
+            // that cannot open this render node. Correct it for this child
+            // only; a matching override is left alone.
+            let vendor = render_node_vendor(&device);
+            let current = std::env::var("LIBVA_DRIVER_NAME").ok();
+            if let Some(driver) = vaapi_driver_override(vendor, current.as_deref()) {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "emersia-daemon: LIBVA_DRIVER_NAME={} cannot drive {device} \
+                     (vendor {:#06x}); using {driver} for the encoder",
+                        current.as_deref().unwrap_or(""),
+                        vendor.unwrap_or(0)
+                    )
+                });
+                cmd.env("LIBVA_DRIVER_NAME", driver);
             }
             cmd.args(["-vaapi_device", &device]);
         }
@@ -1137,9 +1157,86 @@ impl Drop for Encoder {
     }
 }
 
+/// PCI vendor ids that matter for VAAPI driver selection.
+const VENDOR_AMD: u16 = 0x1002;
+const VENDOR_INTEL: u16 = 0x8086;
+const VENDOR_NVIDIA: u16 = 0x10de;
+
+/// libva drivers able to serve a GPU vendor, preferred first.
+fn vaapi_drivers_for(vendor: u16) -> &'static [&'static str] {
+    match vendor {
+        VENDOR_AMD => &["radeonsi", "r600"],
+        VENDOR_INTEL => &["iHD", "i965"],
+        VENDOR_NVIDIA => &["nvidia", "nouveau"],
+        _ => &[],
+    }
+}
+
+/// The libva driver to force for the encoder child, if any.
+///
+/// `None` keeps the environment as-is: no override set (libva autodetects), an
+/// override that suits the vendor, or a vendor we know nothing about (trust
+/// the user). Otherwise returns the vendor's preferred driver.
+pub(crate) fn vaapi_driver_override(
+    vendor: Option<u16>,
+    current: Option<&str>,
+) -> Option<&'static str> {
+    let current = current.filter(|c| !c.is_empty())?;
+    let drivers = vaapi_drivers_for(vendor?);
+    if drivers.is_empty() || drivers.contains(&current) {
+        return None;
+    }
+    drivers.first().copied()
+}
+
+/// PCI vendor of a DRM render node, from sysfs.
+fn render_node_vendor(device: &str) -> Option<u16> {
+    let name = std::path::Path::new(device).file_name()?.to_str()?;
+    let raw = std::fs::read_to_string(format!("/sys/class/drm/{name}/device/vendor")).ok()?;
+    u16::from_str_radix(raw.trim().trim_start_matches("0x"), 16).ok()
+}
+
+/// The lowest-numbered render node, so a box whose only GPU is not
+/// `renderD128` still works without configuration.
+fn first_render_node() -> Option<String> {
+    let mut nodes: Vec<String> = std::fs::read_dir("/dev/dri")
+        .ok()?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with("renderD"))
+        .collect();
+    nodes.sort();
+    nodes.first().map(|n| format!("/dev/dri/{n}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vaapi_override_corrects_driver_for_another_vendor() {
+        // The reference-box bug: an Intel driver forced onto an AMD GPU.
+        assert_eq!(
+            vaapi_driver_override(Some(VENDOR_AMD), Some("i965")),
+            Some("radeonsi")
+        );
+        assert_eq!(
+            vaapi_driver_override(Some(VENDOR_INTEL), Some("radeonsi")),
+            Some("iHD")
+        );
+    }
+
+    #[test]
+    fn vaapi_override_respects_matching_unset_or_unknown() {
+        assert_eq!(vaapi_driver_override(Some(VENDOR_AMD), Some("r600")), None);
+        assert_eq!(
+            vaapi_driver_override(Some(VENDOR_INTEL), Some("i965")),
+            None
+        );
+        assert_eq!(vaapi_driver_override(Some(VENDOR_AMD), None), None);
+        assert_eq!(vaapi_driver_override(Some(VENDOR_AMD), Some("")), None);
+        assert_eq!(vaapi_driver_override(None, Some("i965")), None);
+        assert_eq!(vaapi_driver_override(Some(0x1234), Some("i965")), None);
+    }
 
     #[test]
     fn stderr_tail_keeps_bounded_last_lines() {
