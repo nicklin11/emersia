@@ -57,7 +57,8 @@ Headset: Meta Quest 2 / 3 / 3S / Pro (OpenXR).
 ## Repository layout
 
 ```
-host/     Rust workspace: emersia-daemon (streaming engine) + emersia (CLI)
+host/     Rust workspace: emersia-daemon (streaming engine), emersia (CLI),
+          emersia-transport (wire protocol shared with the client), emersia-protocol
 client/   Godot 4 OpenXR Quest client        (from M2)
 gui/      Tauri companion app                (from M4)
 docs/     ADRs and design documents

@@ -4,6 +4,7 @@ members = [
   "crates/emersia-daemon",
   "crates/emersia-cli",
   "crates/emersia-protocol",
+  "crates/emersia-transport",
 ]
 
 [workspace.package]

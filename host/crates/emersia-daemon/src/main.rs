@@ -12,17 +12,15 @@
 //! M1.2 scope: no encoding, no transport, no input yet (see #3).
 
 mod capture;
-mod codec;
 mod control;
-mod crypto;
 mod encoder;
 mod frame;
 mod pairing;
 mod receiver;
 mod service;
 mod shm;
-mod transport;
 
+use emersia_transport::{codec, crypto, transport};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
