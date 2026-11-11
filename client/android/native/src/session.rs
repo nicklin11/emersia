@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use emersia_transport::codec::Codec;
 use emersia_transport::crypto::{device_id_bytes, DeviceIdentity};
 use emersia_transport::transport::udp::ClientEndpoint;
-use emersia_transport::transport::{FrameHeader, Reassembler, VIDEO_CLOCK_HZ};
+use emersia_transport::transport::{control, FrameHeader, Reassembler, VIDEO_CLOCK_HZ};
 
 /// How long to wait for the host's handshake response.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -26,6 +26,9 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(4);
 /// Reconnect backoff bounds.
 const BACKOFF_MIN: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(3);
+/// Minimum spacing of keyframe requests while out of sync. The host rate-limits
+/// too; this just keeps a loss burst from becoming a request burst.
+const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(300);
 /// Receive buffer requested from the kernel (see `set_recv_buffer`).
 const RECV_BUFFER: usize = 4 << 20;
 
@@ -71,6 +74,7 @@ pub struct Stats {
     pub losses: AtomicU64,
     pub bytes_received: AtomicU64,
     pub handshake_us: AtomicU64,
+    pub keyframe_requests: AtomicU64,
     last_error: Mutex<Option<String>>,
     decoder: Mutex<Option<String>>,
 }
@@ -285,6 +289,20 @@ fn stream(mut client: ClientEndpoint, sink: &mut dyn VideoSink, stop: &AtomicBoo
     let mut gate = KeyframeGate::default();
     let mut clock = PtsClock::default();
     let mut last_datagram = Instant::now();
+    let mut last_request: Option<Instant> = None;
+    // Ask for an IDR, at most once per interval.
+    let mut request_keyframe = |client: &mut ClientEndpoint| {
+        if last_request.is_some_and(|t| t.elapsed() < KEYFRAME_REQUEST_INTERVAL) {
+            return;
+        }
+        last_request = Some(Instant::now());
+        match client.send_control(control::KEYFRAME_REQUEST, &[]) {
+            Ok(()) => {
+                stats.keyframe_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => log::warn!("keyframe request: {e}"),
+        }
+    };
 
     while !stop.load(Ordering::Relaxed) {
         let (header, payload) = match client.recv_record(READ_SLICE) {
@@ -319,6 +337,7 @@ fn stream(mut client: ClientEndpoint, sink: &mut dyn VideoSink, stop: &AtomicBoo
                 }
                 stats.frames_skipped.fetch_add(1, Ordering::Relaxed);
                 stats.set_phase(Phase::WaitingForKeyframe);
+                request_keyframe(&mut client);
                 continue;
             }
         }
@@ -333,6 +352,7 @@ fn stream(mut client: ClientEndpoint, sink: &mut dyn VideoSink, stop: &AtomicBoo
                 stats.set_error(format!("decoder: {err}"));
                 gate = KeyframeGate::default();
                 stats.set_phase(Phase::WaitingForKeyframe);
+                request_keyframe(&mut client);
             }
         }
         sink.service();
@@ -480,6 +500,17 @@ mod tests {
             "pre-keyframe delta must be held back"
         );
         assert_eq!(stats.frames_skipped.load(Ordering::Relaxed), 1);
+        // The skipped pre-keyframe delta made the client ask for an IDR.
+        assert_eq!(stats.keyframe_requests.load(Ordering::Relaxed), 1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut requests = Vec::new();
+        while requests.is_empty() && Instant::now() < deadline {
+            host.pump(16, |_, _| false).unwrap();
+            requests = host.take_control();
+        }
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].payload_type, control::KEYFRAME_REQUEST);
+        assert_eq!(requests[0].device_id, device_id);
         assert_eq!(stats.losses.load(Ordering::Relaxed), 0);
         assert_eq!(stats.phase(), Phase::Stopped);
     }

@@ -24,6 +24,16 @@ pub mod packet_type {
     pub const DATA: u8 = 0x10;
 }
 
+/// Payload types of device → host control records (RTP dynamic range, clear
+/// of the video payload types 96/98). They travel in the same authenticated,
+/// replay-protected records as video, in the `DeviceToHost` direction.
+pub mod control {
+    /// "My reference chain is broken; send an IDR." Empty payload.
+    pub const KEYFRAME_REQUEST: u8 = 120;
+    /// Input events (M2.5).
+    pub const INPUT: u8 = 121;
+}
+
 /// Size of the cleartext frame header inside an encrypted record.
 pub const FRAME_HEADER_LEN: usize = 24;
 

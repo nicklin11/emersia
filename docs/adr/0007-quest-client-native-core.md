@@ -45,9 +45,9 @@ resizable, passthrough-aware panel.
   is unit- and loopback-tested on the host against the real `HostEndpoint`.
 - ADR 0004's "Godot 4 client" now means "Godot (or native) *presentation
   layer*"; transport and decode are not Godot's job.
-- Loss handling is "freeze until the next keyframe" (≤ 2 s with the current
-  forced-keyframe interval). A device→host keyframe request is the follow-up
-  that makes recovery immediate.
+- Loss handling is "freeze until the next keyframe". Since #83 the client
+  sends an authenticated keyframe request (rate-limited on both ends), so
+  recovery takes one encoder restart instead of up to the 2 s forced interval.
 - The debug APK is `android:debuggable` so `run-as` can read `device.pub`;
   release builds (M8) must drop that and pair through the in-headset UI.
 
@@ -57,4 +57,6 @@ resizable, passthrough-aware panel.
 - Decoder: `OMX.qcom.video.decoder.avc`, hardware, 1920×1080 output.
 - Delivered frame rate equals the host capture rate (≈4 fps on a mostly idle
   niri desktop — the damage-driven `wlr-screencopy` limit tracked in #35, not a
-  client limit). Glass-to-glass latency is not yet measured.
+  client limit). With an active desktop (#83 test): **60 fps, 8.9 Mbit/s,
+  1,428 frames, 0 lost, 0 skipped**. Glass-to-glass latency is not yet
+  measured.
