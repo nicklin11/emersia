@@ -382,13 +382,10 @@ impl PairingDb {
     }
 }
 
-/// Stable device id derived from the public key: re-pairing the same identity
-/// keeps the same id, so revocation cannot be dodged by re-pairing.
+/// Stable device id derived from the public key; one definition shared with
+/// the client (see `emersia_transport::crypto::device_id_hex`).
 fn derive_device_id(public_key_hex: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"emersia/device-id/v1");
-    hasher.update(public_key_hex.as_bytes());
-    hex::encode(&hasher.finalize()[..8])
+    crate::crypto::device_id_hex(public_key_hex)
 }
 
 #[cfg(test)]

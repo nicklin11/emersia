@@ -1,0 +1,35 @@
+[package]
+name = "emersia-client"
+description = "Emersia Quest client core: handshake, decrypt, reassemble, hardware decode to an Android Surface"
+version = "0.0.1"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/nicklin11/emersia"
+publish = false
+
+# Standalone workspace: Android-only dependencies stay out of the host
+# workspace, while the wire protocol is shared by path (ADR 0007).
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+emersia-transport = { path = "../../../host/crates/emersia-transport" }
+log = "0.4"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk = { version = "0.9", features = ["media", "nativewindow", "api-level-29"] }
+android_logger = { version = "0.14", default-features = false }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3

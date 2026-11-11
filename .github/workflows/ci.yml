@@ -53,16 +53,39 @@ jobs:
         if: hashFiles('host/Cargo.toml') != ''
         run: cargo check --manifest-path host/Cargo.toml -p emersia-transport --target aarch64-linux-android
 
+  # Quest client core (ADR 0007): host tests of the session logic, then lint
+  # the Android-only modules (MediaCodec, JNI) against the real target.
+  client:
+    name: client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client/android/native
+      - name: rustfmt
+        run: cargo fmt --manifest-path client/android/native/Cargo.toml -- --check
+      - name: clippy (host)
+        run: cargo clippy --manifest-path client/android/native/Cargo.toml --all-targets -- -D warnings
+      - name: test
+        run: cargo test --manifest-path client/android/native/Cargo.toml
+      - name: clippy (aarch64-linux-android)
+        run: cargo clippy --manifest-path client/android/native/Cargo.toml --target aarch64-linux-android -- -D warnings
+
   # Aggregate check — this is the single required status on `main`.
   ci:
     name: ci
-    needs: [validation, rust]
+    needs: [validation, rust, client]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: All jobs green?
         run: |
-          if [ "${{ needs.validation.result }}" != "success" ] || [ "${{ needs.rust.result }}" != "success" ]; then
+          if [ "${{ needs.validation.result }}" != "success" ] || [ "${{ needs.rust.result }}" != "success" ] || [ "${{ needs.client.result }}" != "success" ]; then
             echo "required jobs did not succeed"
             exit 1
           fi

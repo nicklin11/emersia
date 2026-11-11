@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Emersia Quest client (M2.2): a 2D panel that mirrors one host output.
+     Horizon OS shows a plain Activity as a floating, resizable window, which is
+     all screen mirroring needs; the immersive OpenXR layer comes later. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.emersia.client"
+    android:versionCode="1"
+    android:versionName="0.0.1">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="32" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- Keeps Wi-Fi in its low-latency mode while streaming. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <uses-feature android:name="android.hardware.vr.headtracking" android:required="false" />
+
+    <!-- debuggable: `run-as` lets scripts/quest-mirror.sh read the public key
+         for pairing. Release builds will drop it (M8). -->
+    <application
+        android:label="Emersia"
+        android:debuggable="true"
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:hardwareAccelerated="true">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density"
+            android:resizeableActivity="true"
+            android:theme="@android:style/Theme.Black.NoTitleBar">
+            <!-- Default panel size on Horizon OS: 16:9 to match the desktop. -->
+            <layout android:defaultWidth="1600dp" android:defaultHeight="900dp" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

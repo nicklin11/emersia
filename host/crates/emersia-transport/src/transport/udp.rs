@@ -53,6 +53,13 @@ pub struct Peer {
     pub session: Session,
     /// Replay window for records received *from* this device.
     pub window: ReplayWindow,
+    /// Next outbound record sequence for this device.
+    ///
+    /// Per peer, not per endpoint: with a shared counter, frames sent to one
+    /// device left holes in every other device's sequence space, so a client
+    /// could not tell loss from another peer's traffic. Each session has its
+    /// own keys, so restarting at zero never reuses a (key, nonce) pair.
+    next_sequence: u32,
 }
 
 /// A handshake that got as far as a session but is not yet confirmed.
@@ -69,8 +76,6 @@ pub struct HostEndpoint {
     host_identity: DeviceIdentity,
     pending: HashMap<SocketAddr, Pending>,
     peers: HashMap<[u8; DEVICE_ID_LEN], Peer>,
-    /// Sequence counter for outbound records.
-    next_sequence: u32,
 }
 
 /// Decides whether a device may start a handshake.
@@ -89,7 +94,6 @@ impl HostEndpoint {
             host_identity,
             pending: HashMap::new(),
             peers: HashMap::new(),
-            next_sequence: 0,
         })
     }
 
@@ -215,6 +219,7 @@ impl HostEndpoint {
                 addr: from,
                 session: pending.session,
                 window: ReplayWindow::default(),
+                next_sequence: 0,
             },
         );
         HostOutcome::Silent
@@ -301,23 +306,20 @@ impl HostEndpoint {
         payload_type: u8,
         payload: &[u8],
     ) -> Result<usize, TransportError> {
-        let (addr, session) = {
-            let peer = self
-                .peers
-                .get(device_id)
-                .ok_or(TransportError::Dropped("no such peer"))?;
-            (peer.addr, peer.session.clone())
-        };
+        let peer = self
+            .peers
+            .get_mut(device_id)
+            .ok_or(TransportError::Dropped("no such peer"))?;
 
         let chunks = payload_chunks(payload);
         let frag_count = u16::try_from(chunks.len())
             .map_err(|_| TransportError::PayloadTooLarge(payload.len()))?;
-        let frame_sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.wrapping_add(1);
+        let frame_sequence = peer.next_sequence;
+        peer.next_sequence = peer.next_sequence.wrapping_add(1);
 
         for (index, chunk) in chunks.iter().enumerate() {
-            let record_sequence = self.next_sequence;
-            self.next_sequence = self.next_sequence.wrapping_add(1);
+            let record_sequence = peer.next_sequence;
+            peer.next_sequence = peer.next_sequence.wrapping_add(1);
             let record = build_record(
                 record_sequence,
                 frame_sequence,
@@ -330,13 +332,13 @@ impl HostEndpoint {
             )?;
             // Single definition of the wire layout: type || seq || nonce || ct.
             let packet = seal_packet(
-                &session,
+                &peer.session,
                 crate::crypto::Direction::HostToDevice,
                 record_sequence,
                 &record,
             )?;
             self.socket
-                .send_to(&packet, addr)
+                .send_to(&packet, peer.addr)
                 .map_err(|_| TransportError::Dropped("send failed"))?;
         }
         Ok(chunks.len())
@@ -369,6 +371,46 @@ impl ClientEndpoint {
             session: None,
             window: ReplayWindow::default(),
         })
+    }
+
+    /// Ask the kernel for a larger receive buffer.
+    ///
+    /// A 1080p keyframe is ~100 datagrams arriving back to back; the default
+    /// buffer (~200 KiB on Android) overflows while the decoder thread is
+    /// busy, which shows up as a lost keyframe. Returns the size granted.
+    #[cfg(unix)]
+    pub fn set_recv_buffer(&self, bytes: usize) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd as _;
+        let fd = self.socket.as_raw_fd();
+        let want = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
+        let len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: fd is a live socket owned by self; value pointers are valid
+        // for the duration of each call and `len` matches their size.
+        unsafe {
+            if libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&want as *const libc::c_int).cast(),
+                len,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut got: libc::c_int = 0;
+            let mut got_len = len;
+            if libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&mut got as *mut libc::c_int).cast(),
+                &mut got_len,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(usize::try_from(got).unwrap_or(0))
+        }
     }
 
     /// Send `init`. Returns nothing; the caller drives the exchange.
