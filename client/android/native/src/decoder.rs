@@ -33,6 +33,8 @@ pub struct SurfaceDecoder {
     window: NativeWindow,
     codec: Option<(Codec, MediaCodec)>,
     stats: Arc<crate::session::Stats>,
+    /// When each queued unit (by pts) went in, to time the decoder.
+    queued: std::collections::VecDeque<(u64, std::time::Instant)>,
 }
 
 impl SurfaceDecoder {
@@ -41,6 +43,7 @@ impl SurfaceDecoder {
             window,
             codec: None,
             stats,
+            queued: std::collections::VecDeque::new(),
         }
     }
 
@@ -92,6 +95,19 @@ impl SurfaceDecoder {
         loop {
             match codec.dequeue_output_buffer(Duration::ZERO) {
                 Ok(DequeuedOutputBufferInfoResult::Buffer(buffer)) => {
+                    let pts = buffer.info().presentation_time_us() as u64;
+                    while let Some(&(queued_pts, at)) = self.queued.front() {
+                        if queued_pts > pts {
+                            break;
+                        }
+                        self.queued.pop_front();
+                        if queued_pts == pts {
+                            crate::session::smooth(
+                                &self.stats.decode_us,
+                                at.elapsed().as_micros() as u64,
+                            );
+                        }
+                    }
                     if let Some(older) = newest.replace(buffer) {
                         let _ = codec.release_output_buffer(older, false);
                     }
@@ -153,6 +169,10 @@ impl VideoSink for SurfaceDecoder {
                     codec
                         .queue_input_buffer(input, 0, au.len(), pts_us, 0)
                         .map_err(|e| format!("queue input: {e:?}"))?;
+                    if self.queued.len() == 64 {
+                        self.queued.pop_front();
+                    }
+                    self.queued.push_back((pts_us, std::time::Instant::now()));
                     return Ok(());
                 }
                 Ok(DequeuedInputBufferResult::TryAgainLater) => self.drain(),

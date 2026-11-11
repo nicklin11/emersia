@@ -51,6 +51,26 @@ pub fn render(server: &str, stats: &Stats, sampler: &Sampler) -> String {
         stats.sessions.load(Ordering::Relaxed),
         stats.handshake_us.load(Ordering::Relaxed) as f64 / 1000.0,
     );
+    let ms = |us: u64| -> String {
+        if us == 0 {
+            "—".into()
+        } else {
+            format!("{:.1} ms", us as f64 / 1000.0)
+        }
+    };
+    let rx = stats.capture_to_rx_us.load(Ordering::Relaxed);
+    let dec = stats.decode_us.load(Ordering::Relaxed);
+    text.push_str(&format!(
+        "\nlatency: capture→received {} · decode {} · sum {} · rtt {}",
+        ms(rx),
+        ms(dec),
+        if rx > 0 && dec > 0 {
+            ms(rx + dec)
+        } else {
+            "—".into()
+        },
+        ms(stats.rtt_us.load(Ordering::Relaxed)),
+    ));
     if let Some(err) = stats.last_error() {
         text.push_str("\nlast error: ");
         text.push_str(&err);
