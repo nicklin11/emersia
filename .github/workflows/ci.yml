@@ -25,6 +25,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: aarch64-linux-android
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: host
@@ -46,6 +47,11 @@ jobs:
       - name: test
         if: hashFiles('host/Cargo.toml') != ''
         run: cargo test --manifest-path host/Cargo.toml
+      # The wire protocol is compiled into the Quest client (ADR 0007), so it
+      # must keep building for Android. `check` needs no NDK linker.
+      - name: emersia-transport builds for Android
+        if: hashFiles('host/Cargo.toml') != ''
+        run: cargo check --manifest-path host/Cargo.toml -p emersia-transport --target aarch64-linux-android
 
   # Aggregate check — this is the single required status on `main`.
   ci:

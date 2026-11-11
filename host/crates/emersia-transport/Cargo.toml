@@ -1,0 +1,24 @@
+[package]
+name = "emersia-transport"
+description = "Emersia wire protocol: device identity, forward-secret handshake, encrypted RTP-style UDP transport, codec framing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Shared by the host daemon and the Quest client (ADR 0007), so it must stay
+# free of Wayland and other host-only dependencies and build for
+# aarch64-linux-android.
+[dependencies]
+# `static_secrets` is required for long-term device identity keys (ADR 0006).
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+chacha20poly1305 = "0.11"
+hkdf = "0.13"
+sha2 = "0.11"
+getrandom = "0.4"
+hex = "0.4"
+aead = "0.6"
+
+[dev-dependencies]
+tempfile = "3.27.0"
