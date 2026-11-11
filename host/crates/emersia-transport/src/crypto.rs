@@ -535,6 +535,28 @@ impl fmt::Display for PairingCode {
     }
 }
 
+/// Stable device id derived from a hex public key: the first 8 bytes of
+/// `SHA-256("emersia/device-id/v1" || public_key_hex)`.
+///
+/// Both sides compute it — the host when pairing, the device to name itself in
+/// the handshake — so it lives here rather than in either binary. Re-pairing the
+/// same identity keeps the same id, so revocation cannot be dodged by
+/// re-pairing.
+pub fn device_id_bytes(public_key_hex: &str) -> [u8; 8] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"emersia/device-id/v1");
+    hasher.update(public_key_hex.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest[..8]);
+    out
+}
+
+/// [`device_id_bytes`], hex-encoded as shown by `emersia devices`.
+pub fn device_id_hex(public_key_hex: &str) -> String {
+    hex::encode(device_id_bytes(public_key_hex))
+}
+
 /// Decode a hex-encoded public key.
 pub fn parse_public_key_hex(hex_str: &str) -> Result<[u8; 32], CryptoError> {
     let bytes = hex::decode(hex_str).map_err(|_| CryptoError::Hex)?;
@@ -545,6 +567,14 @@ pub fn parse_public_key_hex(hex_str: &str) -> Result<[u8; 32], CryptoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_id_matches_the_pinned_derivation() {
+        // Pinned vector: the host's pairing store and every client must agree.
+        let key = "721b62e7324f61b2208a142d7e7d59fdc9bb3a7c68b29efb6eb28fa5a8def108";
+        assert_eq!(device_id_hex(key), "1efa4d0807fab855");
+        assert_eq!(hex::encode(device_id_bytes(key)), device_id_hex(key));
+    }
 
     const CONTEXT: &[u8] = b"emersia/v1";
 
