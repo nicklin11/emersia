@@ -42,12 +42,19 @@ enum RequestLine {
 /// Acquire one connection slot without allowing the accept loop to overshoot the
 /// configured cap during a race with a finishing worker.
 fn try_acquire_connection(counter: Arc<AtomicUsize>) -> Option<ConnectionPermit> {
-    counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-            (count < MAX_CONNECTIONS).then_some(count + 1)
-        })
-        .ok()
-        .map(|_| ConnectionPermit(counter))
+    // An explicit CAS loop rather than `fetch_update`: that method is
+    // deprecated on current stable and its replacement (`try_update`) is newer
+    // than our MSRV.
+    let mut count = counter.load(Ordering::Acquire);
+    loop {
+        if count >= MAX_CONNECTIONS {
+            return None;
+        }
+        match counter.compare_exchange_weak(count, count + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(ConnectionPermit(counter)),
+            Err(actual) => count = actual,
+        }
+    }
 }
 
 /// Releases a connection slot on every return path, including panics.
