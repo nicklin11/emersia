@@ -35,7 +35,16 @@ work=$(mktemp -d)
 pids=()
 cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
-  wait 2>/dev/null || true
+  # A process blocked on a hung compositor never finishes SIGTERM handling;
+  # give a grace period, then SIGKILL, so cleanup itself cannot hang.
+  for _ in $(seq 30); do
+    alive=0
+    for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && alive=1; done
+    ((alive)) || break
+    sleep 0.1
+  done
+  for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null || true; done
+  pkill -9 -P $$ 2>/dev/null || true
   rm -rf "$rt" "$work"
 }
 trap cleanup EXIT
@@ -75,8 +84,9 @@ port=$((40000 + RANDOM % 20000))
 # cleanup kills a wrapper subshell and leaves the daemon running.
 env XDG_RUNTIME_DIR="$rt" WAYLAND_DISPLAY=wayland-1 XDG_CONFIG_HOME="$work/config" \
   "$bin/emersia-daemon" serve --stream-port "$port" --socket "$rt/ctl.sock" \
-  --encoder "$encoder" >"$work/daemon.log" 2>&1 &
-pids+=($!)
+  --encoder "$encoder" --no-audio >"$work/daemon.log" 2>&1 &
+daemon_pid=$!
+pids+=($daemon_pid)
 ctl() { "$bin/emersia" --socket "$rt/ctl.sock" "$@"; }
 for _ in $(seq 50); do ctl status >/dev/null 2>&1 && break; sleep 0.1; done
 ctl status >/dev/null || fail "daemon did not start"
@@ -132,7 +142,11 @@ step "removing $virt"
 kill "$damage_pid" 2>/dev/null || true
 wait "$damage_pid" 2>/dev/null || true
 ctl stop >/dev/null
-sleep 1
+# Then let the daemon go entirely: on sway 1.11 an unplug did not return while
+# a client still had the output bound, so check removal with no client.
+kill "$daemon_pid" 2>/dev/null || true
+for _ in $(seq 30); do kill -0 "$daemon_pid" 2>/dev/null || break; sleep 0.1; done
+sleep 0.5
 "$bin/emersia" virtual remove "$virt" || fail "emersia virtual remove failed"
 ! "$bin/emersia" virtual list | grep -qx "$virt" || fail "$virt still listed"
 backend=$(grep -oP 'capture backend: \K.*' "$work/daemon.log")
