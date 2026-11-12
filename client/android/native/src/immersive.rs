@@ -23,7 +23,8 @@ use openxr as xr;
 use crate::decoder::{Decoders, SurfaceDecoder};
 use crate::session::Stats;
 
-use crate::layout::{screen_yaw, RADIUS, SCREEN_WIDTH};
+use crate::layout::{hit, screen_yaw, RADIUS, SCREEN_WIDTH};
+use emersia_transport::input::{Button, InputEvent};
 
 /// Swapchain size: the stream's native resolution.
 const WIDTH: u32 = 1920;
@@ -31,9 +32,80 @@ const HEIGHT: u32 = 1080;
 
 /// What the immersive thread shares with the stream thread.
 pub struct Shared {
+    /// Pointer/button/scroll events for the host (controller input).
+    pub input: std::sync::mpsc::Sender<emersia_transport::input::InputEvent>,
     pub decoders: Decoders,
     pub idr_wanted: Arc<AtomicU32>,
     pub stats: Arc<Stats>,
+}
+
+/// Controller → desktop pointer, for the hand last used.
+#[derive(Default)]
+struct Pointer {
+    /// Which hand drives the pointer (true = right); switches on a click.
+    right: Option<bool>,
+    pressed: bool,
+    last: Option<(u8, u16, u16)>,
+}
+
+impl Pointer {
+    fn update(
+        &mut self,
+        right: bool,
+        ray: Option<(xr::Vector3f, xr::Quaternionf)>,
+        trigger: f32,
+        stick: f32,
+        streams: &[u8],
+        out: &std::sync::mpsc::Sender<InputEvent>,
+    ) {
+        // A click with the other hand hands the pointer over.
+        if trigger > 0.7 && self.right != Some(right) && !self.pressed {
+            self.right = Some(right);
+        }
+        if self.right.unwrap_or(true) != right {
+            return;
+        }
+        if let Some((p, q)) = ray {
+            // Aim direction = -Z rotated by the controller orientation.
+            let dir = [
+                -2.0 * (q.x * q.z + q.w * q.y),
+                -2.0 * (q.y * q.z - q.w * q.x),
+                -(1.0 - 2.0 * (q.x * q.x + q.y * q.y)),
+            ];
+            if let Some((index, u, v)) = hit([p.x, p.y, p.z], dir, streams.len()) {
+                let at = (streams[index], (u * 65535.0) as u16, (v * 65535.0) as u16);
+                if self.last != Some(at) {
+                    let _ = out.send(InputEvent::PointerOn {
+                        stream: at.0,
+                        x: at.1,
+                        y: at.2,
+                    });
+                    self.last = Some(at);
+                }
+            }
+        }
+        // Hysteresis so a half-pulled trigger does not chatter.
+        if !self.pressed && trigger > 0.7 {
+            self.pressed = true;
+            let _ = out.send(InputEvent::Button {
+                button: Button::Left,
+                down: true,
+            });
+        } else if self.pressed && trigger < 0.3 {
+            self.pressed = false;
+            let _ = out.send(InputEvent::Button {
+                button: Button::Left,
+                down: false,
+            });
+        }
+        if stick.abs() > 0.2 {
+            // Up on the stick scrolls up; up to ~18 detents/s at 72 Hz.
+            let _ = out.send(InputEvent::Scroll {
+                dx: 0,
+                dy: (-stick * 30.0) as i16,
+            });
+        }
+    }
 }
 
 struct Screen {
@@ -202,6 +274,45 @@ pub unsafe fn run(
         .ok_or("surface swapchain extension not loaded")?
         .create_swapchain_android_surface;
 
+    // Controller input: aim pose, trigger (click), thumbstick (scroll).
+    let action_set = instance
+        .create_action_set("desktop", "Desktop", 0)
+        .map_err(|e| format!("action set: {e}"))?;
+    let path = |p: &str| instance.string_to_path(p).map_err(|e| format!("{p}: {e}"));
+    let hands = [path("/user/hand/left")?, path("/user/hand/right")?];
+    let aim = action_set
+        .create_action::<xr::Posef>("aim", "Aim", &hands)
+        .map_err(|e| e.to_string())?;
+    let select = action_set
+        .create_action::<f32>("select", "Click", &hands)
+        .map_err(|e| e.to_string())?;
+    let scroll = action_set
+        .create_action::<xr::Vector2f>("scroll", "Scroll", &hands)
+        .map_err(|e| e.to_string())?;
+    instance
+        .suggest_interaction_profile_bindings(
+            path("/interaction_profiles/oculus/touch_controller")?,
+            &[
+                xr::Binding::new(&aim, path("/user/hand/left/input/aim/pose")?),
+                xr::Binding::new(&aim, path("/user/hand/right/input/aim/pose")?),
+                xr::Binding::new(&select, path("/user/hand/left/input/trigger/value")?),
+                xr::Binding::new(&select, path("/user/hand/right/input/trigger/value")?),
+                xr::Binding::new(&scroll, path("/user/hand/left/input/thumbstick")?),
+                xr::Binding::new(&scroll, path("/user/hand/right/input/thumbstick")?),
+            ],
+        )
+        .map_err(|e| format!("bindings: {e}"))?;
+    session
+        .attach_action_sets(&[&action_set])
+        .map_err(|e| format!("attach actions: {e}"))?;
+    let aim_spaces = [
+        aim.create_space(session.clone(), hands[0], xr::Posef::IDENTITY)
+            .map_err(|e| e.to_string())?,
+        aim.create_space(session.clone(), hands[1], xr::Posef::IDENTITY)
+            .map_err(|e| e.to_string())?,
+    ];
+    let mut pointer = Pointer::default();
+
     let mut screens: BTreeMap<u8, Screen> = BTreeMap::new();
     let mut running = false;
     let mut events = xr::EventDataBuffer::new();
@@ -287,6 +398,30 @@ pub unsafe fn run(
         }
 
         let state = waiter.wait().map_err(|e| format!("xrWaitFrame: {e}"))?;
+        if session.sync_actions(&[(&action_set).into()]).is_ok() {
+            let ids: Vec<u8> = screens.keys().copied().collect();
+            for (hand, aim_space) in hands.iter().zip(&aim_spaces) {
+                let trigger = select
+                    .state(&session, *hand)
+                    .map(|s| s.current_state)
+                    .unwrap_or(0.0);
+                let stick = scroll
+                    .state(&session, *hand)
+                    .map(|s| s.current_state.y)
+                    .unwrap_or(0.0);
+                let ray = aim_space
+                    .locate(&space, state.predicted_display_time)
+                    .ok()
+                    .filter(|l| {
+                        l.location_flags.contains(
+                            xr::SpaceLocationFlags::POSITION_VALID
+                                | xr::SpaceLocationFlags::ORIENTATION_VALID,
+                        )
+                    })
+                    .map(|l| (l.pose.position, l.pose.orientation));
+                pointer.update(*hand == hands[1], ray, trigger, stick, &ids, &shared.input);
+            }
+        }
         stream.begin().map_err(|e| format!("xrBeginFrame: {e}"))?;
         let count = screens.len();
         let layers: Vec<xr::sys::CompositionLayerCylinderKHR> = screens

@@ -40,9 +40,11 @@ Native OpenXR (Khronos loader 1.1.65, bundled and hash-pinned), no engine:
   4% GPU; decode latency unchanged from panel mode (~4.4 ms).
 - Godot is no longer planned for the client; the presentation layer is native.
   This supersedes the Quest-client row of ADR 0004.
-- Not yet: controller input in immersive mode (pointer ray hit-testing on the
-  cylinders, mapped to `PointerOn{stream}`), passthrough, recentering and
-  user-adjustable layout. Panel mode keeps full input meanwhile.
+- Controller input (#128): the active hand's aim ray is intersected with the
+  cylinders and sent as `PointerOn{stream}`; trigger = click, thumbstick =
+  scroll. The pointer the user sees is the desktop's own cursor, composited by
+  the host — nothing extra is rendered.
+- Not yet: passthrough, recentering and user-adjustable layout.
 - Verification gap: compositor stats prove the layers are composited, but an
   idle headset captures black, so the image itself still needs to be checked
   by someone wearing it.
