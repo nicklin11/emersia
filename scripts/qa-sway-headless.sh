@@ -53,6 +53,10 @@ for _ in $(seq 50); do [[ -S $rt/wayland-1 ]] && compgen -G "$rt/sway-ipc.*" >/d
 [[ -S $rt/wayland-1 ]] || fail "sway did not start"
 export SWAYSOCK
 SWAYSOCK=$(compgen -G "$rt/sway-ipc.*" | head -1)
+# The IPC socket exists before sway answers on it; a request sent too early
+# fails with "Unable to receive IPC response" (seen in CI).
+for _ in $(seq 50); do swaymsg -t get_version >/dev/null 2>&1 && break; sleep 0.1; done
+swaymsg -t get_version >/dev/null || fail "sway IPC did not come up"
 
 step "creating a virtual output (swaymsg create_output)"
 swaymsg create_output >/dev/null
