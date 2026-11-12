@@ -200,6 +200,17 @@ impl Drop for Egl {
     }
 }
 
+/// Releases the ndk-context Android context when a session ends.
+struct AndroidContextGuard;
+
+impl Drop for AndroidContextGuard {
+    fn drop(&mut self) {
+        // SAFETY: created right after initialize_android_context succeeded,
+        // so the context is set; nothing else in the app touches it.
+        unsafe { ndk_context::release_android_context() };
+    }
+}
+
 /// Run the immersive session until `stop` is set or the runtime ends it.
 ///
 /// # Safety
@@ -211,8 +222,12 @@ pub unsafe fn run(
     shared: &Shared,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    // The loader and instance creation read the VM/Activity from here.
+    // The loader and instance creation read the VM/Activity from here. The
+    // guard releases it on every exit path, so a later session (the activity
+    // re-created in the same process) can initialize it with its own
+    // activity instead of tripping ndk-context's "already initialized" assert.
     ndk_context::initialize_android_context(vm, activity);
+    let _context = AndroidContextGuard;
     let jvm = jni::JavaVM::from_raw(vm.cast()).map_err(|e| format!("JavaVM: {e}"))?;
     let env = jvm
         .attach_current_thread_permanently()
