@@ -20,6 +20,7 @@ mod inject;
 mod network;
 mod notify;
 mod pairing;
+mod pixels;
 mod receiver;
 mod service;
 mod shm;

@@ -145,7 +145,10 @@ enum QueueResult {
     Closed,
 }
 
-fn try_queue_frame(tx: &std::sync::mpsc::SyncSender<Vec<u8>>, frame: Vec<u8>) -> QueueResult {
+fn try_queue_frame(
+    tx: &std::sync::mpsc::SyncSender<crate::pixels::Pixels>,
+    frame: crate::pixels::Pixels,
+) -> QueueResult {
     match tx.try_send(frame) {
         Ok(()) => QueueResult::Queued,
         Err(std::sync::mpsc::TrySendError::Full(_)) => QueueResult::Dropped,
@@ -400,7 +403,7 @@ impl From<CodecError> for EncoderError {
 pub struct Encoder {
     child: Child,
     /// Sender for RGBA frames. `None` closes the queue during shutdown.
-    stdin: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    stdin: Option<std::sync::mpsc::SyncSender<crate::pixels::Pixels>>,
     /// Writer thread owning the child stdin pipe.
     writer: Option<std::thread::JoinHandle<()>>,
     /// Error reported by the writer after its pipe failed.
@@ -695,13 +698,36 @@ impl Encoder {
         // A synchronous bounded queue keeps the engine thread out of the child
         // stdin pipe. One queued frame is enough to smooth a scheduling hiccup
         // without retaining a large backlog of RGBA buffers.
-        let (stdin_tx, stdin_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(STDIN_QUEUE_CAPACITY);
+        let (stdin_tx, stdin_rx) =
+            std::sync::mpsc::sync_channel::<crate::pixels::Pixels>(STDIN_QUEUE_CAPACITY);
         let writer_error = std::sync::Arc::new(std::sync::Mutex::new(None));
         let writer_error_by_thread = std::sync::Arc::clone(&writer_error);
         let writer = std::thread::spawn(move || {
             let mut stdin = stdin;
+            use std::os::fd::AsRawFd as _;
+            let fd = stdin.as_raw_fd();
+            // A larger pipe means fewer wakeups per 8 MB frame (best effort).
+            // SAFETY: fcntl on our own pipe fd.
+            unsafe {
+                libc::fcntl(fd, libc::F_SETPIPE_SZ, 1 << 20);
+            }
+            let mut splice = true;
             while let Ok(frame) = stdin_rx.recv() {
-                if let Err(e) = stdin.write_all(&frame) {
+                // Mapped capture buffers go in by reference (vmsplice);
+                // anything else, or a kernel without it, is written.
+                let result = if splice && frame.is_mapped() {
+                    match crate::pixels::vmsplice_all(fd, &frame) {
+                        Ok(()) => Ok(()),
+                        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                            splice = false;
+                            stdin.write_all(&frame)
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    stdin.write_all(&frame)
+                };
+                if let Err(e) = result {
                     let mut slot = writer_error_by_thread
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -999,7 +1025,7 @@ impl Encoder {
     /// offered to a bounded queue with [`std::sync::mpsc::SyncSender::try_send`],
     /// so a slow encoder drops this frame instead of blocking the capture loop.
     pub fn encode(&mut self, pixels: &[u8]) -> Result<EncodeOutcome, EncoderError> {
-        self.encode_captured_at(pixels.to_vec(), Instant::now())
+        self.encode_captured_at(pixels.to_vec().into(), Instant::now())
     }
 
     /// [`encode`](Self::encode), recording when the frame was captured so the
@@ -1007,7 +1033,7 @@ impl Encoder {
     /// [`last_unit_capture`](Self::last_unit_capture)).
     pub fn encode_captured_at(
         &mut self,
-        rgba: Vec<u8>,
+        rgba: crate::pixels::Pixels,
         captured_at: Instant,
     ) -> Result<EncodeOutcome, EncoderError> {
         let expected = (self.config.width as usize)
@@ -1413,14 +1439,14 @@ mod tests {
     #[test]
     fn bounded_stdin_queue_drops_instead_of_waiting() {
         let (tx, rx) = std::sync::mpsc::sync_channel(STDIN_QUEUE_CAPACITY);
-        assert_eq!(try_queue_frame(&tx, vec![1]), QueueResult::Queued);
+        assert_eq!(try_queue_frame(&tx, vec![1u8].into()), QueueResult::Queued);
         // No receiver is running, so this queue is full. `try_send` must report
         // a drop immediately rather than waiting for the writer to make room.
-        assert_eq!(try_queue_frame(&tx, vec![2]), QueueResult::Dropped);
-        assert_eq!(rx.try_recv(), Ok(vec![1]));
+        assert_eq!(try_queue_frame(&tx, vec![2u8].into()), QueueResult::Dropped);
+        assert_eq!(rx.try_recv().map(|p| p.to_vec()), Ok(vec![1u8]));
 
         drop(rx);
-        assert_eq!(try_queue_frame(&tx, vec![3]), QueueResult::Closed);
+        assert_eq!(try_queue_frame(&tx, vec![3u8].into()), QueueResult::Closed);
     }
 
     #[test]
@@ -1629,7 +1655,8 @@ mod tests {
             // Irregular spacing, like damage-driven capture.
             let at = base + Duration::from_millis(i * i * 13);
             let before = enc.frames_in();
-            enc.encode_captured_at(frame, at).expect("frame accepted");
+            enc.encode_captured_at(frame.into(), at)
+                .expect("frame accepted");
             if enc.frames_in() > before {
                 fed.push(at);
             }

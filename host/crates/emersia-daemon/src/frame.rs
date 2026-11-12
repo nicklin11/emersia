@@ -4,6 +4,8 @@
 use std::path::Path;
 
 use anyhow::{bail, Context as _};
+
+use crate::pixels::Pixels;
 use wayland_client::protocol::{wl_output, wl_shm};
 
 /// Byte order of a packed 4-byte pixel, named as ffmpeg names it.
@@ -66,13 +68,15 @@ impl PixelFormat {
 pub struct Frame {
     pub width: u32,
     pub height: u32,
-    /// Tightly packed `width * height * 4` bytes, row-major, in `format`.
-    pub pixels: Vec<u8>,
+    /// Tightly packed `width * height * 4` bytes, row-major, in `format`;
+    /// usually the mapped capture buffer itself.
+    pub pixels: Pixels,
     pub format: PixelFormat,
 }
 
 impl Frame {
-    pub fn new(width: u32, height: u32, pixels: Vec<u8>, format: PixelFormat) -> Self {
+    pub fn new(width: u32, height: u32, pixels: impl Into<Pixels>, format: PixelFormat) -> Self {
+        let pixels = pixels.into();
         debug_assert_eq!(pixels.len(), (width as usize) * (height as usize) * 4);
         Self {
             width,
@@ -85,7 +89,7 @@ impl Frame {
     /// The pixels as non-premultiplied RGBA (a copy; for PNG output and QA).
     pub fn to_rgba(&self) -> Vec<u8> {
         if self.format == PixelFormat::Rgba {
-            return self.pixels.clone();
+            return self.pixels.to_vec();
         }
         let mut out = vec![0u8; self.pixels.len()];
         for (s, d) in self.pixels.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
@@ -156,7 +160,13 @@ const fn forward(t: wl_output::Transform, x: u32, y: u32, lw: u32, lh: u32) -> (
 /// The M1.1 hardware only exercises `transform=normal` (the identity path,
 /// verified live on both niri outputs); the other seven cases are covered by
 /// round-trip unit tests, not by a rotated physical output.
-pub fn untransform(buf: Vec<u8>, bw: u32, bh: u32, t: wl_output::Transform) -> (Vec<u8>, u32, u32) {
+pub fn untransform(
+    buf: impl Into<Pixels>,
+    bw: u32,
+    bh: u32,
+    t: wl_output::Transform,
+) -> (Pixels, u32, u32) {
+    let buf: Pixels = buf.into();
     // The common case, and the only one most desktops ever see: no copy.
     if t == wl_output::Transform::Normal {
         return (buf, bw, bh);
@@ -174,7 +184,7 @@ pub fn untransform(buf: Vec<u8>, bw: u32, bh: u32, t: wl_output::Transform) -> (
             out[dst..dst + 4].copy_from_slice(&buf[src..src + 4]);
         }
     }
-    (out, ow, oh)
+    (Pixels::Owned(out), ow, oh)
 }
 
 /// Flip a buffer the compositor marked `Y_INVERT` (rows stored bottom-up).
@@ -201,8 +211,9 @@ pub fn pack(
     width: u32,
     height: u32,
     stride: u32,
-    mut data: Vec<u8>,
-) -> anyhow::Result<(Vec<u8>, PixelFormat)> {
+    data: impl Into<Pixels>,
+) -> anyhow::Result<(Pixels, PixelFormat)> {
+    let data: Pixels = data.into();
     let pixel = PixelFormat::from_shm(format).with_context(|| {
         format!("unsupported wl_shm format {format:?} (supported: XRGB/ARGB/XBGR/ABGR/RGBA 8888)")
     })?;
@@ -224,13 +235,18 @@ pub fn pack(
             data.len()
         );
     }
+    if stride == row && data.len() == row * h {
+        // The common case: the buffer already is the frame (no copy at all).
+        return Ok((data, pixel));
+    }
+    let mut owned = data.into_vec();
     if stride != row {
         for y in 1..h {
-            data.copy_within(y * stride..y * stride + row, y * row);
+            owned.copy_within(y * stride..y * stride + row, y * row);
         }
     }
-    data.truncate(row * h);
-    Ok((data, pixel))
+    owned.truncate(row * h);
+    Ok((Pixels::Owned(owned), pixel))
 }
 
 /// Decode a shared-memory buffer into tightly packed RGBA8.
@@ -344,7 +360,7 @@ mod tests {
                 let (buf, bw, bh) = apply_transform(&logical, lw, lh, t);
                 let (out, ow, oh) = untransform(buf.clone(), bw, bh, t);
                 assert_eq!((ow, oh), (lw, lh), "dimensions for {t:?} {lw}x{lh}");
-                assert_eq!(out, logical, "pixels for {t:?} {lw}x{lh}");
+                assert_eq!(&*out, &logical[..], "pixels for {t:?} {lw}x{lh}");
             }
         }
     }
@@ -398,15 +414,15 @@ mod tests {
         let (px, fmt) = pack(wl_shm::Format::Xrgb8888, 2, 2, 8, data).unwrap();
         assert_eq!(fmt, PixelFormat::Bgr0);
         assert_eq!(px.as_ptr(), ptr, "unpadded rows are passed through");
-        assert_eq!(px, (0..16).collect::<Vec<u8>>());
+        assert_eq!(&*px, &(0..16).collect::<Vec<u8>>()[..]);
 
         // 2 px rows padded to 12 bytes.
         let mut padded = vec![0u8; 24];
         padded[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
         padded[12..20].copy_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
         let (px, _) = pack(wl_shm::Format::Xrgb8888, 2, 2, 12, padded).unwrap();
-        assert_eq!(px, (1..=16).collect::<Vec<u8>>());
-        assert!(pack(wl_shm::Format::Rgb565, 1, 1, 4, vec![0; 4]).is_err());
+        assert_eq!(&*px, &(1..=16).collect::<Vec<u8>>()[..]);
+        assert!(pack(wl_shm::Format::Rgb565, 1, 1, 4, vec![0u8; 4]).is_err());
     }
 
     #[test]
