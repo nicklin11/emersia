@@ -23,7 +23,7 @@ use openxr as xr;
 use crate::decoder::{Decoders, SurfaceDecoder};
 use crate::session::Stats;
 
-use crate::layout::{hit, screen_yaw, RADIUS, SCREEN_WIDTH};
+use crate::layout::Layout;
 use emersia_transport::input::{Button, InputEvent};
 
 /// Swapchain size: the stream's native resolution.
@@ -32,11 +32,24 @@ const HEIGHT: u32 = 1080;
 
 /// What the immersive thread shares with the stream thread.
 pub struct Shared {
+    /// Where the user's screen arrangement is remembered.
+    pub layout_file: std::path::PathBuf,
     /// Pointer/button/scroll events for the host (controller input).
     pub input: std::sync::mpsc::Sender<emersia_transport::input::InputEvent>,
     pub decoders: Decoders,
     pub idr_wanted: Arc<AtomicU32>,
     pub stats: Arc<Stats>,
+}
+
+/// One controller's input this frame.
+#[derive(Clone, Copy)]
+struct HandState {
+    right: bool,
+    /// Aim position and orientation, when tracked.
+    ray: Option<(xr::Vector3f, xr::Quaternionf)>,
+    trigger: f32,
+    /// Vertical stick deflection used for scrolling (0 for the left hand).
+    scroll: f32,
 }
 
 /// Controller → desktop pointer, for the hand last used.
@@ -51,13 +64,17 @@ struct Pointer {
 impl Pointer {
     fn update(
         &mut self,
-        right: bool,
-        ray: Option<(xr::Vector3f, xr::Quaternionf)>,
-        trigger: f32,
-        stick: f32,
+        hand: &HandState,
         streams: &[u8],
+        layout: &Layout,
         out: &std::sync::mpsc::Sender<InputEvent>,
     ) {
+        let HandState {
+            right,
+            ray,
+            trigger,
+            scroll: stick,
+        } = *hand;
         // A click with the other hand hands the pointer over.
         if trigger > 0.7 && self.right != Some(right) && !self.pressed {
             self.right = Some(right);
@@ -72,7 +89,7 @@ impl Pointer {
                 -2.0 * (q.y * q.z - q.w * q.x),
                 -(1.0 - 2.0 * (q.x * q.x + q.y * q.y)),
             ];
-            if let Some((index, u, v)) = hit([p.x, p.y, p.z], dir, streams.len()) {
+            if let Some((index, u, v)) = layout.hit([p.x, p.y, p.z], dir, streams.len()) {
                 let at = (streams[index], (u * 65535.0) as u16, (v * 65535.0) as u16);
                 if self.last != Some(at) {
                     let _ = out.send(InputEvent::PointerOn {
@@ -339,6 +356,11 @@ pub unsafe fn run(
             .map_err(|e| e.to_string())?,
     ];
     let mut pointer = Pointer::default();
+    let mut layout = std::fs::read_to_string(&shared.layout_file)
+        .map(|l| Layout::from_line(&l))
+        .unwrap_or_default();
+    let mut layout_dirty: Option<std::time::Instant> = None;
+    let mut last_frame = std::time::Instant::now();
 
     let mut screens: BTreeMap<u8, Screen> = BTreeMap::new();
     let mut running = false;
@@ -425,6 +447,15 @@ pub unsafe fn run(
         }
 
         let state = waiter.wait().map_err(|e| format!("xrWaitFrame: {e}"))?;
+        let frame_dt = last_frame.elapsed().as_secs_f32().min(0.1);
+        last_frame = std::time::Instant::now();
+        // Save the arrangement once the user has stopped adjusting it.
+        if layout_dirty.is_some_and(|t| t.elapsed() > Duration::from_secs(1)) {
+            layout_dirty = None;
+            if let Err(e) = std::fs::write(&shared.layout_file, layout.to_line()) {
+                log::warn!("saving layout: {e}");
+            }
+        }
         if session.sync_actions(&[(&action_set).into()]).is_ok() {
             let ids: Vec<u8> = screens.keys().copied().collect();
             for (hand, aim_space) in hands.iter().zip(&aim_spaces) {
@@ -434,8 +465,14 @@ pub unsafe fn run(
                     .unwrap_or(0.0);
                 let stick = scroll
                     .state(&session, *hand)
-                    .map(|s| s.current_state.y)
-                    .unwrap_or(0.0);
+                    .map(|s| s.current_state)
+                    .unwrap_or_default();
+                let left = *hand == hands[0];
+                // Left stick arranges the screens; right stick scrolls.
+                if left && layout.adjust(stick.x, stick.y, frame_dt) {
+                    layout_dirty = Some(std::time::Instant::now());
+                }
+                let scroll_y = if left { 0.0 } else { stick.y };
                 let ray = aim_space
                     .locate(&space, state.predicted_display_time)
                     .ok()
@@ -446,7 +483,13 @@ pub unsafe fn run(
                         )
                     })
                     .map(|l| (l.pose.position, l.pose.orientation));
-                pointer.update(*hand == hands[1], ray, trigger, stick, &ids, &shared.input);
+                let hand = HandState {
+                    right: !left,
+                    ray,
+                    trigger,
+                    scroll: scroll_y,
+                };
+                pointer.update(&hand, &ids, &layout, &shared.input);
             }
         }
         stream.begin().map_err(|e| format!("xrBeginFrame: {e}"))?;
@@ -455,7 +498,7 @@ pub unsafe fn run(
             .values()
             .enumerate()
             .map(|(i, screen)| {
-                let yaw = screen_yaw(i, count);
+                let yaw = layout.yaw(i, count);
                 xr::sys::CompositionLayerCylinderKHR {
                     ty: xr::sys::CompositionLayerCylinderKHR::TYPE,
                     next: std::ptr::null(),
@@ -482,8 +525,8 @@ pub unsafe fn run(
                         },
                         position: xr::Vector3f::default(),
                     },
-                    radius: RADIUS,
-                    central_angle: SCREEN_WIDTH / RADIUS,
+                    radius: layout.radius,
+                    central_angle: layout.arc(),
                     aspect_ratio: WIDTH as f32 / HEIGHT as f32,
                 }
             })

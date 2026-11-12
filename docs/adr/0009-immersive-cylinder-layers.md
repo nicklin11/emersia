@@ -48,7 +48,10 @@ Native OpenXR (Khronos loader 1.1.65, bundled and hash-pinned), no engine:
   and the screens float in it (keyboard and desk stay visible); black when the
   runtime lacks it. Quest 2: `LCnt=3` (passthrough + 2 screens) at 72/72 FPS.
 - Recentering is the system's (hold the Meta button); LOCAL space follows it.
-- Not yet: user-adjustable layout (distance, size, arrangement).
+- Layout (#133): the left thumbstick moves the screens closer/farther
+  (1.0–3.5 m) and resizes them (0.8–3.5 m wide); the right stick scrolls.
+  Remembered in the app's files dir. Placement and hit-testing share one
+  `Layout` value, so the pointer always lands where the screens are drawn.
 - Verification gap: compositor stats prove the layers are composited, but an
   idle headset captures black, so the image itself still needs to be checked
   by someone wearing it.
