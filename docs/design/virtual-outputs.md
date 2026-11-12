@@ -1,6 +1,7 @@
 # Virtual outputs: niri, sway, hyprland
 
-Status: design (M3 input) · Issue: #76
+Status: implemented for sway/hyprland (#112) and multi-output streaming (#109);
+niri via EDID override / dummy plug · Issue: #76
 
 M3 wants monitors that exist only in the headset. A compositor only lays out
 windows on outputs it knows about, so a "virtual monitor" has to be an output
@@ -58,3 +59,14 @@ the compositor believes in — or we stream something other than an output.
 - A compositor adapter trait (`create_virtual`, `remove_virtual`) with
   sway/hyprland implementations and a niri implementation that reports
   "unsupported" with a pointer to this document.
+
+## Implemented (2026-11-12)
+
+- `emersia start A B …` streams up to four outputs at once (frame header
+  byte 3 = stream id); the Quest client opens one panel per stream (#109).
+- Every stream engine re-reads the Wayland registry once a second, so outputs
+  created later are streamable (hot plug).
+- `emersia virtual add [WxH] | remove NAME | list` drives sway/hyprland IPC
+  from the user's session; on niri it prints the options above.
+- CI (headless sway) creates a virtual output while the daemon runs and
+  streams it alongside another output, decode-verifying both.
