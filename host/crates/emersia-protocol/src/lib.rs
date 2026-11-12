@@ -107,6 +107,10 @@ pub struct StartArgs {
     /// Optional target frames per second.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fps: Option<u32>,
+    /// More outputs to stream at the same time, as streams 1, 2, … (each a
+    /// separate headset panel). `output` stays stream 0.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +270,7 @@ mod tests {
             command: Command::Start(StartArgs {
                 output: Some("DP-3".into()),
                 fps: Some(60),
+                also: Vec::new(),
             }),
         };
         let line = encode_request(&req).unwrap();

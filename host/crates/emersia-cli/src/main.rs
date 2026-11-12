@@ -445,14 +445,11 @@ fn build_command(
     match name {
         "screens" => Ok(Command::Screens),
         "start" => {
-            if positionals.len() > 1 {
-                return Err(Failure::Usage(
-                    "'start' takes at most one output name".into(),
-                ));
-            }
+            // `start A B C`: A is the primary stream, B and C extra panels.
             Ok(Command::Start(StartArgs {
                 output: positionals.first().cloned(),
                 fps,
+                also: positionals.iter().skip(1).cloned().collect(),
             }))
         }
         "pair" => {
@@ -527,7 +524,7 @@ fn print_help() {
     println!("Commands:");
     println!("  status                 daemon and stream state");
     println!("  screens                list capturable outputs/windows");
-    println!("  start [OUTPUT]         begin capture streaming");
+    println!("  start [OUTPUT…]        begin streaming; extra outputs become extra panels");
     println!("  stop                   end capture streaming");
     println!("  events                 current state snapshot (follow-mode later)");
     println!(
@@ -686,7 +683,17 @@ mod tests {
         assert!(bad(&["status", "extra-arg"]));
         assert!(bad(&["pair"]));
         assert!(bad(&["revoke"]));
-        assert!(bad(&["start", "a", "b"]));
+    }
+
+    #[test]
+    fn start_with_several_outputs_streams_them_all() {
+        match parsed(&["start", "DP-3", "HDMI-A-1"]).command {
+            Command::Start(a) => {
+                assert_eq!(a.output.as_deref(), Some("DP-3"));
+                assert_eq!(a.also, vec!["HDMI-A-1".to_string()]);
+            }
+            other => panic!("expected start, got {other:?}"),
+        }
     }
 
     #[test]

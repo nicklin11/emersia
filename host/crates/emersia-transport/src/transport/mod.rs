@@ -76,6 +76,9 @@ pub const FRAME_HEADER_LEN: usize = 24;
 /// MTU, so a frame fragment is never fragmented by the IP layer.
 pub const RECORD_MTU: usize = 1200;
 
+/// Most simultaneous streams (captured outputs) per device.
+pub const MAX_STREAMS: u8 = 4;
+
 // An audio chunk must fit one record: audio is never fragmented.
 const _: () = assert!(control::AUDIO_CHUNK_BYTES <= RECORD_MTU - FRAME_HEADER_LEN);
 
@@ -90,6 +93,10 @@ pub struct FrameHeader {
     pub keyframe: bool,
     /// Codec/payload type, assigned by the encoder stage.
     pub payload_type: u8,
+    /// Which stream (captured output) this record belongs to; 0 is the
+    /// primary stream. Byte 3, formerly reserved and always 0, so
+    /// single-stream peers interoperate unchanged.
+    pub stream: u8,
     /// Monotonic per-*record* sequence; also the AEAD associated data and the
     /// value the replay window checks. Every datagram has its own.
     pub sequence: u32,
@@ -114,7 +121,7 @@ impl FrameHeader {
         out[0] = self.version;
         out[1] = u8::from(self.keyframe);
         out[2] = self.payload_type;
-        out[3] = 0; // reserved
+        out[3] = self.stream;
         out[4..8].copy_from_slice(&self.sequence.to_be_bytes());
         out[8..12].copy_from_slice(&self.frame_sequence.to_be_bytes());
         out[12..16].copy_from_slice(&self.timestamp.to_be_bytes());
@@ -146,6 +153,7 @@ impl FrameHeader {
             version,
             keyframe: bytes[1] & 0x01 != 0,
             payload_type: bytes[2],
+            stream: bytes[3],
             sequence: u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
             frame_sequence: u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
             timestamp: u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
@@ -174,6 +182,7 @@ pub fn build_record(
         version: 1,
         keyframe,
         payload_type,
+        stream: 0,
         sequence,
         frame_sequence,
         timestamp,
@@ -454,6 +463,7 @@ mod tests {
             version: 1,
             keyframe: true,
             payload_type: Codec::H264.payload_type(),
+            stream: 3,
             sequence: 0xdead_beef,
             frame_sequence: 0x0bad_f00d,
             timestamp: 123_456,
@@ -499,6 +509,7 @@ mod tests {
                     version: 1,
                     keyframe: true,
                     payload_type: Codec::H264.payload_type(),
+                    stream: 0,
                     sequence: index as u32,
                     frame_sequence: 7,
                     timestamp: 90_000,

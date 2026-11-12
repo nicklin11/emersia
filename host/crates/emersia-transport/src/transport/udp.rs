@@ -356,6 +356,19 @@ impl HostEndpoint {
         payload_type: u8,
         payload: &[u8],
     ) -> Result<usize, TransportError> {
+        self.send_frame_on(0, device_id, timestamp, keyframe, payload_type, payload)
+    }
+
+    /// [`send_frame`](Self::send_frame) on a given stream (captured output).
+    pub fn send_frame_on(
+        &mut self,
+        stream: u8,
+        device_id: &[u8; DEVICE_ID_LEN],
+        timestamp: u32,
+        keyframe: bool,
+        payload_type: u8,
+        payload: &[u8],
+    ) -> Result<usize, TransportError> {
         let peer = self
             .peers
             .get_mut(device_id)
@@ -370,7 +383,7 @@ impl HostEndpoint {
         for (index, chunk) in chunks.iter().enumerate() {
             let record_sequence = peer.next_sequence;
             peer.next_sequence = peer.next_sequence.wrapping_add(1);
-            let record = build_record(
+            let mut record = build_record(
                 record_sequence,
                 frame_sequence,
                 timestamp,
@@ -380,7 +393,8 @@ impl HostEndpoint {
                 index as u16,
                 frag_count,
             )?;
-            // Single definition of the wire layout: type || seq || nonce || ct.
+            record[3] = stream; // FrameHeader::stream
+                                // Single definition of the wire layout: type || seq || nonce || ct.
             let packet = seal_packet(
                 &peer.session,
                 crate::crypto::Direction::HostToDevice,

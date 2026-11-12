@@ -232,9 +232,9 @@ impl Injector {
         Ok(())
     }
 
-    /// Inject a batch. `layout` is `(streamed output, global bounds)`; pointer
-    /// motion is dropped without it.
-    pub fn apply(&mut self, events: &[InputEvent], layout: Option<(Rect, Rect)>) {
+    /// Inject a batch. `layout(stream)` is `(that stream's output, global
+    /// bounds)`; pointer motion on a stream without a layout is dropped.
+    pub fn apply(&mut self, events: &[InputEvent], layout: impl Fn(u8) -> Option<(Rect, Rect)>) {
         if self.failed {
             return;
         }
@@ -248,8 +248,12 @@ impl Injector {
         let mut keys = Vec::new();
         for event in events {
             match *event {
-                InputEvent::Pointer { x, y } => {
-                    if let Some((output, bounds)) = layout {
+                InputEvent::Pointer { x, y } | InputEvent::PointerOn { x, y, .. } => {
+                    let stream = match *event {
+                        InputEvent::PointerOn { stream, .. } => stream,
+                        _ => 0,
+                    };
+                    if let Some((output, bounds)) = layout(stream) {
                         let (ax, ay) = map_pointer(x, y, output, bounds);
                         pointer.push((EV_ABS, ABS_X, ax));
                         pointer.push((EV_ABS, ABS_Y, ay));
