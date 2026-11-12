@@ -88,19 +88,38 @@ code=$(ctl pair new --json | python3 -c 'import json,sys; print(json.load(sys.st
 device=$(ctl pair accept "$code" --name qa --public-key "$pub" --json \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["device"])')
 host_key=$(ctl status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["host_public_key"])')
-ctl --fps 30 start HEADLESS-2 >/dev/null
+step "creating a virtual output with 'emersia virtual add' while the daemon runs"
+virt=$("$bin/emersia" virtual add 1280x720) || fail "emersia virtual add failed"
+echo "created $virt"
+# The daemon re-reads outputs once a second (hot plug).
+for _ in $(seq 50); do
+  ctl screens --json | grep -q "\"$virt\"" && break
+  sleep 0.1
+done
+ctl screens --json | grep -q "\"$virt\"" || fail "daemon did not pick up $virt"
+
+step "streaming HEADLESS-2 and $virt at once (two streams)"
+ctl --fps 30 start HEADLESS-2 "$virt" >/dev/null
 
 # Capture is damage-driven: keep the output changing while we receive.
-(for i in $(seq 200); do
-   swaymsg "output HEADLESS-2 bg #$(printf '%02x%02x%02x' $((i * 7 % 256)) 80 $((255 - i * 7 % 256))) solid_color" >/dev/null 2>&1 || exit 0
+(for i in $(seq 400); do
+   c=$(printf '%02x%02x%02x' $((i * 7 % 256)) 80 $((255 - i * 7 % 256)))
+   swaymsg "output HEADLESS-2 bg #$c solid_color" >/dev/null 2>&1 || exit 0
+   swaymsg "output $virt bg #$c solid_color" >/dev/null 2>&1 || exit 0
    sleep 0.05
  done) &
 pids+=($!)
 
-"$bin/emersia-daemon" receive --server "127.0.0.1:$port" --device-id "$device" \
-  --host-key "$host_key" --private-key "$priv" --frames "$frames" --timeout 10 \
-  | tee "$work/receive.log" || fail "receiver failed"
-grep -q "^decoded:" "$work/receive.log" || fail "stream did not decode"
+for stream in 0 1; do
+  "$bin/emersia-daemon" receive --server "127.0.0.1:$port" --device-id "$device" \
+    --host-key "$host_key" --private-key "$priv" --frames "$frames" --timeout 10 \
+    --stream "$stream" | tee "$work/receive-$stream.log" || fail "receiver failed (stream $stream)"
+  grep -q "^decoded:" "$work/receive-$stream.log" || fail "stream $stream did not decode"
+done
+
+step "removing $virt"
+"$bin/emersia" virtual remove "$virt" || fail "emersia virtual remove failed"
+! "$bin/emersia" virtual list | grep -qx "$virt" || fail "$virt still listed"
 backend=$(grep -oP 'capture backend: \K.*' "$work/daemon.log")
 encoder_used=$(ctl status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["encoder"])')
-echo "qa-sway: PASS — $(swaymsg -t get_version | python3 -c 'import json,sys; print(json.load(sys.stdin)["human_readable"])'), backend $backend, encoder $encoder_used"
+echo "qa-sway: PASS (2 streams incl. virtual output $virt) — $(swaymsg -t get_version | python3 -c 'import json,sys; print(json.load(sys.stdin)["human_readable"])'), backend $backend, encoder $encoder_used"

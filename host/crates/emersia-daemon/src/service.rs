@@ -45,6 +45,8 @@ const DEFAULT_FPS: u32 = 30;
 
 /// Engine idle tick — how often a stopped engine checks for new commands.
 const IDLE_TICK: Duration = Duration::from_millis(20);
+/// How often the output list is re-read for hot-plugged/virtual outputs.
+const OUTPUT_REFRESH: Duration = Duration::from_secs(1);
 
 /// Rolling window used for the session-scoped capture-rate telemetry.
 const CAPTURE_RATE_WINDOW: Duration = Duration::from_secs(2);
@@ -1147,6 +1149,32 @@ impl Engine {
         })
     }
 
+    /// Pick up outputs added or removed since discovery (a monitor plugged
+    /// in, a virtual output created with `emersia virtual add`). Two
+    /// roundtrips: registry globals, then their name/mode (and geometry).
+    /// Returns whether the set of outputs changed.
+    pub fn refresh_outputs(&mut self) -> anyhow::Result<bool> {
+        let before = self.state.output_labels();
+        self.queue
+            .roundtrip(&mut self.state)
+            .context("refreshing Wayland globals")?;
+        self.queue
+            .roundtrip(&mut self.state)
+            .context("reading new output descriptions")?;
+        let qh = self.queue.handle();
+        if self.state.request_missing_geometry(&qh) {
+            self.queue
+                .roundtrip(&mut self.state)
+                .context("reading new output layout")?;
+        }
+        let after = self.state.output_labels();
+        if after != before {
+            self.screens = screen_infos(&self.state);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Select a named output from the live discovery state.
     pub fn set_output(&mut self, name: &str) -> anyhow::Result<()> {
         let labels = self.state.output_labels();
@@ -1236,6 +1264,7 @@ pub fn run_stream(mut engine: Engine, service: Arc<Service>, stream: u8) {
     let mut last_peers = 0usize;
     let mut applied_output: Option<String> = None;
     let mut last_forced_keyframe = Instant::now();
+    let mut last_refresh = Instant::now();
 
     while !service.is_shutting_down() && !crate::signal_received() {
         // Receiving (handshakes, revocation, device messages) runs on the
@@ -1269,6 +1298,22 @@ pub fn run_stream(mut engine: Engine, service: Arc<Service>, stream: u8) {
             }
         }
 
+        // Hot plug: re-read the output list once a second. Stream 0 publishes
+        // it (so `start` can validate new names); every stream refreshes its
+        // own connection so it can select an output created after startup.
+        if last_refresh.elapsed() >= OUTPUT_REFRESH {
+            last_refresh = Instant::now();
+            match engine.refresh_outputs() {
+                Ok(true) => {
+                    view.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
+                    view.set_input_layout(engine.input_layout());
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    let _ = engine.latch_protocol_failure(&e);
+                }
+            }
+        }
         if !view.is_streaming() {
             std::thread::sleep(IDLE_TICK);
             last_frame = Instant::now();

@@ -4,6 +4,8 @@
 //! control socket described in `docs/design/control-api.md`. Every command maps
 //! 1:1 to a daemon command; the daemon owns all policy, this is a thin client.
 
+mod virtual_outputs;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
@@ -83,7 +85,45 @@ fn simple_command(name: &str) -> Option<Command> {
     })
 }
 
+/// `emersia virtual add [WxH] | remove NAME | list` — compositor IPC, no daemon.
+fn run_virtual(args: &[String]) -> Result<(), Failure> {
+    use virtual_outputs as vo;
+    let compositor = vo::detect(|k| std::env::var(k).ok());
+    match args.first().map(String::as_str) {
+        Some("add") => {
+            let size = match args.get(1) {
+                Some(s) => vo::parse_size(s).ok_or_else(|| {
+                    Failure::Usage(format!("size must be WIDTHxHEIGHT, got {s:?}"))
+                })?,
+                None => (1920, 1080),
+            };
+            let name = vo::add(compositor, size).map_err(Failure::Runtime)?;
+            println!("{name}");
+            eprintln!("virtual output {name} ({}x{}) created; stream it with: emersia start <main output> {name}", size.0, size.1);
+            Ok(())
+        }
+        Some("remove") => {
+            let name = args
+                .get(1)
+                .ok_or_else(|| Failure::Usage("'virtual remove' needs an output name".into()))?;
+            vo::remove(compositor, name).map_err(Failure::Runtime)
+        }
+        Some("list") => {
+            for name in vo::list(compositor).map_err(Failure::Runtime)? {
+                println!("{name}");
+            }
+            Ok(())
+        }
+        other => Err(Failure::Usage(format!(
+            "'virtual' needs add [WxH], remove NAME or list (got {other:?})"
+        ))),
+    }
+}
+
 fn run(args: &[String]) -> Result<(), Failure> {
+    if args.get(1).map(String::as_str) == Some("virtual") {
+        return run_virtual(&args[2..]);
+    }
     let invocation = parse_args(args)?;
     let Some(invocation) = invocation else {
         return Ok(());
@@ -529,6 +569,9 @@ fn print_help() {
     println!("  events                 current state snapshot (follow-mode later)");
     println!(
         "  pair headset             pair a headset from inside it (compare a code)
+  virtual add [WxH]        create a headset-only monitor (sway, hyprland)
+  virtual remove NAME      remove it
+  virtual list             list virtual outputs
   pair new                 mint a short-lived pairing code"
     );
     println!("  pair accept CODE --name N --public-key HEX");
