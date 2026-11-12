@@ -76,8 +76,11 @@ pub const FRAME_HEADER_LEN: usize = 24;
 /// MTU, so a frame fragment is never fragmented by the IP layer.
 pub const RECORD_MTU: usize = 1200;
 
-/// Most simultaneous streams (captured outputs) per device.
-pub const MAX_STREAMS: u8 = 4;
+/// Most simultaneous streams (captured outputs) per device. The header has
+/// a whole byte for the stream id; 8 keeps per-stream state small while
+/// covering a 5+ monitor workspace (M3). Actual capacity is bounded by the
+/// host encoder and the headset decoder, not by this number.
+pub const MAX_STREAMS: u8 = 8;
 
 // An audio chunk must fit one record: audio is never fragmented.
 const _: () = assert!(control::AUDIO_CHUNK_BYTES <= RECORD_MTU - FRAME_HEADER_LEN);

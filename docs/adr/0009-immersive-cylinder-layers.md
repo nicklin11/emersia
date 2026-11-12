@@ -52,6 +52,10 @@ Native OpenXR (Khronos loader 1.1.65, bundled and hash-pinned), no engine:
   (1.0–3.5 m) and resizes them (0.8–3.5 m wide); the right stick scrolls.
   Remembered in the app's files dir. Placement and hit-testing share one
   `Layout` value, so the pointer always lands where the screens are drawn.
+- Many screens (#142): up to 8 streams. A row holds as many screens as fit
+  in ~230° (4 at the default size); more stack into balanced rows centred at
+  eye level (5 → 3 + 2, 8 → 4 + 4). Resizing reflows them; placement and
+  hit-testing still share `Layout::place`.
 - Verification gap: compositor stats prove the layers are composited, but an
   idle headset captures black, so the image itself still needs to be checked
   by someone wearing it.
