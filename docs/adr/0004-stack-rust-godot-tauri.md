@@ -1,6 +1,6 @@
 # ADR 0004: Stack — Rust host, Godot 4 client, Tauri GUI, GPL-3.0
 
-- Status: accepted
+- Status: accepted (Quest client row superseded by ADR 0009)
 - Date: 2026-09-23
 
 ## Context

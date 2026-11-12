@@ -31,6 +31,12 @@ final class NativeBridge {
     /** The panel's surface is going away; returns once the decoder released it. */
     static native void nativeDetach(long handle, int stream);
 
+    /** Starts immersive mode (OpenXR cylinder screens) on {@code session}; returns a handle. */
+    static native long nativeImmersiveStart(long session, android.app.Activity activity);
+
+    /** Ends immersive mode; returns once the OpenXR session is gone. */
+    static native void nativeImmersiveStop(long immersive);
+
     /** Bitmask of stream ids the host has sent. */
     static native int nativeStreams(long handle);
 

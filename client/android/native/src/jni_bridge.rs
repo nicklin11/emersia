@@ -114,13 +114,20 @@ pub extern "system" fn Java_org_emersia_client_NativeBridge_nativeStart(
             return 0;
         }
     };
-    // SAFETY: env and surface are valid for the duration of this JNI call;
-    // ANativeWindow_fromSurface takes its own reference.
-    let window =
-        unsafe { NativeWindow::from_surface(env.get_raw().cast(), surface.as_raw().cast()) };
-    let Some(window) = window else {
-        log::error!("nativeStart: surface has no native window");
-        return 0;
+    // A null surface starts the session headless: immersive mode attaches
+    // its OpenXR surfaces per stream instead of a panel's.
+    let window = if surface.as_raw().is_null() {
+        None
+    } else {
+        // SAFETY: env and surface are valid for the duration of this JNI call;
+        // ANativeWindow_fromSurface takes its own reference.
+        let window =
+            unsafe { NativeWindow::from_surface(env.get_raw().cast(), surface.as_raw().cast()) };
+        if window.is_none() {
+            log::error!("nativeStart: surface has no native window");
+            return 0;
+        }
+        window
     };
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -128,10 +135,12 @@ pub extern "system" fn Java_org_emersia_client_NativeBridge_nativeStart(
     let (input_tx, input_rx) = std::sync::mpsc::channel();
     let decoders: crate::decoder::Decoders = Default::default();
     let idr_wanted = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    decoders
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(0, SurfaceDecoder::new(window, stats.clone()));
+    if let Some(window) = window {
+        decoders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(0, SurfaceDecoder::new(window, stats.clone()));
+    }
     let config = Config {
         server: server.clone(),
         host_key,
@@ -544,5 +553,85 @@ pub extern "system" fn Java_org_emersia_client_NativeBridge_nativePointerOn(
                 y: unit(y),
             },
         );
+    }
+}
+
+struct Immersive {
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+    _activity: jni::objects::GlobalRef,
+}
+
+/// `long nativeImmersiveStart(long session, Activity activity)` — curved
+/// screens in an OpenXR scene for every stream of `session` (ADR 0009).
+#[no_mangle]
+pub extern "system" fn Java_org_emersia_client_NativeBridge_nativeImmersiveStart(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    activity: JObject,
+) -> jlong {
+    init_logging();
+    if handle == 0 {
+        return 0;
+    }
+    // SAFETY: as in nativeStatus.
+    let running = unsafe { &*(handle as *const Running) };
+    let (Ok(vm), Ok(activity)) = (env.get_java_vm(), env.new_global_ref(activity)) else {
+        return 0;
+    };
+    let shared = crate::immersive::Shared {
+        decoders: running.decoders.clone(),
+        idr_wanted: running.idr_wanted.clone(),
+        stats: running.stats.clone(),
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let vm_ptr = vm.get_java_vm_pointer() as usize;
+    let activity_ptr = activity.as_obj().as_raw() as usize;
+    let worker = {
+        let stop = stop.clone();
+        std::thread::Builder::new()
+            .name("emersia-xr".into())
+            .spawn(move || {
+                boost_current_thread();
+                // SAFETY: the VM outlives the process; the activity is held
+                // by a global reference in `Immersive` until this thread ends.
+                let result = unsafe {
+                    crate::immersive::run(
+                        vm_ptr as *mut std::ffi::c_void,
+                        activity_ptr as *mut std::ffi::c_void,
+                        &shared,
+                        &stop,
+                    )
+                };
+                match result {
+                    Ok(()) => log::info!("immersive session ended"),
+                    Err(e) => log::error!("immersive mode failed: {e}"),
+                }
+            })
+            .ok()
+    };
+    Box::into_raw(Box::new(Immersive {
+        stop,
+        worker,
+        _activity: activity,
+    })) as jlong
+}
+
+/// `void nativeImmersiveStop(long immersive)`.
+#[no_mangle]
+pub extern "system" fn Java_org_emersia_client_NativeBridge_nativeImmersiveStop(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: from Box::into_raw in nativeImmersiveStart; freed once.
+    let mut immersive = unsafe { Box::from_raw(handle as *mut Immersive) };
+    immersive.stop.store(true, Ordering::Relaxed);
+    if let Some(w) = immersive.worker.take() {
+        let _ = w.join();
     }
 }

@@ -138,6 +138,16 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         video.setOnGenericMotionListener((v, e) -> input.onGenericMotion(e));
         status.setFocusable(false);
 
+        Button immersiveButton = new Button(this);
+        immersiveButton.setText("Immersive");
+        immersiveButton.setAllCaps(false);
+        immersiveButton.setOnClickListener(v -> {
+            stop(); // the immersive activity runs its own session
+            startActivity(new Intent(this, ImmersiveActivity.class)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        });
+        root.addView(immersiveButton, new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.END));
+
         pairButton = new Button(this);
         pairButton.setText("Pair with a PC");
         pairButton.setAllCaps(false);
