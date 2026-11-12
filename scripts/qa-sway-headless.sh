@@ -108,7 +108,8 @@ ctl --fps 30 start HEADLESS-2 "$virt" >/dev/null
    swaymsg "output $virt bg #$c solid_color" >/dev/null 2>&1 || exit 0
    sleep 0.05
  done) &
-pids+=($!)
+damage_pid=$!
+pids+=($damage_pid)
 
 for stream in 0 1; do
   timeout 90 "$bin/emersia-daemon" receive --server "127.0.0.1:$port" --device-id "$device" \
@@ -118,8 +119,11 @@ for stream in 0 1; do
 done
 
 step "removing $virt"
-# Stop capturing it first: older sway (1.9) stops answering IPC when an
-# output is unplugged mid-capture.
+# Quiesce first: stop the background-colour loop (each `bg` spawns a
+# swaybg client; one left on an unplugged output spins and starves sway's
+# IPC — seen on sway 1.11) and stop capturing the output.
+kill "$damage_pid" 2>/dev/null || true
+wait "$damage_pid" 2>/dev/null || true
 ctl stop >/dev/null
 sleep 1
 "$bin/emersia" virtual remove "$virt" || fail "emersia virtual remove failed"
