@@ -24,6 +24,7 @@ mod pixels;
 mod receiver;
 mod service;
 mod shm;
+mod zerocopy;
 
 use emersia_transport::pairing as transport_pairing;
 use emersia_transport::{codec, crypto, input, transport};
@@ -80,6 +81,8 @@ struct ServeOpts {
     notify: bool,
     /// Video codec.
     codec: codec::Codec,
+    /// Try the zero-copy path (dmabuf capture + in-process VAAPI encode).
+    zero_copy: bool,
 }
 
 fn main() {
@@ -159,6 +162,7 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
     let mut cursor = true;
     let mut audio = true;
     let mut notify = true;
+    let mut zero_copy = true;
     let mut video_codec = codec::Codec::H264;
     let mut encoder_choice = encoder::EncoderChoice::Auto;
     let mut bitrate = encoder::EncoderConfig::default().bitrate;
@@ -227,6 +231,7 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
             "--no-cursor" => cursor = false,
             "--no-audio" => audio = false,
             "--no-notify" => notify = false,
+            "--no-zero-copy" => zero_copy = false,
             "--codec" => {
                 let value = rest
                     .next()
@@ -259,6 +264,7 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
             audio,
             notify,
             codec: video_codec,
+            zero_copy,
         }),
         "receive" => Mode::Receive,
         _ => Mode::Capture(CaptureOpts {
@@ -298,6 +304,7 @@ fn print_help() {
     println!("  --no-audio           do not stream desktop audio");
     println!("  --no-notify          no desktop notification when a headset connects");
     println!("  --codec CODEC        h264 (default) | hevc — sharper per bit, HW-decoded on Quest");
+    println!("  --no-zero-copy       always use the shm + ffmpeg pipeline (no GPU-buffer capture)");
     println!("  --encoder NAME       auto | vaapi | nvenc | amf | qsv | sw (default: auto)");
     println!("  --bitrate RATE       target bitrate, e.g. 30M or 8000k (default: 30M)");
     println!(
@@ -316,6 +323,20 @@ fn print_help() {
 
 fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
     install_signal_handlers();
+    // In-process VAAPI (zero-copy path) reads LIBVA_DRIVER_NAME from our own
+    // environment: correct a mismatched one now, before any thread exists.
+    let node = encoder::render_node();
+    let current = std::env::var("LIBVA_DRIVER_NAME").ok();
+    if let Some(driver) =
+        encoder::vaapi_driver_override(encoder::render_node_vendor(&node), current.as_deref())
+    {
+        eprintln!(
+            "emersia-daemon: LIBVA_DRIVER_NAME={} cannot drive {node}; using {driver}",
+            current.as_deref().unwrap_or("")
+        );
+        // SAFETY: single-threaded at this point (signal handlers only).
+        unsafe { std::env::set_var("LIBVA_DRIVER_NAME", driver) };
+    }
 
     let socket_path = match &opts.socket {
         Some(p) => p.clone(),
@@ -347,7 +368,8 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
         .with_stream_port(opts.stream_port, host_identity.into_identity())?
         .with_encoder(opts.encoder, Some(opts.bitrate))
         .with_codec(opts.codec)
-        .with_cursor(opts.cursor);
+        .with_cursor(opts.cursor)
+        .with_zero_copy(opts.zero_copy);
     println!(
         "encoder: {:?}, target {:.1} Mbit/s",
         opts.encoder,
@@ -411,7 +433,8 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
                 .with_shared_transport(Arc::clone(endpoint))
                 .with_encoder(opts.encoder, Some(opts.bitrate))
                 .with_codec(opts.codec)
-                .with_cursor(opts.cursor);
+                .with_cursor(opts.cursor)
+                .with_zero_copy(opts.zero_copy);
             let svc = Arc::clone(&svc);
             stream_threads.push(
                 std::thread::Builder::new()

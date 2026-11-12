@@ -1369,15 +1369,23 @@ pub(crate) fn vaapi_driver_override(
 }
 
 /// PCI vendor of a DRM render node, from sysfs.
-fn render_node_vendor(device: &str) -> Option<u16> {
+pub(crate) fn render_node_vendor(device: &str) -> Option<u16> {
     let name = std::path::Path::new(device).file_name()?.to_str()?;
     let raw = std::fs::read_to_string(format!("/sys/class/drm/{name}/device/vendor")).ok()?;
     u16::from_str_radix(raw.trim().trim_start_matches("0x"), 16).ok()
 }
 
+/// The render node to use: `EMERSIA_VAAPI_DEVICE`, else the first one.
+pub(crate) fn render_node() -> String {
+    std::env::var("EMERSIA_VAAPI_DEVICE")
+        .ok()
+        .or_else(first_render_node)
+        .unwrap_or_else(|| "/dev/dri/renderD128".to_string())
+}
+
 /// The lowest-numbered render node, so a box whose only GPU is not
 /// `renderD128` still works without configuration.
-fn first_render_node() -> Option<String> {
+pub(crate) fn first_render_node() -> Option<String> {
     let mut nodes: Vec<String> = std::fs::read_dir("/dev/dri")
         .ok()?
         .filter_map(|e| e.ok()?.file_name().into_string().ok())

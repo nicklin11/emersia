@@ -70,3 +70,7 @@ resizable, passthrough-aware panel.
   **≈ 16 ms capture → decoded**; host capture work 14 → 5.7 ms per frame.
   The engine had been shipping every unit one loop iteration late (≈ 16 ms);
   the encoder itself returns a desktop frame in ≈ 7 ms.
+- Zero-copy host path (#35, #138: dmabuf screencopy + in-process VAAPI):
+  **capture → received 4.6 ms**, decode ~5 ms, **≈ 10 ms capture → decoded**
+  at 60 fps on the Quest 2; host CPU for two 1080p60 streams ~36 % → 2.8 % of
+  one core.

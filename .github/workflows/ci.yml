@@ -36,7 +36,11 @@ jobs:
       - name: Install ffmpeg (encoder under test)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          # ffmpeg CLI (classic encoder path) + libav*/GBM headers and libclang
+          # for the in-process zero-copy encoder (#35).
+          sudo apt-get install -y --no-install-recommends ffmpeg pkg-config clang \
+            libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libavdevice-dev \
+            libswscale-dev libswresample-dev libgbm-dev
           ffmpeg -version | head -1
       - name: rustfmt
         if: hashFiles('host/Cargo.toml') != ''
@@ -92,7 +96,9 @@ jobs:
       - name: Install sway and ffmpeg
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends sway ffmpeg
+          sudo apt-get install -y --no-install-recommends sway ffmpeg pkg-config clang \
+            libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libavdevice-dev \
+            libswscale-dev libswresample-dev libgbm-dev
           sway --version
       - name: Build
         run: cargo build --release --manifest-path host/Cargo.toml
