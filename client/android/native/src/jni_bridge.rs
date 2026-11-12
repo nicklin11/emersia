@@ -135,11 +135,19 @@ pub extern "system" fn Java_org_emersia_client_NativeBridge_nativeStart(
             .spawn(move || {
                 boost_current_thread();
                 let mut decoder = SurfaceDecoder::new(window, stats.clone());
-                session::run(
+                // Presence announcements arrive on the discovery port; if it
+                // is busy (pairing running), simply do not follow.
+                let discovery = std::net::UdpSocket::bind((
+                    "0.0.0.0",
+                    emersia_transport::pairing::DISCOVERY_PORT,
+                ))
+                .ok();
+                session::run_following(
                     &config,
                     &identity,
                     &mut decoder,
                     Some(&input_rx),
+                    discovery.as_ref(),
                     &stop,
                     &stats,
                 );
@@ -408,4 +416,21 @@ pub extern "system" fn Java_org_emersia_client_NativeBridge_nativePairStop(
     if let Some(w) = pairing.worker.take() {
         let _ = w.join();
     }
+}
+
+/// `String nativeServer(long handle)` — the address in use, so the app can
+/// remember where the host moved to.
+#[no_mangle]
+pub extern "system" fn Java_org_emersia_client_NativeBridge_nativeServer(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    if handle == 0 {
+        return jstr(&mut env, "");
+    }
+    // SAFETY: as in nativeStatus.
+    let running = unsafe { &*(handle as *const Running) };
+    let server = running.stats.server();
+    jstr(&mut env, &server)
 }

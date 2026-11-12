@@ -20,6 +20,9 @@ use crate::transport_pairing as pairing;
 /// Read timeout: how quickly the thread notices shutdown and revocations when
 /// no datagram arrives.
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
+/// Presence announcement period (always, while the stream port is bound).
+const PRESENCE_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Beacon period while a pairing window is open.
 const BEACON_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -111,6 +114,9 @@ fn run(
         .map(|h| h.trim().to_string())
         .unwrap_or_else(|_| "emersia host".into());
     let mut last_beacon: Option<std::time::Instant> = None;
+    let mut last_presence: Option<std::time::Instant> = None;
+    let host_key =
+        crate::crypto::parse_public_key_hex(service.host_public_key()).unwrap_or([0; 32]);
     while !service.is_shutting_down() && !crate::signal_received() {
         let received = match socket.recv_from(&mut buf) {
             Ok(v) => Some(v),
@@ -155,6 +161,16 @@ fn run(
                 for addr in broadcast_addresses() {
                     let _ = socket.send_to(&beacon, (addr, pairing::DISCOVERY_PORT));
                 }
+            }
+        }
+        // Presence: key + port only (no hostname), so a paired headset can
+        // follow this host to a new address. Unauthenticated by design — the
+        // headset still runs the handshake against its pinned key.
+        if last_presence.is_none_or(|t| t.elapsed() >= PRESENCE_INTERVAL) {
+            last_presence = Some(std::time::Instant::now());
+            let packet = pairing::presence(&host_key, stream_port);
+            for addr in broadcast_addresses() {
+                let _ = socket.send_to(&packet, (addr, pairing::DISCOVERY_PORT));
             }
         }
 

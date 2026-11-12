@@ -33,6 +33,26 @@ pub mod packet {
     pub const NONCE: u8 = 0x22;
     pub const REVEAL: u8 = 0x23;
     pub const RESULT: u8 = 0x24;
+    /// Host → broadcast, always while streaming is possible: "this key is
+    /// here". Lets a paired headset follow the host to a new address.
+    pub const PRESENCE: u8 = 0x25;
+}
+
+/// Encode a presence announcement: `type, version, host_key, stream_port`.
+pub fn presence(host_key: &[u8; 32], stream_port: u16) -> Vec<u8> {
+    let mut out = vec![packet::PRESENCE, VERSION];
+    out.extend_from_slice(host_key);
+    out.extend_from_slice(&stream_port.to_be_bytes());
+    out
+}
+
+/// Decode a presence announcement into `(host_key, stream_port)`.
+pub fn parse_presence(bytes: &[u8]) -> Option<([u8; 32], u16)> {
+    if bytes.len() != 36 || bytes[0] != packet::PRESENCE || bytes[1] != VERSION {
+        return None;
+    }
+    let key: [u8; 32] = bytes[2..34].try_into().ok()?;
+    Some((key, u16::from_be_bytes([bytes[34], bytes[35]])))
 }
 
 /// UDP port devices listen on for beacons.
@@ -239,7 +259,7 @@ impl Message {
 
 /// Whether a datagram is a pairing packet (by its type byte).
 pub fn is_pairing_packet(packet: &[u8]) -> bool {
-    matches!(packet.first(), Some(0x20..=0x24))
+    matches!(packet.first(), Some(0x20..=0x25))
 }
 
 /// A device waiting for the host user's decision.
@@ -515,6 +535,18 @@ mod tests {
             assert_eq!(Message::decode(&wrong_version), None);
         }
         assert!(!is_pairing_packet(&[0x10]));
+    }
+
+    #[test]
+    fn presence_roundtrips_strictly() {
+        let p = presence(&[5; 32], 47800);
+        assert!(is_pairing_packet(&p));
+        assert_eq!(parse_presence(&p), Some(([5; 32], 47800)));
+        assert_eq!(parse_presence(&p[..35]), None);
+        let mut v = p.clone();
+        v[1] = 9;
+        assert_eq!(parse_presence(&v), None);
+        assert_eq!(Message::decode(&p), None, "not a pairing message");
     }
 
     #[test]

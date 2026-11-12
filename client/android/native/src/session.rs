@@ -91,6 +91,8 @@ pub struct Stats {
     pub rtt_us: AtomicU64,
     last_error: Mutex<Option<String>>,
     decoder: Mutex<Option<String>>,
+    /// The address currently in use (changes when the host moves).
+    server: Mutex<String>,
 }
 
 impl Stats {
@@ -117,6 +119,17 @@ impl Stats {
 
     pub fn set_decoder(&self, name: impl Into<String>) {
         *self.decoder.lock().unwrap_or_else(|p| p.into_inner()) = Some(name.into());
+    }
+
+    pub fn set_server(&self, server: &str) {
+        *self.server.lock().unwrap_or_else(|p| p.into_inner()) = server.to_string();
+    }
+
+    pub fn server(&self) -> String {
+        self.server
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     pub fn decoder(&self) -> Option<String> {
@@ -318,11 +331,50 @@ pub fn run(
     stop: &AtomicBool,
     stats: &Stats,
 ) {
+    run_following(config, identity, sink, input, None, stop, stats)
+}
+
+/// The newest presence announcement from `host_key` waiting on `discovery`,
+/// as the address to try. Older or foreign announcements are discarded.
+pub fn follow_presence(discovery: &std::net::UdpSocket, host_key: &[u8; 32]) -> Option<String> {
+    let mut buf = [0u8; 64];
+    let mut found = None;
+    while let Ok((n, from)) = discovery.recv_from(&mut buf) {
+        if let Some((key, port)) = emersia_transport::pairing::parse_presence(&buf[..n]) {
+            if &key == host_key {
+                found = Some(std::net::SocketAddr::new(from.ip(), port).to_string());
+            }
+        }
+    }
+    found
+}
+
+/// [`run`], plus: when the pinned address stops answering, follow the
+/// pinned host key's presence announcements (on `discovery`) to its new
+/// address. The handshake still authenticates against the pinned key, so a
+/// forged announcement cannot redirect the stream anywhere useful.
+pub fn run_following(
+    config: &Config,
+    identity: &DeviceIdentity,
+    sink: &mut dyn VideoSink,
+    input: Option<&Receiver<InputEvent>>,
+    discovery: Option<&std::net::UdpSocket>,
+    stop: &AtomicBool,
+    stats: &Stats,
+) {
     let device_id = device_id_bytes(&identity.public_key_hex());
     let mut backoff = BACKOFF_MIN;
+    let mut config = Config {
+        server: config.server.clone(),
+        host_key: config.host_key,
+    };
+    stats.set_server(&config.server);
+    if let Some(d) = discovery {
+        let _ = d.set_nonblocking(true);
+    }
     while !stop.load(Ordering::Relaxed) {
         stats.set_phase(Phase::Connecting);
-        match connect(config, device_id, identity, stats) {
+        match connect(&config, device_id, identity, stats) {
             Ok(client) => {
                 backoff = BACKOFF_MIN;
                 stats.sessions.fetch_add(1, Ordering::Relaxed);
@@ -337,6 +389,14 @@ pub fn run(
                 stats.set_error(err);
                 sleep_unless_stopped(backoff, stop);
                 backoff = (backoff * 2).min(BACKOFF_MAX);
+                if let Some(moved) = discovery.and_then(|d| follow_presence(d, &config.host_key)) {
+                    if moved != config.server {
+                        log::info!("host moved: {} -> {moved}", config.server);
+                        config.server = moved;
+                        stats.set_server(&config.server);
+                        backoff = BACKOFF_MIN;
+                    }
+                }
             }
         }
     }
@@ -806,6 +866,65 @@ mod tests {
         assert_eq!(requests[0].device_id, device_id);
         assert_eq!(stats.losses.load(Ordering::Relaxed), 0);
         assert_eq!(stats.phase(), Phase::Stopped);
+    }
+
+    /// The pinned address is dead; a presence announcement from the pinned
+    /// key leads the client to the host's new address.
+    #[test]
+    fn follows_the_pinned_host_to_a_new_address() {
+        let host_identity = DeviceIdentity::generate().unwrap();
+        let host_key = host_identity.public_key_bytes();
+        let mut host = HostEndpoint::bind("127.0.0.1:0", host_identity).unwrap();
+        let new_port = host.local_addr().unwrap().port();
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let discovery = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let discovery_addr = discovery.local_addr().unwrap();
+        let announcer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        // A foreign key's announcement must be ignored.
+        let _ = announcer.send_to(
+            &emersia_transport::pairing::presence(&[1; 32], 9),
+            discovery_addr,
+        );
+        announcer
+            .send_to(
+                &emersia_transport::pairing::presence(&host_key, new_port),
+                discovery_addr,
+            )
+            .unwrap();
+
+        let device = DeviceIdentity::generate().unwrap();
+        let device_pub = device.public_key_bytes();
+        let device_id = device_id_bytes(&device.public_key_hex());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Stats::default());
+        let worker = {
+            let (stop, stats) = (stop.clone(), stats.clone());
+            let server = dead.local_addr().unwrap().to_string();
+            std::thread::spawn(move || {
+                let config = Config { server, host_key };
+                run_following(
+                    &config,
+                    &device,
+                    &mut Recorder::default(),
+                    None,
+                    Some(&discovery),
+                    &stop,
+                    &stats,
+                );
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while host.peer_count() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "client never reached the moved host"
+            );
+            host.pump(16, |id, pk| id == &device_id && pk == &device_pub)
+                .unwrap();
+        }
+        assert_eq!(stats.server(), format!("127.0.0.1:{new_port}"));
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
     }
 
     #[test]
