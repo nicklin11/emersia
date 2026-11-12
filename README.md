@@ -40,10 +40,12 @@ the [project board](https://github.com/users/nicklin11/projects/4).
 
 ### Companion app
 
-`cd gui && cargo run --release` — a tray icon that turns red whenever your
+`scripts/install.sh --gui` (or `cd gui && cargo run --release`) — a tray icon that turns red whenever your
 screen is shared (tooltip: what, with how many headsets), plus a window with
 live status, Start/Stop, paired headsets with Revoke, and in-headset pairing
 with the 6-digit code. Closing the window keeps the tray indicator.
+`--gui` also adds a launcher entry and a login autostart that starts it in the
+tray (`~/.config/autostart/org.emersia.companion.desktop`; delete to opt out).
 
 ### Try it: mirror your screen to a Quest
 

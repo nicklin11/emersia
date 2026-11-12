@@ -206,6 +206,13 @@ fn main() {
                 })
                 .build(app)?;
 
+            // `--hidden` (session autostart): live in the tray only.
+            if std::env::args().any(|a| a == "--hidden") {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
+
             // Keep the tray truthful: poll the daemon and flip icon/tooltip.
             std::thread::spawn(move || {
                 let mut last: Option<(bool, String)> = None;
