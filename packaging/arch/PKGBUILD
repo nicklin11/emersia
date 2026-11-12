@@ -1,0 +1,81 @@
+# Maintainer: Emersia contributors <https://github.com/nicklin11/emersia>
+#
+# Split -git package: the host (daemon + CLI + systemd user unit) and the
+# companion app (tray sharing indicator). Build:  makepkg -si
+pkgbase=emersia-git
+pkgname=(emersia-git emersia-gui-git)
+pkgver=r0.0000000
+pkgrel=1
+pkgdesc="Free VR workspace for Meta Quest: stream Linux Wayland desktops as virtual monitors"
+arch=(x86_64)
+url="https://github.com/nicklin11/emersia"
+license=(GPL-3.0-or-later)
+makedepends=(git cargo webkit2gtk-4.1 libayatana-appindicator)
+source=("emersia::git+${url}.git")
+sha256sums=(SKIP)
+options=(!lto)
+
+pkgver() {
+  cd emersia
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd emersia
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --manifest-path host/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')"
+  cargo fetch --manifest-path gui/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd emersia
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --frozen --release --manifest-path host/Cargo.toml
+  cargo build --release --manifest-path gui/Cargo.toml
+}
+
+check() {
+  cd emersia
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  # Hardware/compositor-dependent tests are #[ignore]d; the rest run anywhere.
+  cargo test --frozen --release --manifest-path host/Cargo.toml
+}
+
+package_emersia-git() {
+  pkgdesc+=" (host daemon and CLI)"
+  depends=(ffmpeg gcc-libs glibc)
+  optdepends=('libva-mesa-driver: AMD/Intel hardware encoding'
+              'libnotify: desktop notification when a headset connects'
+              'emersia-gui-git: tray sharing indicator and pairing UI')
+  provides=(emersia)
+  conflicts=(emersia)
+  cd emersia
+  install -Dm755 target/release/emersia-daemon "$pkgdir/usr/bin/emersia-daemon"
+  install -Dm755 target/release/emersia "$pkgdir/usr/bin/emersia"
+  sed 's|%h/.local/bin/emersia-daemon|/usr/bin/emersia-daemon|' \
+    packaging/systemd/emersia-daemon.service \
+    | install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/emersia-daemon.service"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/emersia/README.md"
+  cp -r docs "$pkgdir/usr/share/doc/emersia/"
+}
+
+package_emersia-gui-git() {
+  pkgdesc+=" (companion app: tray sharing indicator, pairing)"
+  depends=(emersia webkit2gtk-4.1 libayatana-appindicator gtk3)
+  provides=(emersia-gui)
+  conflicts=(emersia-gui)
+  cd emersia
+  install -Dm755 target/release/emersia-gui "$pkgdir/usr/bin/emersia-gui"
+  install -Dm644 gui/icons/icon.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/emersia.png"
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/org.emersia.companion.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Emersia
+GenericName=VR desktop streaming
+Comment=Share your desktop with a VR headset; shows when it is shared
+Exec=emersia-gui
+Icon=emersia
+Categories=Network;RemoteAccess;
+Terminal=false
+DESKTOP
+}
