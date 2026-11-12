@@ -74,7 +74,7 @@ pub fn capture(
     let width = state.wlr.buffer_width;
     let height = state.wlr.buffer_height;
     let stride = state.wlr.buffer_stride;
-    let mut shm_buffer = ShmBuffer::create(&shm, &qh, width, height, stride, format)?;
+    let shm_buffer = ShmBuffer::create(&shm, &qh, width, height, stride, format)?;
 
     frame.copy(shm_buffer.buffer());
     let frame_wait_started = Instant::now();
@@ -94,14 +94,14 @@ pub fn capture(
     }
 
     let shm_read_started = Instant::now();
-    let data = shm_buffer.read_pixels(stride, height)?;
+    let data = shm_buffer.map_pixels(stride, height)?;
     let shm_read = shm_read_started.elapsed();
     let decode_started = Instant::now();
     let (mut pixels, pixel_format) = pack(format, width, height, stride, data)?;
     let decode = decode_started.elapsed();
     let transform_started = Instant::now();
     if y_invert {
-        pixels = flip_rows(&pixels, width, height);
+        pixels = flip_rows(&pixels, width, height).into();
     }
     let (pixels, out_w, out_h) = untransform(pixels, width, height, transform);
     let transform = transform_started.elapsed();

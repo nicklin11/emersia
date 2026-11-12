@@ -1,6 +1,5 @@
 //! Shared-memory capture buffers (`wl_shm`), used by both capture backends.
 
-use std::io::{Read as _, Seek as _, SeekFrom};
 use std::os::fd::AsFd as _;
 
 use anyhow::{bail, Context as _};
@@ -16,8 +15,8 @@ use crate::capture::State;
 /// A pixel buffer backed by an anonymous temp file and shared with the
 /// compositor through `wl_shm`.
 ///
-/// The compositor writes the captured frame into it; `read_pixels` copies the
-/// bytes back out for decoding.
+/// The compositor writes the captured frame into it; `map_pixels` maps the
+/// bytes read-only so frames reach the encoder without a CPU copy.
 pub struct ShmBuffer {
     file: std::fs::File,
     /// Kept so the pool object clearly outlives the buffer created from it.
@@ -76,17 +75,13 @@ impl ShmBuffer {
         &self.buffer
     }
 
-    /// Copy the compositor-written pixels out of the shared buffer.
-    pub fn read_pixels(&mut self, stride: u32, height: u32) -> anyhow::Result<Vec<u8>> {
-        let size = u64::from(stride) * u64::from(height);
-        let mut data = vec![0u8; size as usize];
-        self.file
-            .seek(SeekFrom::Start(0))
-            .context("failed to rewind the capture buffer")?;
-        self.file
-            .read_exact(&mut data)
-            .with_context(|| format!("failed to read {size} bytes back from the capture buffer"))?;
-        Ok(data)
+    /// The compositor-written pixels, mapped rather than copied out.
+    pub fn map_pixels(&self, stride: u32, height: u32) -> anyhow::Result<crate::pixels::Pixels> {
+        let size = usize::try_from(u64::from(stride) * u64::from(height))
+            .context("capture buffer too large")?;
+        let mapping = crate::pixels::Mapping::new(&self.file, size)
+            .context("failed to map the capture buffer")?;
+        Ok(crate::pixels::Pixels::Mapped(mapping))
     }
 }
 

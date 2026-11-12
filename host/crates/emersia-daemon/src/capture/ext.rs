@@ -75,7 +75,7 @@ pub fn capture(
     let width = state.ext.buffer_width;
     let height = state.ext.buffer_height;
     let stride = width.checked_mul(4).context("capture stride overflows")?;
-    let mut shm_buffer = ShmBuffer::create(&shm, &qh, width, height, stride, format)?;
+    let shm_buffer = ShmBuffer::create(&shm, &qh, width, height, stride, format)?;
 
     // 2. Ask for exactly one full-frame copy.
     let frame = session.create_frame(&qh, ());
@@ -108,7 +108,7 @@ pub fn capture(
 
     // 3. Read back as native packed pixels, upright.
     let shm_read_started = Instant::now();
-    let data = shm_buffer.read_pixels(stride, height)?;
+    let data = shm_buffer.map_pixels(stride, height)?;
     let shm_read = shm_read_started.elapsed();
     let decode_started = Instant::now();
     let (pixels, pixel_format) = pack(format, width, height, stride, data)?;
