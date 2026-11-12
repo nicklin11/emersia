@@ -33,7 +33,6 @@ pub struct SurfaceDecoder {
     window: NativeWindow,
     codec: Option<(Codec, MediaCodec)>,
     stats: Arc<crate::session::Stats>,
-    audio: crate::audio_out::AudioOut,
     /// When each queued unit (by pts) went in, to time the decoder.
     queued: std::collections::VecDeque<(u64, std::time::Instant)>,
 }
@@ -44,7 +43,6 @@ impl SurfaceDecoder {
             window,
             codec: None,
             stats,
-            audio: crate::audio_out::AudioOut::default(),
             queued: std::collections::VecDeque::new(),
         }
     }
@@ -136,6 +134,7 @@ impl SurfaceDecoder {
 impl VideoSink for SurfaceDecoder {
     fn submit(
         &mut self,
+        _stream: u8,
         kind: Codec,
         au: &[u8],
         pts_us: u64,
@@ -188,10 +187,6 @@ impl VideoSink for SurfaceDecoder {
         self.drain();
     }
 
-    fn audio(&mut self, pcm: &[u8]) {
-        self.audio.push(pcm);
-    }
-
     fn reset(&mut self) {
         // A new session restarts the stream at a keyframe; flushing drops
         // anything queued from the old one.
@@ -201,5 +196,68 @@ impl VideoSink for SurfaceDecoder {
                 self.codec = None;
             }
         }
+    }
+}
+
+// SAFETY: AMediaCodec and ANativeWindow may be used from any thread provided
+// calls are not concurrent. Every SurfaceDecoder lives inside `Decoders`, whose
+// mutex serialises all access: created on the UI thread (attach), fed and
+// drained on the stream thread, dropped on the UI thread (detach).
+unsafe impl Send for SurfaceDecoder {}
+
+/// Decoders by stream id, shared between the stream thread (which feeds
+/// them) and the UI thread (panels attach and detach surfaces). Detaching
+/// takes the lock, so a decoder is never used after its Surface goes away.
+pub type Decoders = Arc<std::sync::Mutex<std::collections::HashMap<u8, SurfaceDecoder>>>;
+
+/// The session's sink: routes each stream to its panel's decoder (frames of a
+/// stream without a panel are dropped) and audio to the speaker.
+pub struct MultiSink {
+    pub decoders: Decoders,
+    /// Bitmask of streams whose panel just attached and needs a keyframe.
+    pub idr_wanted: Arc<std::sync::atomic::AtomicU32>,
+    pub audio: crate::audio_out::AudioOut,
+}
+
+impl MultiSink {
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<u8, SurfaceDecoder>> {
+        self.decoders.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+impl VideoSink for MultiSink {
+    fn submit(
+        &mut self,
+        stream: u8,
+        codec: Codec,
+        au: &[u8],
+        pts_us: u64,
+        keyframe: bool,
+    ) -> Result<(), String> {
+        match self.lock().get_mut(&stream) {
+            Some(decoder) => decoder.submit(stream, codec, au, pts_us, keyframe),
+            None => Ok(()), // no panel for this stream (yet)
+        }
+    }
+
+    fn service(&mut self) {
+        for decoder in self.lock().values_mut() {
+            decoder.service();
+        }
+    }
+
+    fn reset(&mut self) {
+        for decoder in self.lock().values_mut() {
+            decoder.reset();
+        }
+    }
+
+    fn audio(&mut self, pcm: &[u8]) {
+        self.audio.push(pcm);
+    }
+
+    fn take_idr_wanted(&mut self) -> u32 {
+        self.idr_wanted
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 }

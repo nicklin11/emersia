@@ -13,7 +13,9 @@ use emersia_transport::codec::Codec;
 use emersia_transport::crypto::{device_id_bytes, DeviceIdentity};
 use emersia_transport::input::{self, InputEvent};
 use emersia_transport::transport::udp::ClientEndpoint;
-use emersia_transport::transport::{control, FrameHeader, Reassembler, VIDEO_CLOCK_HZ};
+use emersia_transport::transport::{
+    control, FrameHeader, Reassembler, MAX_STREAMS, VIDEO_CLOCK_HZ,
+};
 use std::sync::mpsc::Receiver;
 
 /// How long to wait for the host's handshake response.
@@ -83,6 +85,8 @@ pub struct Stats {
     pub keyframe_requests: AtomicU64,
     pub input_events: AtomicU64,
     pub audio_chunks: AtomicU64,
+    /// Bitmask of stream ids seen, so the app can open a panel per stream.
+    pub streams_seen: AtomicU32,
     /// Smoothed host capture → frame fully received on the headset, µs.
     /// Zero until the clock offset is known.
     pub capture_to_rx_us: AtomicU64,
@@ -144,14 +148,20 @@ impl Stats {
 /// Consumer of whole access units — MediaCodec on the headset, a recorder in
 /// tests.
 pub trait VideoSink {
-    /// Queue one access unit (Annex-B, parameter sets inline on keyframes).
+    /// Queue one access unit (Annex-B, parameter sets inline on keyframes)
+    /// of `stream`. A stream with no panel attached may drop it.
     fn submit(
         &mut self,
+        stream: u8,
         codec: Codec,
         au: &[u8],
         pts_us: u64,
         keyframe: bool,
     ) -> Result<(), String>;
+    /// Streams that need a keyframe now (a panel just attached), as a bitmask.
+    fn take_idr_wanted(&mut self) -> u32 {
+        0
+    }
     /// Called whenever the loop is idle, so decoded output can be released to
     /// the display without waiting for the next datagram.
     fn service(&mut self) {}
@@ -177,8 +187,11 @@ pub struct Config {
 /// keyframe restarts the reference chain.
 #[derive(Debug, Default)]
 pub struct KeyframeGate {
+    /// One sequence space per device covers every stream, audio and clock
+    /// replies (see HostEndpoint::send_frame_on).
     expected: Option<u32>,
-    synced: bool,
+    /// Per stream: decodable since its last keyframe.
+    synced: [bool; MAX_STREAMS as usize],
 }
 
 /// What the gate decided for one frame.
@@ -192,10 +205,12 @@ pub enum Gate {
 }
 
 impl KeyframeGate {
-    /// `header` is the header of the frame's last fragment.
-    pub fn admit(&mut self, header: &FrameHeader) -> Gate {
-        // Each fragment consumes one sequence number after the frame's own
-        // (see HostEndpoint::send_frame), so the next frame is predictable.
+    /// Advance the shared sequence space past this record; `true` on a gap.
+    /// A gap cannot be attributed to a stream (the lost header is lost), so
+    /// every stream must wait for a keyframe.
+    fn advance(&mut self, header: &FrameHeader) -> bool {
+        // Each fragment consumes one sequence number after the frame's own,
+        // so the next record's frame sequence is predictable.
         let next = header
             .frame_sequence
             .wrapping_add(u32::from(header.frag_count))
@@ -205,38 +220,46 @@ impl KeyframeGate {
             .is_some_and(|expected| expected != header.frame_sequence);
         self.expected = Some(next);
         if lost {
-            self.synced = false;
+            self.synced = [false; MAX_STREAMS as usize];
         }
+        lost
+    }
+
+    /// `header` is the header of the frame's last fragment.
+    pub fn admit(&mut self, header: &FrameHeader) -> Gate {
+        let lost = self.advance(header);
+        let Some(synced) = self.synced.get_mut(usize::from(header.stream)) else {
+            return Gate::Skip { lost };
+        };
         if header.keyframe {
-            self.synced = true;
+            *synced = true;
         }
-        if self.synced {
+        if *synced {
             Gate::Pass
         } else {
             Gate::Skip { lost }
         }
     }
 
-    pub fn synced(&self) -> bool {
+    /// Whether `stream` is decodable.
+    pub fn synced(&self, stream: u8) -> bool {
         self.synced
+            .get(usize::from(stream))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// The decoder for `stream` failed or was replaced: wait for a keyframe.
+    pub fn reset(&mut self, stream: u8) {
+        if let Some(s) = self.synced.get_mut(usize::from(stream)) {
+            *s = false;
+        }
     }
 
     /// Account for a non-video record (e.g. PONG) in the sequence space, so
     /// it is not mistaken for a lost frame. Returns whether it revealed a gap.
     pub fn observe_other(&mut self, header: &FrameHeader) -> bool {
-        let lost = self
-            .expected
-            .is_some_and(|expected| expected != header.frame_sequence);
-        self.expected = Some(
-            header
-                .frame_sequence
-                .wrapping_add(u32::from(header.frag_count))
-                .wrapping_add(1),
-        );
-        if lost {
-            self.synced = false;
-        }
-        lost
+        self.advance(header)
     }
 }
 
@@ -493,23 +516,26 @@ fn stream(
     stats: &Stats,
 ) {
     stats.set_phase(Phase::WaitingForKeyframe);
-    let mut reassembler = Reassembler::default();
+    let mut reassemblers: [Reassembler; MAX_STREAMS as usize] = Default::default();
     let mut gate = KeyframeGate::default();
-    let mut clock = PtsClock::default();
+    let mut clocks: [PtsClock; MAX_STREAMS as usize] = Default::default();
     let mut last_datagram = Instant::now();
-    let mut last_request: Option<Instant> = None;
+    let mut last_request: [Option<Instant>; MAX_STREAMS as usize] = Default::default();
     let epoch = Instant::now();
     let now_us = || epoch.elapsed().as_micros() as u64;
     let mut clock_sync = ClockSync::default();
     let mut host_clock = HostClock::default();
     let mut last_ping: Option<Instant> = None;
-    // Ask for an IDR, at most once per interval.
-    let mut request_keyframe = |client: &mut ClientEndpoint| {
-        if last_request.is_some_and(|t| t.elapsed() < KEYFRAME_REQUEST_INTERVAL) {
+    // Ask for an IDR on `stream`, at most once per interval per stream.
+    let mut request_keyframe = |client: &mut ClientEndpoint, stream: u8| {
+        let Some(last) = last_request.get_mut(usize::from(stream)) else {
+            return;
+        };
+        if last.is_some_and(|t| t.elapsed() < KEYFRAME_REQUEST_INTERVAL) {
             return;
         }
-        last_request = Some(Instant::now());
-        match client.send_control(control::KEYFRAME_REQUEST, &[]) {
+        *last = Some(Instant::now());
+        match client.send_control(control::KEYFRAME_REQUEST, &[stream]) {
             Ok(()) => {
                 stats.keyframe_requests.fetch_add(1, Ordering::Relaxed);
             }
@@ -521,6 +547,15 @@ fn stream(
         // At most one READ_SLICE (2 ms) between an input event and its send.
         if let Some(rx) = input {
             send_input(&mut client, rx, stats);
+        }
+        // A panel that just attached needs a picture now, not at the next
+        // forced keyframe.
+        let wanted = sink.take_idr_wanted();
+        for stream in 0..MAX_STREAMS {
+            if wanted & (1 << stream) != 0 {
+                gate.reset(stream);
+                request_keyframe(&mut client, stream);
+            }
         }
         if last_ping.is_none_or(|t| t.elapsed() >= PING_INTERVAL) {
             last_ping = Some(Instant::now());
@@ -568,11 +603,16 @@ fn stream(
             }
             continue; // not video
         };
+        let stream = header.stream;
+        let Some(reassembler) = reassemblers.get_mut(usize::from(stream)) else {
+            continue; // stream id beyond what this client supports
+        };
+        stats.streams_seen.fetch_or(1 << stream, Ordering::Relaxed);
         let Some(frame) = reassembler.push(header, &payload) else {
             continue;
         };
         stats.frames_received.fetch_add(1, Ordering::Relaxed);
-        let pts = clock.micros(header.timestamp);
+        let pts = clocks[usize::from(stream)].micros(header.timestamp);
         let captured_host_us = host_clock.micros(header.timestamp);
         if let Some(offset) = clock_sync.offset() {
             // Capture time on the device clock, then how long ago that was.
@@ -589,23 +629,29 @@ fn stream(
                     stats.losses.fetch_add(1, Ordering::Relaxed);
                 }
                 stats.frames_skipped.fetch_add(1, Ordering::Relaxed);
-                stats.set_phase(Phase::WaitingForKeyframe);
-                request_keyframe(&mut client);
+                if stream == 0 {
+                    stats.set_phase(Phase::WaitingForKeyframe);
+                }
+                request_keyframe(&mut client, stream);
                 continue;
             }
         }
-        match sink.submit(codec, &frame, pts, header.keyframe) {
+        match sink.submit(stream, codec, &frame, pts, header.keyframe) {
             Ok(()) => {
-                stats.frames_submitted.fetch_add(1, Ordering::Relaxed);
-                stats.set_phase(Phase::Streaming);
+                if stream == 0 {
+                    stats.frames_submitted.fetch_add(1, Ordering::Relaxed);
+                    stats.set_phase(Phase::Streaming);
+                }
             }
             Err(err) => {
                 // A frame the decoder could not take breaks the reference
                 // chain just like a lost one.
                 stats.set_error(format!("decoder: {err}"));
-                gate = KeyframeGate::default();
-                stats.set_phase(Phase::WaitingForKeyframe);
-                request_keyframe(&mut client);
+                gate.reset(stream);
+                if stream == 0 {
+                    stats.set_phase(Phase::WaitingForKeyframe);
+                }
+                request_keyframe(&mut client, stream);
             }
         }
         sink.service();
@@ -659,9 +705,27 @@ mod tests {
         // Frame at sequence 2 (1 fragment) lost; the next one is 4.
         assert_eq!(gate.admit(&header(4, 1, false)), Gate::Skip { lost: true });
         assert_eq!(gate.admit(&header(6, 1, false)), Gate::Skip { lost: false });
-        assert!(!gate.synced());
+        assert!(!gate.synced(0));
         assert_eq!(gate.admit(&header(8, 2, true)), Gate::Pass);
         assert_eq!(gate.admit(&header(11, 1, false)), Gate::Pass);
+    }
+
+    #[test]
+    fn a_gap_unsyncs_every_stream_and_each_resyncs_on_its_own_keyframe() {
+        let on = |seq: u32, stream: u8, key: bool| FrameHeader {
+            stream,
+            ..header(seq, 1, key)
+        };
+        let mut gate = KeyframeGate::default();
+        assert_eq!(gate.admit(&on(0, 0, true)), Gate::Pass);
+        assert_eq!(gate.admit(&on(2, 1, true)), Gate::Pass);
+        // Sequence 4 lost (unknown stream): both must wait.
+        assert_eq!(gate.admit(&on(6, 0, false)), Gate::Skip { lost: true });
+        assert!(!gate.synced(0) && !gate.synced(1));
+        assert_eq!(gate.admit(&on(8, 1, true)), Gate::Pass, "stream 1 keyframe");
+        assert_eq!(gate.admit(&on(10, 0, false)), Gate::Skip { lost: false });
+        assert_eq!(gate.admit(&on(12, 0, true)), Gate::Pass);
+        assert_eq!(gate.admit(&on(14, 1, false)), Gate::Pass);
     }
 
     #[test]
@@ -765,7 +829,14 @@ mod tests {
     }
 
     impl VideoSink for Recorder {
-        fn submit(&mut self, _: Codec, au: &[u8], _: u64, keyframe: bool) -> Result<(), String> {
+        fn submit(
+            &mut self,
+            _: u8,
+            _: Codec,
+            au: &[u8],
+            _: u64,
+            keyframe: bool,
+        ) -> Result<(), String> {
             self.frames.push((au.to_vec(), keyframe));
             Ok(())
         }

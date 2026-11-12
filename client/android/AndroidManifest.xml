@@ -41,5 +41,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- One panel per extra stream (another captured output). Launched by
+             MainActivity with NEW_TASK|MULTIPLE_TASK, so each is its own
+             Horizon OS window. -->
+        <activity
+            android:name=".PanelActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density"
+            android:resizeableActivity="true"
+            android:theme="@android:style/Theme.Black.NoTitleBar">
+            <layout android:defaultWidth="1600dp" android:defaultHeight="900dp" />
+        </activity>
     </application>
 </manifest>

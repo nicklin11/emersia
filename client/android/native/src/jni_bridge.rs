@@ -22,6 +22,8 @@ use crate::session::{self, Config, Stats};
 
 struct Running {
     stop: Arc<AtomicBool>,
+    decoders: crate::decoder::Decoders,
+    idr_wanted: Arc<std::sync::atomic::AtomicU32>,
     input: Sender<InputEvent>,
     stats: Arc<Stats>,
     worker: Option<JoinHandle<()>>,
@@ -124,17 +126,29 @@ pub extern "system" fn Java_org_emersia_client_NativeBridge_nativeStart(
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Stats::default());
     let (input_tx, input_rx) = std::sync::mpsc::channel();
+    let decoders: crate::decoder::Decoders = Default::default();
+    let idr_wanted = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    decoders
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(0, SurfaceDecoder::new(window, stats.clone()));
     let config = Config {
         server: server.clone(),
         host_key,
     };
     let worker = {
         let (stop, stats) = (stop.clone(), stats.clone());
+        let (decoders, idr_wanted) = (decoders.clone(), idr_wanted.clone());
         std::thread::Builder::new()
             .name("emersia-stream".into())
             .spawn(move || {
                 boost_current_thread();
-                let mut decoder = SurfaceDecoder::new(window, stats.clone());
+                // Built here: the audio stream must live on this thread.
+                let mut decoder = crate::decoder::MultiSink {
+                    decoders,
+                    idr_wanted,
+                    audio: Default::default(),
+                };
                 // Presence announcements arrive on the discovery port; if it
                 // is busy (pairing running), simply do not follow.
                 let discovery = std::net::UdpSocket::bind((
@@ -163,6 +177,8 @@ pub extern "system" fn Java_org_emersia_client_NativeBridge_nativeStart(
     };
     let running = Box::new(Running {
         stop,
+        decoders,
+        idr_wanted,
         input: input_tx,
         stats,
         worker: Some(worker),
@@ -433,4 +449,100 @@ pub extern "system" fn Java_org_emersia_client_NativeBridge_nativeServer(
     let running = unsafe { &*(handle as *const Running) };
     let server = running.stats.server();
     jstr(&mut env, &server)
+}
+
+/// `boolean nativeAttach(long handle, int stream, Surface surface)` — a panel
+/// shows `stream` on `surface`; a keyframe is requested for it.
+#[no_mangle]
+pub extern "system" fn Java_org_emersia_client_NativeBridge_nativeAttach(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    stream: jint,
+    surface: JObject,
+) -> jboolean {
+    let Ok(stream) = u8::try_from(stream) else {
+        return 0;
+    };
+    if handle == 0 || stream >= emersia_transport::transport::MAX_STREAMS {
+        return 0;
+    }
+    // SAFETY: as in nativeStatus.
+    let running = unsafe { &*(handle as *const Running) };
+    // SAFETY: env and surface are valid for this call; the window holds its
+    // own reference.
+    let window =
+        unsafe { NativeWindow::from_surface(env.get_raw().cast(), surface.as_raw().cast()) };
+    let Some(window) = window else {
+        return 0;
+    };
+    running
+        .decoders
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(stream, SurfaceDecoder::new(window, running.stats.clone()));
+    running.idr_wanted.fetch_or(1 << stream, Ordering::Relaxed);
+    log::info!("panel attached to stream {stream}");
+    1
+}
+
+/// `void nativeDetach(long handle, int stream)` — the panel's Surface is
+/// going away; returns only once the decoder no longer uses it.
+#[no_mangle]
+pub extern "system" fn Java_org_emersia_client_NativeBridge_nativeDetach(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    stream: jint,
+) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: as in nativeStatus.
+    let running = unsafe { &*(handle as *const Running) };
+    if let Ok(stream) = u8::try_from(stream) {
+        let removed = running
+            .decoders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&stream);
+        drop(removed); // stops the codec while the lock guarantees no user
+    }
+}
+
+/// `int nativeStreams(long handle)` — bitmask of stream ids seen so far.
+#[no_mangle]
+pub extern "system" fn Java_org_emersia_client_NativeBridge_nativeStreams(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jint {
+    if handle == 0 {
+        return 0;
+    }
+    // SAFETY: as in nativeStatus.
+    let running = unsafe { &*(handle as *const Running) };
+    running.stats.streams_seen.load(Ordering::Relaxed) as jint
+}
+
+/// `void nativePointerOn(long handle, int stream, float x, float y)`.
+#[no_mangle]
+pub extern "system" fn Java_org_emersia_client_NativeBridge_nativePointerOn(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    stream: jint,
+    x: jfloat,
+    y: jfloat,
+) {
+    if let Ok(stream) = u8::try_from(stream) {
+        push_input(
+            handle,
+            InputEvent::PointerOn {
+                stream,
+                x: unit(x),
+                y: unit(y),
+            },
+        );
+    }
 }
