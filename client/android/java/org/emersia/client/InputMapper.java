@@ -16,11 +16,18 @@ import android.view.View;
  */
 final class InputMapper {
     private final View video;
+    private final int stream;
     private long handle;
     private int heldButton = -1;
 
     InputMapper(View video) {
+        this(video, 0);
+    }
+
+    /** For a secondary panel showing {@code stream}. */
+    InputMapper(View video, int stream) {
         this.video = video;
+        this.stream = stream;
     }
 
     void setHandle(long handle) {
@@ -31,7 +38,11 @@ final class InputMapper {
     private boolean pointer(MotionEvent e) {
         int w = video.getWidth(), h = video.getHeight();
         if (handle == 0 || w <= 0 || h <= 0) return false;
-        NativeBridge.nativePointer(handle, e.getX() / w, e.getY() / h);
+        if (stream == 0) {
+            NativeBridge.nativePointer(handle, e.getX() / w, e.getY() / h);
+        } else {
+            NativeBridge.nativePointerOn(handle, stream, e.getX() / w, e.getY() / h);
+        }
         return true;
     }
 

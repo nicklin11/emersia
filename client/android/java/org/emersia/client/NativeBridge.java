@@ -25,6 +25,21 @@ final class NativeBridge {
     /** The host address in use; changes when the host moved and was followed. */
     static native String nativeServer(long handle);
 
+    /** Shows {@code stream} on {@code surface} (a secondary panel); requests a keyframe. */
+    static native boolean nativeAttach(long handle, int stream, Surface surface);
+
+    /** The panel's surface is going away; returns once the decoder released it. */
+    static native void nativeDetach(long handle, int stream);
+
+    /** Bitmask of stream ids the host has sent. */
+    static native int nativeStreams(long handle);
+
+    /** Pointer on a given stream's panel, 0..1 on each axis. */
+    static native void nativePointerOn(long handle, int stream, float x, float y);
+
+    /** The running session, shared by every panel (one transport session per headset). */
+    static volatile long session;
+
     /** Pointer position on the video, 0..1 on each axis. */
     static native void nativePointer(long handle, float x, float y);
 

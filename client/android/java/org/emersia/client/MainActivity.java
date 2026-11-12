@@ -46,6 +46,16 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     private long handle;
     private WifiManager.WifiLock wifiLock;
     private InputMapper input;
+    /** Streams with an open secondary panel (bitmask). */
+    private static volatile int openPanels;
+
+    static void panelOpened(int stream) {
+        openPanels |= 1 << stream;
+    }
+
+    static void panelClosed(int stream) {
+        openPanels &= ~(1 << stream);
+    }
     private PairingPanel pairingPanel;
     private Button pairButton;
     private long pairHandle;
@@ -85,6 +95,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
                 if (!server.isEmpty() && !server.equals(prefs.getString(EXTRA_SERVER, ""))) {
                     prefs.edit().putString(EXTRA_SERVER, server).apply();
                 }
+                openNewPanels();
                 String text = NativeBridge.nativeStatus(handle);
                 status.setText(text);
                 long now = System.currentTimeMillis();
@@ -212,6 +223,24 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         super.onPause();
     }
 
+    /**
+     * Opens a Horizon OS panel for every extra stream the host sends (e.g.
+     * `emersia start DP-3 HDMI-A-1`): stream 0 is this panel.
+     */
+    private void openNewPanels() {
+        int seen = NativeBridge.nativeStreams(handle);
+        for (int stream = 1; stream < 4; stream++) {
+            int bit = 1 << stream;
+            if ((seen & bit) != 0 && (openPanels & bit) == 0) {
+                openPanels |= bit; // until the panel reports itself
+                Intent i = new Intent(this, PanelActivity.class)
+                        .putExtra(PanelActivity.EXTRA_STREAM, stream)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
+                startActivity(i);
+            }
+        }
+    }
+
     /** Persists connection extras; returns true when anything was supplied. */
     private boolean remember(Intent intent) {
         if (intent == null) return false;
@@ -236,6 +265,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             return;
         }
         handle = NativeBridge.nativeStart(holder.getSurface(), files, server, key);
+        NativeBridge.session = handle;
         input.setHandle(handle);
         streamingSince = 0;
         if (handle == 0) {
@@ -246,6 +276,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     private void stop() {
         if (handle != 0) {
             input.setHandle(0);
+            NativeBridge.session = 0;
             NativeBridge.nativeStop(handle);
             handle = 0;
         }
@@ -277,6 +308,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
     /** Letterboxes its child to a fixed aspect ratio so the desktop is never stretched. */
     static final class AspectFrame extends FrameLayout {
+        // Shared with PanelActivity.
         private final int aw, ah;
 
         AspectFrame(Context c, int aw, int ah) {
