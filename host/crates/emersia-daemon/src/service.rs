@@ -1009,6 +1009,13 @@ impl Engine {
     /// Choose the encoder family and bitrate. Does not start anything: the
     /// encoder is created on the first frame, when the capture geometry is
     /// known and an odd resolution can be rejected with a clear message.
+    /// Codec to encode with (H.264 default; HEVC is sharper per bit and
+    /// hardware-decoded on Quest).
+    pub fn with_codec(mut self, codec: crate::codec::Codec) -> Self {
+        self.codec = codec;
+        self
+    }
+
     pub fn with_encoder(
         mut self,
         choice: crate::encoder::EncoderChoice,

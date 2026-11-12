@@ -77,6 +77,8 @@ struct ServeOpts {
     audio: bool,
     /// Desktop notifications when a headset starts/stops viewing.
     notify: bool,
+    /// Video codec.
+    codec: codec::Codec,
 }
 
 fn main() {
@@ -156,6 +158,7 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
     let mut cursor = true;
     let mut audio = true;
     let mut notify = true;
+    let mut video_codec = codec::Codec::H264;
     let mut encoder_choice = encoder::EncoderChoice::Auto;
     let mut bitrate = encoder::EncoderConfig::default().bitrate;
 
@@ -223,6 +226,16 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
             "--no-cursor" => cursor = false,
             "--no-audio" => audio = false,
             "--no-notify" => notify = false,
+            "--codec" => {
+                let value = rest
+                    .next()
+                    .ok_or_else(|| "missing value for --codec".to_string())?;
+                video_codec = match value.as_str() {
+                    "h264" | "avc" => codec::Codec::H264,
+                    "hevc" | "h265" => codec::Codec::Hevc,
+                    other => return Err(format!("--codec must be h264 or hevc, got {other:?}")),
+                };
+            }
             "--socket" => {
                 let value = rest
                     .next()
@@ -244,6 +257,7 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
             cursor,
             audio,
             notify,
+            codec: video_codec,
         }),
         "receive" => Mode::Receive,
         _ => Mode::Capture(CaptureOpts {
@@ -282,6 +296,7 @@ fn print_help() {
     println!("  --no-cursor          leave the mouse pointer out of the stream");
     println!("  --no-audio           do not stream desktop audio");
     println!("  --no-notify          no desktop notification when a headset connects");
+    println!("  --codec CODEC        h264 (default) | hevc — sharper per bit, HW-decoded on Quest");
     println!("  --encoder NAME       auto | vaapi | nvenc | amf | qsv | sw (default: auto)");
     println!("  --bitrate RATE       target bitrate, e.g. 30M or 8000k (default: 30M)");
     println!(
@@ -330,6 +345,7 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
         .context("capture engine discovery failed")?
         .with_stream_port(opts.stream_port, host_identity.into_identity())?
         .with_encoder(opts.encoder, Some(opts.bitrate))
+        .with_codec(opts.codec)
         .with_cursor(opts.cursor);
     println!(
         "encoder: {:?}, target {:.1} Mbit/s",
@@ -393,6 +409,7 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
                 .context("extra stream: capture engine discovery failed")?
                 .with_shared_transport(Arc::clone(endpoint))
                 .with_encoder(opts.encoder, Some(opts.bitrate))
+                .with_codec(opts.codec)
                 .with_cursor(opts.cursor);
             let svc = Arc::clone(&svc);
             stream_threads.push(
