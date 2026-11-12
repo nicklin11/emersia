@@ -100,16 +100,41 @@ jobs:
         timeout-minutes: 8
         run: scripts/qa-sway-headless.sh --encoder sw < /dev/null
 
+  # Companion app (M4): Tauri 2 on webkit2gtk; UI is dependency-free JS.
+  gui:
+    name: gui
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gui
+      - name: Install webkit2gtk and appindicator
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: rustfmt
+        run: cargo fmt --manifest-path gui/Cargo.toml -- --check
+      - name: clippy
+        run: cargo clippy --manifest-path gui/Cargo.toml --all-targets -- -D warnings
+      - name: test
+        run: cargo test --manifest-path gui/Cargo.toml
+      - name: UI script syntax
+        run: node --check gui/ui/app.js
+
   # Aggregate check — this is the single required status on `main`.
   ci:
     name: ci
-    needs: [validation, rust, client, sway]
+    needs: [validation, rust, client, sway, gui]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: All jobs green?
         run: |
-          if [ "${{ needs.validation.result }}" != "success" ] || [ "${{ needs.rust.result }}" != "success" ] || [ "${{ needs.client.result }}" != "success" ] || [ "${{ needs.sway.result }}" != "success" ]; then
+          if [ "${{ needs.validation.result }}" != "success" ] || [ "${{ needs.rust.result }}" != "success" ] || [ "${{ needs.client.result }}" != "success" ] || [ "${{ needs.sway.result }}" != "success" ] || [ "${{ needs.gui.result }}" != "success" ]; then
             echo "required jobs did not succeed"
             exit 1
           fi

@@ -1,0 +1,24 @@
+[package]
+name = "emersia-gui"
+description = "Emersia companion app: tray sharing indicator, status, devices, headset pairing"
+version = "0.0.1"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/nicklin11/emersia"
+publish = false
+
+# Standalone workspace: webkit/GTK dependencies stay out of the host build.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+emersia-protocol = { path = "../host/crates/emersia-protocol" }
+
+[profile.release]
+lto = "thin"
+strip = true
