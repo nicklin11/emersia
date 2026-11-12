@@ -878,6 +878,12 @@ impl Engine {
         Ok(self)
     }
 
+    /// Whether captured frames include the pointer.
+    pub fn with_cursor(mut self, paint: bool) -> Self {
+        self.state.paint_cursor = paint;
+        self
+    }
+
     /// The streaming endpoint, once bound.
     pub fn transport(&self) -> Option<&crate::network::SharedEndpoint> {
         self.transport.as_ref()
@@ -923,6 +929,7 @@ impl Engine {
         let transport = self.transport.take();
         fresh.transport = transport;
         fresh.encoder_choice = self.encoder_choice;
+        fresh.state.paint_cursor = self.state.paint_cursor;
         fresh.bitrate = self.bitrate;
         fresh.codec = self.codec;
         *self = fresh;

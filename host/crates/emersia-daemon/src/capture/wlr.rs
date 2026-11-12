@@ -41,7 +41,8 @@ pub fn capture(
         .clone()
         .context("the compositor does not advertise wl_shm")?;
 
-    let frame = mgr.capture_output(0, output, &qh, ());
+    // overlay_cursor: 1 composites the pointer into the frame.
+    let frame = mgr.capture_output(i32::from(state.paint_cursor), output, &qh, ());
     // v3 adds the explicit `buffer_done` terminator; older versions signal the
     // buffer description with `buffer` alone.
     let needs_buffer_done = frame.version() >= 3;
