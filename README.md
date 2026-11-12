@@ -17,18 +17,20 @@ make paid VR-desktop apps obsolete.
 
 ## Status
 
-**M0 — Foundation is complete; M1 — Linux host engine is in progress.** The
-roadmap and live work items are tracked in the [M1 parent issue](https://github.com/nicklin11/emersia/issues/3).
+**M0 is complete; M1 (Linux host) is functionally complete; M2 (Quest client)
+is underway — screen mirroring to a Quest works today.** Live work is tracked on
+the [project board](https://github.com/users/nicklin11/projects/4).
 
-The host currently has live niri capture through direct Wayland
-`wlr-screencopy` (with the `ext-image-copy-capture` path in tree), runtime
-encoder selection with a decoder-verified RTP/UDP test receiver, a local
-control CLI, and encrypted pairing with revocation ([#3](https://github.com/nicklin11/emersia/issues/3)).
-M1.6 capture telemetry is also in place, but the ≥60 fps acceptance gate remains
-open pending a compositor/hardware-backed decision between dmabuf and
-portal/PipeWire ([#35](https://github.com/nicklin11/emersia/issues/35)).
-sway/hyprland QA, and a packaged systemd service are
-still outstanding.
+- Host: direct Wayland capture (`ext-image-copy-capture`, `wlr-screencopy`
+  fallback), GPU colour conversion + hardware H.264/HEVC (VAAPI/NVENC/AMF/QSV),
+  forward-secret encrypted UDP, pairing/revocation, headset input via
+  `uinput`, systemd user service. Verified on niri and (headless, in CI) sway.
+- Quest client: Rust core with NDK MediaCodec hardware decode into a Horizon
+  OS panel, keyframe recovery, pointer/keyboard input, on-headset latency
+  readout. Measured ≈ 16 ms capture → decoded at 60 fps
+  ([ADR 0007](docs/adr/0007-quest-client-native-core.md)).
+- Next: in-headset pairing (no adb), the immersive multi-monitor OpenXR view
+  (M3), virtual outputs ([design](docs/design/virtual-outputs.md)).
 
 ### Try it: mirror your screen to a Quest
 
