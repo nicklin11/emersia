@@ -50,7 +50,12 @@ pub fn capture(
         .context("the compositor does not advertise wl_shm")?;
 
     let source = source_mgr.create_source(output, &qh, ());
-    let session = copy_mgr.create_session(&source, Options::empty(), &qh, ());
+    let options = if state.paint_cursor {
+        Options::PaintCursors
+    } else {
+        Options::empty()
+    };
+    let session = copy_mgr.create_session(&source, options, &qh, ());
 
     // 1. The compositor tells us what buffer it will accept.
     let constraints_started = Instant::now();

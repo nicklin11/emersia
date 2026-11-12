@@ -254,6 +254,9 @@ pub struct State {
     pub wlr_mgr: Option<ZwlrScreencopyManagerV1>,
     pub xdg_output_mgr: Option<ZxdgOutputManagerV1>,
     pub outputs: Vec<OutputInfo>,
+    /// Composite the pointer into captured frames. On by default: a mirrored
+    /// desktop without a visible cursor cannot be driven from the headset.
+    pub paint_cursor: bool,
     pub ext: ExtState,
     pub wlr: WlrState,
 }
@@ -267,6 +270,7 @@ impl State {
             wlr_mgr: None,
             xdg_output_mgr: None,
             outputs: Vec::new(),
+            paint_cursor: true,
             ext: ExtState::default(),
             wlr: WlrState::default(),
         }
