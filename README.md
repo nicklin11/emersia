@@ -30,8 +30,13 @@ the [project board](https://github.com/users/nicklin11/projects/4).
   OS panel, keyframe recovery, pointer/keyboard input, on-headset latency
   readout. Measured ≈ 16 ms capture → decoded at 60 fps
   ([ADR 0007](docs/adr/0007-quest-client-native-core.md)).
-- Next: in-headset pairing (no adb), the immersive multi-monitor OpenXR view
-  (M3), virtual outputs ([design](docs/design/virtual-outputs.md)).
+- Several monitors at once: `emersia start DP-1 HDMI-A-1` shows each output in
+  its own Horizon OS panel. On sway/hyprland, `emersia virtual add 2560x1440`
+  creates a headset-only monitor (niri: see
+  [virtual outputs](docs/design/virtual-outputs.md) for the EDID / dummy-plug
+  route).
+- Next: the immersive OpenXR view (curved screens placed in 3D), zero-copy
+  capture.
 
 ### Try it: mirror your screen to a Quest
 
