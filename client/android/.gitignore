@@ -1,3 +1,4 @@
 build/
 debug.keystore
 native/target/
+third_party/

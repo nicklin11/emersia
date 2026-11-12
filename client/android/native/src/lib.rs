@@ -6,6 +6,7 @@
 
 pub mod audio_buffer;
 pub mod identity;
+pub mod layout;
 pub mod pairing;
 pub mod session;
 pub mod status;
@@ -14,5 +15,7 @@ pub mod status;
 mod audio_out;
 #[cfg(target_os = "android")]
 mod decoder;
+#[cfg(target_os = "android")]
+mod immersive;
 #[cfg(target_os = "android")]
 mod jni_bridge;

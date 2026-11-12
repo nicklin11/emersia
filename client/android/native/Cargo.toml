@@ -26,6 +26,10 @@ tempfile = "3"
 jni = "0.21"
 ndk = { version = "0.9", features = ["media", "nativewindow", "audio", "api-level-29"] }
 android_logger = { version = "0.14", default-features = false }
+# Immersive mode (ADR 0009): OpenXR through the bundled Khronos loader.
+openxr = { version = "0.19", features = ["loaded"] }
+ndk-context = "0.1"
+khronos-egl = { version = "6", features = ["static", "no-pkg-config"] }
 
 [profile.release]
 lto = "fat"

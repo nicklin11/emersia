@@ -42,6 +42,21 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$tc/aarch64-linux-android${min_
 export CC_aarch64_linux_android=$tc/aarch64-linux-android${min_api}-clang
 export AR_aarch64_linux_android=$tc/llvm-ar
 
+# OpenXR loader (Khronos, Apache-2.0/MIT) for immersive mode, pinned by hash.
+loader_version=1.1.65
+loader_sha256=a298c326085b09181c85235fb04d37510939bd30938ed4322c093c09780e8643
+loader_dir=$here/third_party/openxr-loader-$loader_version
+if [[ ! -f $loader_dir/libopenxr_loader.so ]]; then
+  echo "==> fetching OpenXR loader $loader_version"
+  mkdir -p "$loader_dir"
+  aar=$loader_dir/loader.aar
+  curl -fsSL -o "$aar" "https://repo1.maven.org/maven2/org/khronos/openxr/openxr_loader_for_android/$loader_version/openxr_loader_for_android-$loader_version.aar"
+  echo "$loader_sha256  $aar" | sha256sum -c --quiet - || die "OpenXR loader checksum mismatch"
+  python3 -c 'import sys, zipfile; open(sys.argv[2], "wb").write(zipfile.ZipFile(sys.argv[1]).read("jni/arm64-v8a/libopenxr_loader.so"))' \
+    "$aar" "$loader_dir/libopenxr_loader.so"
+  rm -f "$aar"
+fi
+
 echo "==> native core (Rust, aarch64-linux-android)"
 "$cargo" build --release --target aarch64-linux-android --manifest-path "$here/native/Cargo.toml"
 so=$here/native/target/aarch64-linux-android/release/libemersia_client.so
@@ -57,7 +72,7 @@ javac --release 11 -Xlint:-options -classpath "$android_jar" -d "$out/classes" \
 echo "==> package"
 "$build_tools/aapt2" link -o "$out/base.apk" -I "$android_jar" \
   --manifest "$here/AndroidManifest.xml" --min-sdk-version $min_api --target-sdk-version 32
-cp "$so" "$out/apk/lib/arm64-v8a/"
+cp "$so" "$loader_dir/libopenxr_loader.so" "$out/apk/lib/arm64-v8a/"
 # Append dex + native lib to the aapt2 output (python's zipfile, so no `zip`
 # dependency).
 python3 - "$out/base.apk" "$out/apk" <<'PY'

@@ -1,0 +1,367 @@
+//! Immersive mode (ADR 0009): each stream is a curved screen in an OpenXR
+//! scene, with no rendering of our own.
+//!
+//! For every stream the runtime creates an `XR_KHR_android_surface_swapchain`,
+//! whose Android Surface becomes that stream's MediaCodec output. The frame is
+//! then submitted as an `XR_KHR_composition_layer_cylinder`: the compositor
+//! samples the decoded image directly at display resolution and reprojects it
+//! with head motion. Decoded pixels are never copied or touched by the GPU on
+//! our side, which is the cheapest and lowest-latency path the platform has.
+//! A minimal EGL context exists only because a session needs a graphics
+//! binding.
+
+use std::collections::BTreeMap;
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use emersia_transport::transport::MAX_STREAMS;
+use ndk::native_window::NativeWindow;
+use openxr as xr;
+
+use crate::decoder::{Decoders, SurfaceDecoder};
+use crate::session::Stats;
+
+use crate::layout::{screen_yaw, RADIUS, SCREEN_WIDTH};
+
+/// Swapchain size: the stream's native resolution.
+const WIDTH: u32 = 1920;
+const HEIGHT: u32 = 1080;
+
+/// What the immersive thread shares with the stream thread.
+pub struct Shared {
+    pub decoders: Decoders,
+    pub idr_wanted: Arc<AtomicU32>,
+    pub stats: Arc<Stats>,
+}
+
+struct Screen {
+    swapchain: xr::sys::Swapchain,
+}
+
+struct Egl {
+    egl: khronos_egl::Instance<khronos_egl::Static>,
+    display: khronos_egl::Display,
+    config: khronos_egl::Config,
+    context: khronos_egl::Context,
+    surface: khronos_egl::Surface,
+}
+
+impl Egl {
+    fn new() -> Result<Self, String> {
+        use khronos_egl as egl;
+        let instance = egl::Instance::new(egl::Static);
+        // SAFETY: EGL_DEFAULT_DISPLAY is always a valid argument.
+        let display =
+            unsafe { instance.get_display(egl::DEFAULT_DISPLAY) }.ok_or("no EGL display")?;
+        instance
+            .initialize(display)
+            .map_err(|e| format!("eglInitialize: {e}"))?;
+        let attribs = [
+            egl::RED_SIZE,
+            8,
+            egl::GREEN_SIZE,
+            8,
+            egl::BLUE_SIZE,
+            8,
+            egl::RENDERABLE_TYPE,
+            egl::OPENGL_ES3_BIT,
+            egl::SURFACE_TYPE,
+            egl::PBUFFER_BIT,
+            egl::NONE,
+        ];
+        let config = instance
+            .choose_first_config(display, &attribs)
+            .map_err(|e| format!("eglChooseConfig: {e}"))?
+            .ok_or("no EGL config")?;
+        let context = instance
+            .create_context(
+                display,
+                config,
+                None,
+                &[egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE],
+            )
+            .map_err(|e| format!("eglCreateContext: {e}"))?;
+        let surface = instance
+            .create_pbuffer_surface(
+                display,
+                config,
+                &[egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE],
+            )
+            .map_err(|e| format!("eglCreatePbufferSurface: {e}"))?;
+        instance
+            .make_current(display, Some(surface), Some(surface), Some(context))
+            .map_err(|e| format!("eglMakeCurrent: {e}"))?;
+        Ok(Self {
+            egl: instance,
+            display,
+            config,
+            context,
+            surface,
+        })
+    }
+}
+
+impl Drop for Egl {
+    fn drop(&mut self) {
+        let _ = self.egl.make_current(self.display, None, None, None);
+        let _ = self.egl.destroy_surface(self.display, self.surface);
+        let _ = self.egl.destroy_context(self.display, self.context);
+    }
+}
+
+/// Run the immersive session until `stop` is set or the runtime ends it.
+///
+/// # Safety
+/// `vm` and `activity` must be the process's JavaVM and a global reference to
+/// the running Activity; they are handed to the OpenXR loader.
+pub unsafe fn run(
+    vm: *mut c_void,
+    activity: *mut c_void,
+    shared: &Shared,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    // The loader and instance creation read the VM/Activity from here.
+    ndk_context::initialize_android_context(vm, activity);
+    let jvm = jni::JavaVM::from_raw(vm.cast()).map_err(|e| format!("JavaVM: {e}"))?;
+    let env = jvm
+        .attach_current_thread_permanently()
+        .map_err(|e| format!("attach: {e}"))?;
+
+    let entry = xr::Entry::load().map_err(|e| format!("OpenXR loader: {e}"))?;
+    entry
+        .initialize_android_loader()
+        .map_err(|e| format!("xrInitializeLoaderKHR: {e}"))?;
+    let available = entry
+        .enumerate_extensions()
+        .map_err(|e| format!("extensions: {e}"))?;
+    for (have, name) in [
+        (available.khr_opengl_es_enable, "XR_KHR_opengl_es_enable"),
+        (
+            available.khr_android_surface_swapchain,
+            "XR_KHR_android_surface_swapchain",
+        ),
+        (
+            available.khr_composition_layer_cylinder,
+            "XR_KHR_composition_layer_cylinder",
+        ),
+    ] {
+        if !have {
+            return Err(format!("runtime lacks {name}"));
+        }
+    }
+    let mut wanted = xr::ExtensionSet::default();
+    wanted.khr_android_create_instance = true;
+    wanted.khr_opengl_es_enable = true;
+    wanted.khr_android_surface_swapchain = true;
+    wanted.khr_composition_layer_cylinder = true;
+    let instance = entry
+        .create_instance(
+            &xr::ApplicationInfo {
+                application_name: "Emersia",
+                application_version: 1,
+                engine_name: "Emersia",
+                engine_version: 1,
+                api_version: xr::Version::new(1, 0, 0),
+            },
+            &wanted,
+            &[],
+        )
+        .map_err(|e| format!("xrCreateInstance: {e}"))?;
+    let props = instance.properties().map_err(|e| e.to_string())?;
+    log::info!(
+        "OpenXR runtime: {} {}",
+        props.runtime_name,
+        props.runtime_version
+    );
+    let system = instance
+        .system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)
+        .map_err(|e| format!("xrGetSystem: {e}"))?;
+    // Required before session creation, even though we draw nothing.
+    let _ = instance
+        .graphics_requirements::<xr::OpenGlEs>(system)
+        .map_err(|e| format!("GLES requirements: {e}"))?;
+    let egl = Egl::new()?;
+    let (session, mut waiter, mut stream) = instance
+        .create_session::<xr::OpenGlEs>(
+            system,
+            &xr::opengles::SessionCreateInfo::Android {
+                display: egl.display.as_ptr() as _,
+                config: egl.config.as_ptr() as _,
+                context: egl.context.as_ptr() as _,
+            },
+        )
+        .map_err(|e| format!("xrCreateSession: {e}"))?;
+    let space = session
+        .create_reference_space(xr::ReferenceSpaceType::LOCAL, xr::Posef::IDENTITY)
+        .map_err(|e| format!("reference space: {e}"))?;
+    let create_surface = instance
+        .exts()
+        .khr_android_surface_swapchain
+        .ok_or("surface swapchain extension not loaded")?
+        .create_swapchain_android_surface;
+
+    let mut screens: BTreeMap<u8, Screen> = BTreeMap::new();
+    let mut running = false;
+    let mut events = xr::EventDataBuffer::new();
+    let mut result = Ok(());
+    'main: while !stop.load(Ordering::Relaxed) {
+        while let Some(event) = instance
+            .poll_event(&mut events)
+            .map_err(|e| e.to_string())?
+        {
+            if let xr::Event::SessionStateChanged(change) = event {
+                log::info!("XR session state: {:?}", change.state());
+                match change.state() {
+                    xr::SessionState::READY => {
+                        session
+                            .begin(xr::ViewConfigurationType::PRIMARY_STEREO)
+                            .map_err(|e| format!("xrBeginSession: {e}"))?;
+                        running = true;
+                    }
+                    xr::SessionState::STOPPING => {
+                        let _ = session.end();
+                        running = false;
+                    }
+                    xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => break 'main,
+                    _ => {}
+                }
+            }
+        }
+        if !running {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+
+        // A swapchain (and decoder) per stream the host sends.
+        let seen = shared.stats.streams_seen.load(Ordering::Relaxed);
+        for id in 0..MAX_STREAMS {
+            if seen & (1 << id) == 0 || screens.contains_key(&id) {
+                continue;
+            }
+            let info = xr::sys::SwapchainCreateInfo {
+                ty: xr::sys::SwapchainCreateInfo::TYPE,
+                next: std::ptr::null(),
+                create_flags: xr::SwapchainCreateFlags::EMPTY,
+                usage_flags: xr::SwapchainUsageFlags::SAMPLED
+                    | xr::SwapchainUsageFlags::COLOR_ATTACHMENT,
+                // The Surface defines format and layout; Meta's runtime
+                // rejects non-zero counts here (ERROR_VALIDATION_FAILURE).
+                format: 0,
+                sample_count: 0,
+                width: WIDTH,
+                height: HEIGHT,
+                face_count: 0,
+                array_size: 0,
+                mip_count: 0,
+            };
+            let mut swapchain = xr::sys::Swapchain::NULL;
+            let mut surface: *mut c_void = std::ptr::null_mut();
+            let r = create_surface(
+                session.as_raw(),
+                &info,
+                &mut swapchain,
+                (&mut surface as *mut *mut c_void).cast(),
+            );
+            if r.into_raw() < 0 || surface.is_null() {
+                result = Err(format!("xrCreateSwapchainAndroidSurfaceKHR: {r:?}"));
+                break 'main;
+            }
+            let window = NativeWindow::from_surface(env.get_raw().cast(), surface.cast());
+            // Meta's runtime returns the Surface as a *global* reference that it owns
+            // for the swapchain's lifetime (CheckJNI aborted when it was deleted as
+            // local), so it is not deleted here; the window holds its own ref.
+            let Some(window) = window else {
+                result = Err("surface swapchain without a native window".into());
+                break 'main;
+            };
+            shared
+                .decoders
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(id, SurfaceDecoder::new(window, shared.stats.clone()));
+            shared.idr_wanted.fetch_or(1 << id, Ordering::Relaxed);
+            screens.insert(id, Screen { swapchain });
+            log::info!("immersive screen for stream {id}");
+        }
+
+        let state = waiter.wait().map_err(|e| format!("xrWaitFrame: {e}"))?;
+        stream.begin().map_err(|e| format!("xrBeginFrame: {e}"))?;
+        let count = screens.len();
+        let layers: Vec<xr::sys::CompositionLayerCylinderKHR> = screens
+            .values()
+            .enumerate()
+            .map(|(i, screen)| {
+                let yaw = screen_yaw(i, count);
+                xr::sys::CompositionLayerCylinderKHR {
+                    ty: xr::sys::CompositionLayerCylinderKHR::TYPE,
+                    next: std::ptr::null(),
+                    layer_flags: xr::CompositionLayerFlags::EMPTY,
+                    space: space.as_raw(),
+                    eye_visibility: xr::EyeVisibility::BOTH,
+                    sub_image: xr::sys::SwapchainSubImage {
+                        swapchain: screen.swapchain,
+                        image_rect: xr::Rect2Di {
+                            offset: xr::Offset2Di { x: 0, y: 0 },
+                            extent: xr::Extent2Di {
+                                width: WIDTH as i32,
+                                height: HEIGHT as i32,
+                            },
+                        },
+                        image_array_index: 0,
+                    },
+                    pose: xr::Posef {
+                        orientation: xr::Quaternionf {
+                            x: 0.0,
+                            y: (yaw / 2.0).sin(),
+                            z: 0.0,
+                            w: (yaw / 2.0).cos(),
+                        },
+                        position: xr::Vector3f::default(),
+                    },
+                    radius: RADIUS,
+                    central_angle: SCREEN_WIDTH / RADIUS,
+                    aspect_ratio: WIDTH as f32 / HEIGHT as f32,
+                }
+            })
+            .collect();
+        let pointers: Vec<*const xr::sys::CompositionLayerBaseHeader> = if state.should_render {
+            layers
+                .iter()
+                .map(|l| (l as *const xr::sys::CompositionLayerCylinderKHR).cast())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let end = xr::sys::FrameEndInfo {
+            ty: xr::sys::FrameEndInfo::TYPE,
+            next: std::ptr::null(),
+            display_time: state.predicted_display_time,
+            environment_blend_mode: xr::EnvironmentBlendMode::OPAQUE,
+            layer_count: pointers.len() as u32,
+            layers: pointers.as_ptr(),
+        };
+        let r = (instance.fp().end_frame)(session.as_raw(), &end);
+        if r.into_raw() < 0 {
+            result = Err(format!("xrEndFrame: {r:?}"));
+            break;
+        }
+    }
+
+    // Decoders first: they must stop using the surfaces before the
+    // swapchains that own them go away.
+    {
+        let mut decoders = shared.decoders.lock().unwrap_or_else(|p| p.into_inner());
+        for id in screens.keys() {
+            decoders.remove(id);
+        }
+    }
+    for screen in screens.values() {
+        let _ = (instance.fp().destroy_swapchain)(screen.swapchain);
+    }
+    drop(space);
+    drop(session);
+    drop(egl);
+    result
+}

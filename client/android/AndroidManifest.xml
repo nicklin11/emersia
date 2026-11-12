@@ -19,6 +19,19 @@
 
     <uses-feature android:name="android.hardware.vr.headtracking" android:required="false" />
 
+    <!-- OpenXR (Khronos loader): talk to the runtime broker. -->
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
+    <queries>
+        <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRApiLayerService" />
+        </intent>
+    </queries>
+
     <!-- debuggable: `run-as` lets scripts/quest-mirror.sh read the public key
          for pairing. Release builds will drop it (M8). -->
     <application
@@ -41,6 +54,25 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <meta-data android:name="com.oculus.supportedDevices" android:value="quest2|quest3|quest3s|questpro" />
+
+        <!-- Immersive mode (ADR 0009): an OpenXR app; Horizon OS switches to it
+             in place of the home environment. -->
+        <activity
+            android:name=".ImmersiveActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:excludeFromRecents="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="com.oculus.intent.category.VR" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+            </intent-filter>
+        </activity>
+
         <!-- One panel per extra stream (another captured output). Launched by
              MainActivity with NEW_TASK|MULTIPLE_TASK, so each is its own
              Horizon OS window. -->
