@@ -106,7 +106,9 @@ fn run_virtual(args: &[String]) -> Result<(), Failure> {
             let name = args
                 .get(1)
                 .ok_or_else(|| Failure::Usage("'virtual remove' needs an output name".into()))?;
-            eprintln!("note: stop streaming {name} first (emersia stop) — some compositors stall when an output is unplugged mid-capture");
+            eprintln!(
+                "note: on sway 1.11 (wlroots 0.19) unplugging hangs while any client has the output bound — stop emersia-daemon first (#115); sway ≥ 1.12 is fine"
+            );
             vo::remove(compositor, name).map_err(Failure::Runtime)
         }
         Some("list") => {
