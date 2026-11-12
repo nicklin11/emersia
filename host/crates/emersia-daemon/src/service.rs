@@ -1278,7 +1278,7 @@ pub fn run_stream(mut engine: Engine, service: Arc<Service>, stream: u8) {
     // encoder restarts (a device joining, a keyframe request). Shared with the
     // network thread, which answers clock probes on the same clock.
     let stream_epoch = service.stream_epoch();
-    let mut last_peers = 0usize;
+    let mut last_sessions = 0u64;
     let mut applied_output: Option<String> = None;
     let mut last_forced_keyframe = Instant::now();
     let mut last_refresh = Instant::now();
@@ -1287,21 +1287,19 @@ pub fn run_stream(mut engine: Engine, service: Arc<Service>, stream: u8) {
         // Receiving (handshakes, revocation, device messages) runs on the
         // network thread; the engine only watches the peer count.
         if let Some(transport) = engine.transport.as_ref() {
-            let peers = crate::network::lock(transport).peer_count();
-            if peers > last_peers {
-                // A device just connected. It has no prior frames, so it cannot
-                // decode anything until a keyframe arrives. Dropping the
-                // encoder makes the next frame an IDR, which is the only way to
-                // force one over a raw ffmpeg pipe — there is no control
-                // channel. Costs one encoder restart per connection.
-                if last_peers > 0 || engine.encoder.is_some() {
-                    eprintln!(
-                        "emersia-daemon: new device connected, restarting encoder for a keyframe"
-                    );
+            let sessions = crate::network::lock(transport).sessions_established();
+            if sessions != last_sessions {
+                // A device just (re)connected. Its new session has no prior
+                // frames, so it cannot decode until a keyframe arrives — also
+                // when it merely reconnected, which leaves the peer count
+                // unchanged. Dropping the encoder makes the next frame an IDR,
+                // the only way to force one over a raw ffmpeg pipe.
+                if engine.encoder.is_some() {
+                    eprintln!("emersia-daemon: new session, restarting encoder for a keyframe");
                 }
                 engine.encoder = None;
             }
-            last_peers = peers;
+            last_sessions = sessions;
             // A device lost a frame and cannot decode until an IDR. Restarting
             // the encoder is the only way to force one through the ffmpeg
             // pipe, so requests are coalesced and rate-limited.

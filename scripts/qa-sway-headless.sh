@@ -102,10 +102,17 @@ step "streaming HEADLESS-2 and $virt at once (two streams)"
 ctl --fps 30 start HEADLESS-2 "$virt" >/dev/null
 
 # Capture is damage-driven: keep the output changing while we receive.
+# The virtual output gets no `bg` (a swaybg left on an output that is later
+# unplugged spins and starves sway 1.11's IPC); its damage is the cursor,
+# which captures now composite, moving back and forth across it.
+read -r vx vy vw vh < <(swaymsg -r -t get_outputs | python3 -c '
+import json, sys
+o = [o for o in json.load(sys.stdin) if o["name"] == sys.argv[1]][0]["rect"]
+print(o["x"], o["y"], o["width"], o["height"])' "$virt")
 (for i in $(seq 400); do
    c=$(printf '%02x%02x%02x' $((i * 7 % 256)) 80 $((255 - i * 7 % 256)))
    swaymsg "output HEADLESS-2 bg #$c solid_color" >/dev/null 2>&1 || exit 0
-   swaymsg "output $virt bg #$c solid_color" >/dev/null 2>&1 || exit 0
+   swaymsg "seat seat0 cursor set $((vx + 50 + i * 37 % (vw - 100))) $((vy + vh / 2))" >/dev/null 2>&1 || exit 0
    sleep 0.05
  done) &
 damage_pid=$!
