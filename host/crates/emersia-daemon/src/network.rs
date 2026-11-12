@@ -20,6 +20,9 @@ use crate::transport_pairing as pairing;
 /// Read timeout: how quickly the thread notices shutdown and revocations when
 /// no datagram arrives.
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
+/// A session with no record for this long is closed (clients ping at 1 Hz).
+const PEER_TIMEOUT: Duration = Duration::from_secs(6);
+
 /// Presence announcement period (always, while the stream port is bound).
 const PRESENCE_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -90,6 +93,7 @@ pub fn spawn(
     endpoint: SharedEndpoint,
     service: Arc<Service>,
     input_enabled: bool,
+    notify: bool,
 ) -> std::io::Result<JoinHandle<()>> {
     let socket = lock(&endpoint).try_clone_socket()?;
     socket.set_read_timeout(Some(READ_TIMEOUT))?;
@@ -98,7 +102,7 @@ pub fn spawn(
     socket.set_broadcast(true)?;
     std::thread::Builder::new()
         .name("emersia-net".into())
-        .spawn(move || run(socket, endpoint, service, input_enabled))
+        .spawn(move || run(socket, endpoint, service, input_enabled, notify))
 }
 
 fn run(
@@ -106,8 +110,10 @@ fn run(
     endpoint: SharedEndpoint,
     service: Arc<Service>,
     input_enabled: bool,
+    notify: bool,
 ) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut known_peers: std::collections::BTreeSet<[u8; 8]> = Default::default();
     let mut injector = Injector::default();
     let stream_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
     let host_name = std::fs::read_to_string("/proc/sys/kernel/hostname")
@@ -200,6 +206,14 @@ fn run(
                 eprintln!("emersia-daemon: stream reply failed: {e}");
             }
         }
+        // Liveness: clients ping every second; silence means the headset is
+        // gone, so stop encoding and sending for it.
+        for id in ep.expire_idle(PEER_TIMEOUT) {
+            eprintln!(
+                "emersia-daemon: device {} went silent; session closed",
+                hex::encode(id)
+            );
+        }
         let records = ep.take_control();
         // Clock probes are answered at once, under the lock already held, so
         // the reply's host time is as close to the probe's arrival as possible.
@@ -234,6 +248,32 @@ fn run(
         }
         if peers == 0 {
             injector.release_all();
+        }
+        // Visible consent: announce sessions starting and ending.
+        let current: std::collections::BTreeSet<[u8; 8]> =
+            lock(&endpoint).peer_ids().into_iter().collect();
+        if current != known_peers {
+            let name = |id: &[u8; 8]| {
+                let hex_id = hex::encode(id);
+                service
+                    .lock_pairing()
+                    .devices()
+                    .iter()
+                    .find(|d| d.id == hex_id)
+                    .map(|d| d.name.clone())
+                    .unwrap_or(hex_id)
+            };
+            for id in current.difference(&known_peers) {
+                if notify {
+                    crate::notify::send(crate::notify::Event::Connected, &name(id));
+                }
+            }
+            for id in known_peers.difference(&current) {
+                if notify {
+                    crate::notify::send(crate::notify::Event::Disconnected, &name(id));
+                }
+            }
+            known_peers = current;
         }
         service.set_stream_peers(peers);
     }
