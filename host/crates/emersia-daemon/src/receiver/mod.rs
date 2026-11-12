@@ -248,7 +248,13 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
     let mut keyframes = 0usize;
     let mut codec_name: Option<&str> = None;
 
+    let mut last_ping = Instant::now();
     while frames < opts.frames {
+        // Keep the session alive: the host closes sessions silent for 6 s.
+        if last_ping.elapsed() >= Duration::from_secs(1) {
+            last_ping = Instant::now();
+            let _ = client.send_control(crate::transport::control::PING, &0u64.to_be_bytes());
+        }
         let (header, payload) = match client.recv_record(opts.timeout) {
             Ok(v) => v,
             Err(_) => {

@@ -53,6 +53,8 @@ pub struct Peer {
     pub session: Session,
     /// Replay window for records received *from* this device.
     pub window: ReplayWindow,
+    /// When this device was last heard from (any authenticated record).
+    pub last_seen: Instant,
     /// Next outbound record sequence for this device.
     ///
     /// Per peer, not per endpoint: with a shared counter, frames sent to one
@@ -239,6 +241,7 @@ impl HostEndpoint {
                 addr: from,
                 session: pending.session,
                 window: ReplayWindow::default(),
+                last_seen: Instant::now(),
                 next_sequence: 0,
             },
         );
@@ -258,6 +261,7 @@ impl HostEndpoint {
         ) else {
             return;
         };
+        peer.last_seen = Instant::now();
         if self.inbox.len() >= MAX_INBOX {
             self.inbox.pop_front();
         }
@@ -266,6 +270,23 @@ impl HostEndpoint {
             payload_type: header.payload_type,
             payload,
         });
+    }
+
+    /// Drop peers not heard from for `timeout` (headset switched off, out of
+    /// range). Clients ping every second, so silence means gone; without
+    /// this the host kept encoding and sending to them forever.
+    pub fn expire_idle(&mut self, timeout: Duration) -> Vec<[u8; DEVICE_ID_LEN]> {
+        let now = Instant::now();
+        let gone: Vec<_> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| now.duration_since(p.last_seen) >= timeout)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &gone {
+            self.peers.remove(id);
+        }
+        gone
     }
 
     /// Drain authenticated control records received since the last call.
@@ -712,6 +733,27 @@ mod tests {
         let (packet, from) = &raw[0];
         host.dispatch(packet, *from, &mut deny).unwrap();
         assert!(host.take_control().is_empty());
+    }
+
+    #[test]
+    fn silent_peers_expire_and_talking_ones_stay() {
+        let (mut host, mut client, id) = established();
+        assert!(host.expire_idle(Duration::from_secs(60)).is_empty());
+        std::thread::sleep(Duration::from_millis(30));
+        client
+            .send_control(crate::transport::control::PING, &0u64.to_be_bytes())
+            .unwrap();
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (n, from) = host.socket.recv_from(&mut buf).unwrap();
+        let mut deny = |_: &[u8; DEVICE_ID_LEN], _: &[u8; 32]| false;
+        host.dispatch(&buf[..n], from, &mut deny).unwrap();
+        assert!(
+            host.expire_idle(Duration::from_millis(25)).is_empty(),
+            "a record just arrived"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(host.expire_idle(Duration::from_millis(25)), vec![id]);
+        assert_eq!(host.peer_count(), 0);
     }
 
     #[test]
