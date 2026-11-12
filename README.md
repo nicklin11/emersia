@@ -23,8 +23,9 @@ the [project board](https://github.com/users/nicklin11/projects/4).
 
 - Host: direct Wayland capture (`ext-image-copy-capture`, `wlr-screencopy`
   fallback), GPU colour conversion + hardware H.264/HEVC (VAAPI/NVENC/AMF/QSV),
-  forward-secret encrypted UDP, pairing/revocation, headset input via
-  `uinput`, systemd user service. Verified on niri and (headless, in CI) sway.
+  forward-secret encrypted UDP, desktop audio, cursor compositing,
+  pairing/revocation, headset input via `uinput`, presence announcements so a
+  headset follows the PC to a new IP, systemd user service. Verified on niri and (headless, in CI) sway.
 - Quest client: Rust core with NDK MediaCodec hardware decode into a Horizon
   OS panel, keyframe recovery, pointer/keyboard input, on-headset latency
   readout. Measured ≈ 16 ms capture → decoded at 60 fps
@@ -51,7 +52,8 @@ The desktop appears as a floating panel. Point at it with a controller or
 hand and pinch/trigger to click, use the thumbstick to scroll; a Bluetooth
 keyboard paired to the headset types into the host. The daemon injects this
 through `/dev/uinput` (your user needs the `input` group; `--no-input` turns it
-off). Needs the Android SDK/NDK and a Rust
+off). Desktop audio plays in the headset too (`--no-audio` turns it off), and
+the mouse pointer is drawn into the stream (`--no-cursor`). Needs the Android SDK/NDK and a Rust
 toolchain with `aarch64-linux-android` (see `client/android/build.sh`). If a
 host firewall is active, allow the stream port (UDP 47800 by default); the
 script prints the exact `ufw` command when it detects one.
