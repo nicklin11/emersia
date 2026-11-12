@@ -22,6 +22,7 @@ mod receiver;
 mod service;
 mod shm;
 
+use emersia_transport::pairing as transport_pairing;
 use emersia_transport::{codec, crypto, input, transport};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -17,6 +18,7 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.WindowManager;
+import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 
@@ -44,6 +46,31 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     private long handle;
     private WifiManager.WifiLock wifiLock;
     private InputMapper input;
+    private PairingPanel pairingPanel;
+    private Button pairButton;
+    private long pairHandle;
+    private WifiManager.MulticastLock multicastLock;
+    private static final long PAIR_POLL_MS = 250;
+
+    private final Runnable pairPoll = new Runnable() {
+        @Override public void run() {
+            if (pairHandle == 0) return;
+            String line = NativeBridge.nativePairStatus(pairHandle);
+            if (line.startsWith("accepted|")) {
+                String[] p = line.split("\\|", -1);
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                        .putString(EXTRA_SERVER, p[1]).putString(EXTRA_HOST_KEY, p[2]).apply();
+                stopPairing();
+                if (holder != null) {
+                    stop();
+                    start();
+                }
+                return;
+            }
+            pairingPanel.render(line);
+            ui.postDelayed(this, PAIR_POLL_MS);
+        }
+    };
     /** When streaming began, for auto-hiding the overlay; 0 = not streaming. */
     private long streamingSince;
     /** The overlay stays this long after streaming starts, then gets out of the way. */
@@ -62,6 +89,8 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
                 }
                 boolean show = streamingSince == 0 || now - streamingSince < OVERLAY_LINGER_MS;
                 status.setVisibility(show ? View.VISIBLE : View.GONE);
+                // Re-pairing is offered whenever we are not streaming.
+                pairButton.setVisibility(streamingSince == 0 && pairHandle == 0 ? View.VISIBLE : View.GONE);
             }
             ui.postDelayed(this, STATUS_PERIOD_MS);
         }
@@ -91,6 +120,27 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         video.setOnTouchListener((v, e) -> input.onTouch(e));
         video.setOnGenericMotionListener((v, e) -> input.onGenericMotion(e));
         status.setFocusable(false);
+
+        pairButton = new Button(this);
+        pairButton.setText("Pair with a PC");
+        pairButton.setAllCaps(false);
+        pairButton.setOnClickListener(v -> startPairing());
+        root.addView(pairButton, new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.END));
+
+        pairingPanel = new PairingPanel(this, new PairingPanel.Listener() {
+            @Override public void onConfirm() {
+                if (pairHandle != 0) NativeBridge.nativePairConfirm(pairHandle);
+            }
+            @Override public void onCancel() {
+                stopPairing();
+            }
+            @Override public void onRetry() {
+                stopPairing();
+                startPairing();
+            }
+        });
+        pairingPanel.setVisibility(View.GONE);
+        root.addView(pairingPanel, new FrameLayout.LayoutParams(-1, -1));
         setContentView(root);
 
         video.getHolder().setFixedSize(VIDEO_W, VIDEO_H);
@@ -98,7 +148,39 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         if (wifi != null) {
             wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "emersia");
+            multicastLock = wifi.createMulticastLock("emersia-pairing");
         }
+    }
+
+    /** Listen for a PC's pairing beacon and run the code exchange (ADR 0008). */
+    private void startPairing() {
+        if (pairHandle != 0) return;
+        String name = Build.MODEL != null ? Build.MODEL.replace('_', ' ') : "Quest";
+        pairHandle = NativeBridge.nativePairStart(getFilesDir().getAbsolutePath(), name);
+        if (pairHandle == 0) {
+            status.setText("could not start pairing — see `adb logcat -s emersia`");
+            return;
+        }
+        // Some Wi-Fi drivers drop broadcast frames unless an app holds this.
+        if (multicastLock != null && !multicastLock.isHeld()) multicastLock.acquire();
+        pairingPanel.setVisibility(View.VISIBLE);
+        pairButton.setVisibility(View.GONE);
+        ui.post(pairPoll);
+    }
+
+    private void stopPairing() {
+        ui.removeCallbacks(pairPoll);
+        if (pairHandle != 0) {
+            NativeBridge.nativePairStop(pairHandle);
+            pairHandle = 0;
+        }
+        if (multicastLock != null && multicastLock.isHeld()) multicastLock.release();
+        pairingPanel.setVisibility(View.GONE);
+    }
+
+    @Override protected void onDestroy() {
+        stopPairing();
+        super.onDestroy();
     }
 
     @Override protected void onNewIntent(Intent intent) {
@@ -141,6 +223,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         String files = getFilesDir().getAbsolutePath();
         if (server == null || key == null) {
             status.setText(unconfigured(NativeBridge.nativeIdentity(files)));
+            startPairing();
             return;
         }
         handle = NativeBridge.nativeStart(holder.getSurface(), files, server, key);
@@ -162,11 +245,8 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     private static String unconfigured(String identity) {
         String[] parts = identity.split(" ");
         if (parts.length != 2) return identity;
-        return "Emersia is not paired with a host yet.\n\n"
-                + "Device id:  " + parts[1] + "\n"
-                + "Public key: " + parts[0] + "\n\n"
-                + "With the headset on USB, run scripts/quest-mirror.sh on the host.\n"
-                + "Or pair by hand: emersia pair new; emersia pair accept CODE --name quest --public-key <key>";
+        return "Not paired with a PC yet. Device id " + parts[1] + ".\n"
+                + "Run `emersia pair headset` on the PC, or scripts/quest-mirror.sh over USB.";
     }
 
     @Override public boolean dispatchKeyEvent(KeyEvent e) {

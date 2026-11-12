@@ -34,8 +34,14 @@ the [project board](https://github.com/users/nicklin11/projects/4).
 
 ### Try it: mirror your screen to a Quest
 
-With the headset on USB (developer mode, USB debugging allowed) and on the same
-network as the host:
+Install the host (`scripts/install.sh`), open Emersia on the headset, and on
+the PC run:
+
+```sh
+emersia pair headset    # compare the 6-digit code with the headset, confirm on both
+```
+
+The headset then mirrors your desktop. For development over USB instead:
 
 ```sh
 scripts/quest-mirror.sh --output DP-1     # builds, installs, pairs, streams

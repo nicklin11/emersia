@@ -33,4 +33,16 @@ final class NativeBridge {
 
     /** Linux evdev key code. */
     static native void nativeKey(long handle, int code, boolean down);
+
+    /** Starts in-headset pairing (listens for a PC's beacon); returns a handle. */
+    static native long nativePairStart(String filesDir, String deviceName);
+
+    /** "searching" | "code|123 456|host|confirmed" | "accepted|ip:port|key" | "rejected" | "error|msg". */
+    static native String nativePairStatus(long handle);
+
+    /** The headset user confirms the codes match. */
+    static native void nativePairConfirm(long handle);
+
+    /** Cancels or finishes pairing and frees the handle. */
+    static native void nativePairStop(long handle);
 }
