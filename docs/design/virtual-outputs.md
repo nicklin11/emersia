@@ -70,3 +70,9 @@ the compositor believes in — or we stream something other than an output.
   from the user's session; on niri it prints the options above.
 - CI (headless sway) creates a virtual output while the daemon runs and
   streams it alongside another output, decode-verifying both.
+
+### Known compositor issue
+
+sway 1.11 / wlroots 0.19 hangs in `wlr_output_destroy_global` when an output
+that a client has bound is unplugged (#115, diagnosed with gdb in CI). Stop
+`emersia-daemon` before `emersia virtual remove` there; sway 1.12 is fine.
