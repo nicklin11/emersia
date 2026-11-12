@@ -114,6 +114,8 @@ fn run(
 ) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut known_peers: std::collections::BTreeSet<[u8; 8]> = Default::default();
+    // View-only devices whose dropped input has been logged (once each).
+    let mut view_only_noted: std::collections::BTreeSet<[u8; 8]> = Default::default();
     let mut injector = Injector::default();
     let stream_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
     let host_name = std::fs::read_to_string("/proc/sys/kernel/hostname")
@@ -234,15 +236,27 @@ fn run(
                 control::KEYFRAME_REQUEST => {
                     service.request_keyframe(record.payload.first().copied().unwrap_or(0))
                 }
-                control::INPUT if input_enabled => match crate::input::decode(&record.payload) {
-                    Ok(events) => {
-                        injector.apply(&events, |stream| service.input_layout_for(stream))
+                control::INPUT if input_enabled => {
+                    // View-only devices (#140) watch but never reach uinput.
+                    // The trust store is read per record, so a toggle applies
+                    // immediately.
+                    let device = hex::encode(record.device_id);
+                    if !service.lock_pairing().input_allowed(&device) {
+                        if view_only_noted.insert(record.device_id) {
+                            // Anything it was holding when it lost control is let go.
+                            injector.release_all();
+                            eprintln!("emersia-daemon: device {device} is view-only; its input is ignored");
+                        }
+                        continue;
                     }
-                    Err(e) => eprintln!(
-                        "emersia-daemon: bad input record from {}: {e}",
-                        hex::encode(record.device_id)
-                    ),
-                },
+                    view_only_noted.remove(&record.device_id);
+                    match crate::input::decode(&record.payload) {
+                        Ok(events) => {
+                            injector.apply(&events, |stream| service.input_layout_for(stream))
+                        }
+                        Err(e) => eprintln!("emersia-daemon: bad input record from {device}: {e}"),
+                    }
+                }
                 _ => {}
             }
         }

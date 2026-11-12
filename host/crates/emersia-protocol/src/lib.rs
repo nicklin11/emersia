@@ -92,6 +92,8 @@ pub enum Command {
     Devices,
     /// Remove a paired device.
     Revoke(RevokeArgs),
+    /// Allow or forbid a paired device's input (view-only when false).
+    DeviceInput(DeviceInputArgs),
     /// Set capture targets.
     Select(SelectArgs),
     /// Anything this daemon does not know.
@@ -139,6 +141,13 @@ pub struct DeviceInfo {
     /// Unix seconds.
     pub paired_at: u64,
     pub revoked: bool,
+    /// May this device inject input? (false = view-only)
+    #[serde(default = "default_true")]
+    pub input: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +166,13 @@ pub enum PairAction {
     Reject,
     /// Close the pairing window.
     Close,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceInputArgs {
+    pub device: String,
+    /// `false` = view-only: the device streams but its input is dropped.
+    pub input: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,5 +353,25 @@ mod tests {
             decode_request("{not json"),
             Err(ProtocolError::Json(_))
         ));
+    }
+
+    #[test]
+    fn device_input_wire_format_and_legacy_device_info() {
+        let cmd = Command::DeviceInput(DeviceInputArgs {
+            device: "ab".into(),
+            input: false,
+        });
+        let v = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"cmd": "device_input", "device": "ab", "input": false})
+        );
+        let old: DeviceInfo =
+            serde_json::from_str(r#"{"id":"ab","name":"q","paired_at":1,"revoked":false}"#)
+                .unwrap();
+        assert!(
+            old.input,
+            "a daemon without the field reports devices as controlling"
+        );
     }
 }

@@ -12,8 +12,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use emersia_protocol::{
-    decode_response, encode_request, Command, ErrorInfo, PairAction, PairArgs, Request, Response,
-    RevokeArgs, SelectArgs, StartArgs, PROTOCOL_VERSION,
+    decode_response, encode_request, Command, DeviceInputArgs, ErrorInfo, PairAction, PairArgs,
+    Request, Response, RevokeArgs, SelectArgs, StartArgs, PROTOCOL_VERSION,
 };
 
 /// Crate version, e.g. `0.0.1`.
@@ -328,6 +328,22 @@ fn print_human(payload: &serde_json::Value) {
         return;
     }
 
+    if let (Some(device), Some(input)) = (
+        payload.get("device").and_then(|v| v.as_str()),
+        payload.get("input").and_then(|v| v.as_bool()),
+    ) {
+        let name = payload
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(device);
+        if input {
+            println!("{name} ({device}) may control this desktop");
+        } else {
+            println!("{name} ({device}) is view-only: it can watch, its input is ignored");
+        }
+        return;
+    }
+
     if payload.get("devices").is_some() {
         let arr = payload["devices"].as_array().cloned().unwrap_or_default();
         if arr.is_empty() {
@@ -338,7 +354,12 @@ fn print_human(payload: &serde_json::Value) {
                 let id = d.get("id").and_then(|v| v.as_str()).unwrap_or("?");
                 let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                 let revoked = d.get("revoked").and_then(|v| v.as_bool()).unwrap_or(false);
-                let state = if revoked { "revoked" } else { "active" };
+                let input = d.get("input").and_then(|v| v.as_bool()).unwrap_or(true);
+                let state = match (revoked, input) {
+                    (true, _) => "revoked",
+                    (false, true) => "active",
+                    (false, false) => "active, view-only",
+                };
                 println!("  {id}  {name}  [{state}]");
             }
         }
@@ -554,6 +575,17 @@ fn build_command(
                 .ok_or_else(|| Failure::Usage("'revoke' needs a device id".into()))?;
             Ok(Command::Revoke(RevokeArgs { device }))
         }
+        "allow-input" => {
+            let device = positionals.first().cloned().ok_or_else(|| {
+                Failure::Usage("'allow-input' needs a device id and on|off".into())
+            })?;
+            let input = match positionals.get(1).map(String::as_str) {
+                Some("on" | "yes" | "true") => true,
+                Some("off" | "no" | "false") => false,
+                _ => return Err(Failure::Usage("'allow-input' needs on or off".into())),
+            };
+            Ok(Command::DeviceInput(DeviceInputArgs { device, input }))
+        }
         "select" => Ok(Command::Select(SelectArgs {
             targets: positionals.to_vec(),
         })),
@@ -581,6 +613,7 @@ fn print_help() {
     println!("                           register a device identity");
     println!("  devices                  list paired devices");
     println!("  revoke <id>              revoke a paired device");
+    println!("  allow-input <id> on|off  let a device control the desktop, or make it view-only");
     println!("  select [TARGET…]         set capture targets (empty = none)");
     println!("\nOptions:");
     println!("  --socket PATH   control socket [default: $XDG_RUNTIME_DIR/emersia/control.sock]");
@@ -622,6 +655,13 @@ mod tests {
         assert_eq!(parsed(&["stop"]).command, Command::Stop);
         assert_eq!(parsed(&["events"]).command, Command::Events);
         assert_eq!(parsed(&["devices"]).command, Command::Devices);
+        assert_eq!(
+            parsed(&["allow-input", "abcd", "off"]).command,
+            Command::DeviceInput(DeviceInputArgs {
+                device: "abcd".into(),
+                input: false
+            })
+        );
         assert_eq!(parsed(&["screens"]).command, Command::Screens);
     }
 

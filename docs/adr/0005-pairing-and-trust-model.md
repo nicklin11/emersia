@@ -46,3 +46,8 @@ multi-user servers.
 - uinput access needs a udev/group setup step — documented alongside pairing
   in M1.
 - A crypto-transport spike ADR (0006) will record the M1 measurement results.
+- Per-device input permission (#140): a paired device can be made
+  **view-only** (`emersia allow-input <id> off`, or the companion app). It
+  still streams; its input records are dropped by the daemon before uinput,
+  checked against the trust store per record. The flag survives re-pairing,
+  and stores without it load as allowed.

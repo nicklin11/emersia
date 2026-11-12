@@ -70,6 +70,18 @@ async function refresh() {
           const li = document.createElement("li");
           const name = document.createElement("span");
           name.textContent = `${dev.name}  ·  ${dev.id}`;
+          // View-only headsets watch but cannot control the desktop (#140).
+          const ctl = document.createElement("label");
+          ctl.className = "small";
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          box.checked = dev.input !== false;
+          box.onchange = async () => {
+            await invoke("set_input", { device: dev.id, input: box.checked }).catch(showError);
+            refresh();
+          };
+          ctl.append(box, " Control");
+          ctl.title = "Unchecked: view-only — the headset can watch, its input is ignored";
           const btn = document.createElement("button");
           btn.textContent = "Revoke";
           btn.className = "danger small";
@@ -79,7 +91,7 @@ async function refresh() {
               refresh();
             }
           };
-          li.append(name, btn);
+          li.append(name, ctl, btn);
           return li;
         }),
     );

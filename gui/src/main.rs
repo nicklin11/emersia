@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use emersia_protocol::{
-    decode_response, encode_request, Command, PairAction, PairArgs, Request, Response, RevokeArgs,
-    StartArgs, PROTOCOL_VERSION,
+    decode_response, encode_request, Command, DeviceInputArgs, PairAction, PairArgs, Request,
+    Response, RevokeArgs, StartArgs, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tauri::image::Image;
@@ -84,6 +84,11 @@ async fn screens() -> Result<Value, String> {
 #[tauri::command]
 async fn revoke(device: String) -> Result<Value, String> {
     call(Command::Revoke(RevokeArgs { device }))
+}
+
+#[tauri::command]
+async fn set_input(device: String, input: bool) -> Result<Value, String> {
+    call(Command::DeviceInput(DeviceInputArgs { device, input }))
 }
 
 #[tauri::command]
@@ -169,6 +174,7 @@ fn main() {
             devices,
             screens,
             revoke,
+            set_input,
             start,
             stop,
             pair_open,
