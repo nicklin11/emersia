@@ -38,6 +38,13 @@ the [project board](https://github.com/users/nicklin11/projects/4).
 - Next: the immersive OpenXR view (curved screens placed in 3D), zero-copy
   capture.
 
+### Companion app
+
+`cd gui && cargo run --release` — a tray icon that turns red whenever your
+screen is shared (tooltip: what, with how many headsets), plus a window with
+live status, Start/Stop, paired headsets with Revoke, and in-headset pairing
+with the 6-digit code. Closing the window keeps the tray indicator.
+
 ### Try it: mirror your screen to a Quest
 
 Install the host (`scripts/install.sh`), open Emersia on the headset, and on
@@ -95,7 +102,7 @@ Headset: Meta Quest 2 / 3 / 3S / Pro (OpenXR).
 host/     Rust workspace: emersia-daemon (streaming engine), emersia (CLI),
           emersia-transport (wire protocol shared with the client), emersia-protocol
 client/   Quest client: Rust core (decode/transport) + Android panel shell (M2)
-gui/      Tauri companion app                (from M4)
+gui/      Tauri companion app: tray sharing indicator, status, devices, pairing
 docs/     ADRs and design documents
 scripts/  development & validation tooling
 ```

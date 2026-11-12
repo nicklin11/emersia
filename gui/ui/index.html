@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Emersia</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Emersia</h1>
+    <span id="badge" class="badge">…</span>
+  </header>
+
+  <section>
+    <h2>Sharing</h2>
+    <p id="summary" class="muted">Connecting to the daemon…</p>
+    <dl id="stats" class="stats"></dl>
+    <div class="row">
+      <select id="outputs" multiple size="2" aria-label="Outputs to stream"></select>
+      <div class="col">
+        <button id="start">Start</button>
+        <button id="stop" class="danger">Stop sharing</button>
+      </div>
+    </div>
+    <p class="hint">Select one or more outputs; each appears as its own panel in the headset.</p>
+  </section>
+
+  <section>
+    <h2>Headsets</h2>
+    <ul id="devices" class="list"></ul>
+    <button id="pair">Pair a headset…</button>
+    <div id="pairing" class="pairing" hidden>
+      <p id="pair-text">Open Emersia in the headset and choose “Pair with a PC”.</p>
+      <p id="pair-code" class="code"></p>
+      <div class="row">
+        <button id="pair-yes">Codes match</button>
+        <button id="pair-no" class="danger">Don’t match</button>
+        <button id="pair-cancel">Cancel</button>
+      </div>
+    </div>
+  </section>
+
+  <p id="error" class="error" hidden></p>
+  <script src="app.js"></script>
+</body>
+</html>
