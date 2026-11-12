@@ -38,6 +38,15 @@ pub mod control {
     /// `device_us: u64 || host_us: u64`, where `host_us` is on the same clock
     /// as frame timestamps (90 kHz ticks = `host_us * 9 / 100`).
     pub const PONG: u8 = 123;
+    /// Desktop audio, host → device: interleaved stereo s16le at
+    /// [`AUDIO_RATE`] Hz, [`AUDIO_CHUNK_FRAMES`] frames per record.
+    pub const AUDIO_PCM: u8 = 124;
+    pub const AUDIO_RATE: u32 = 48_000;
+    pub const AUDIO_CHANNELS: u32 = 2;
+    /// 5 ms per record: 960 bytes, so a chunk always fits one datagram
+    /// (`RECORD_MTU`) and never needs reassembly.
+    pub const AUDIO_CHUNK_FRAMES: usize = 240;
+    pub const AUDIO_CHUNK_BYTES: usize = AUDIO_CHUNK_FRAMES * AUDIO_CHANNELS as usize * 2;
 
     /// Encode a PONG payload.
     pub fn pong(device_us: u64, host_us: u64) -> [u8; 16] {
@@ -66,6 +75,9 @@ pub const FRAME_HEADER_LEN: usize = 24;
 /// Conservative datagram budget for one record. Well under any typical path
 /// MTU, so a frame fragment is never fragmented by the IP layer.
 pub const RECORD_MTU: usize = 1200;
+
+// An audio chunk must fit one record: audio is never fragmented.
+const _: () = assert!(control::AUDIO_CHUNK_BYTES <= RECORD_MTU - FRAME_HEADER_LEN);
 
 /// RTP video clock rate (ADR 0003): timestamps count in 90 kHz units.
 pub const VIDEO_CLOCK_HZ: u32 = 90_000;

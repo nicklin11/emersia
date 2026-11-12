@@ -37,7 +37,7 @@ pub fn render(server: &str, stats: &Stats, sampler: &Sampler) -> String {
     let bytes = stats.bytes_received.load(Ordering::Relaxed);
     let (fps, mbps) = sampler.rates(submitted, bytes);
     let mut text = format!(
-        "{} · {}\n{:.0} fps · {:.1} Mbit/s · decoder {}\nframes {} · skipped {} · losses {} · IDR requests {} · input {} · sessions {} · handshake {:.1} ms",
+        "{} · {}\n{:.0} fps · {:.1} Mbit/s · decoder {}\nframes {} · skipped {} · losses {} · IDR requests {} · input {} · audio {} · sessions {} · handshake {:.1} ms",
         server,
         stats.phase().label(),
         fps,
@@ -48,6 +48,7 @@ pub fn render(server: &str, stats: &Stats, sampler: &Sampler) -> String {
         stats.losses.load(Ordering::Relaxed),
         stats.keyframe_requests.load(Ordering::Relaxed),
         stats.input_events.load(Ordering::Relaxed),
+        stats.audio_chunks.load(Ordering::Relaxed),
         stats.sessions.load(Ordering::Relaxed),
         stats.handshake_us.load(Ordering::Relaxed) as f64 / 1000.0,
     );

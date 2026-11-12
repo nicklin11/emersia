@@ -33,6 +33,7 @@ pub struct SurfaceDecoder {
     window: NativeWindow,
     codec: Option<(Codec, MediaCodec)>,
     stats: Arc<crate::session::Stats>,
+    audio: crate::audio_out::AudioOut,
     /// When each queued unit (by pts) went in, to time the decoder.
     queued: std::collections::VecDeque<(u64, std::time::Instant)>,
 }
@@ -43,6 +44,7 @@ impl SurfaceDecoder {
             window,
             codec: None,
             stats,
+            audio: crate::audio_out::AudioOut::default(),
             queued: std::collections::VecDeque::new(),
         }
     }
@@ -184,6 +186,10 @@ impl VideoSink for SurfaceDecoder {
 
     fn service(&mut self) {
         self.drain();
+    }
+
+    fn audio(&mut self, pcm: &[u8]) {
+        self.audio.push(pcm);
     }
 
     fn reset(&mut self) {

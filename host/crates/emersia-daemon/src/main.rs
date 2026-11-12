@@ -11,6 +11,7 @@
 //!
 //! M1.2 scope: no encoding, no transport, no input yet (see #3).
 
+mod audio;
 mod capture;
 mod control;
 mod encoder;
@@ -71,6 +72,8 @@ struct ServeOpts {
     input: bool,
     /// Composite the pointer into the stream.
     cursor: bool,
+    /// Stream desktop audio to connected devices.
+    audio: bool,
 }
 
 fn main() {
@@ -148,6 +151,7 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
     let mut stream_port: Option<u16> = None;
     let mut input = true;
     let mut cursor = true;
+    let mut audio = true;
     let mut encoder_choice = encoder::EncoderChoice::Auto;
     let mut bitrate = encoder::EncoderConfig::default().bitrate;
 
@@ -213,6 +217,7 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
             }
             "--no-input" => input = false,
             "--no-cursor" => cursor = false,
+            "--no-audio" => audio = false,
             "--socket" => {
                 let value = rest
                     .next()
@@ -232,6 +237,7 @@ fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
             bitrate,
             input,
             cursor,
+            audio,
         }),
         "receive" => Mode::Receive,
         _ => Mode::Capture(CaptureOpts {
@@ -268,6 +274,7 @@ fn print_help() {
     println!("  --stream-port N      bind the encrypted UDP stream to port N (default: off)");
     println!("  --no-input           ignore pointer/keyboard input from paired devices");
     println!("  --no-cursor          leave the mouse pointer out of the stream");
+    println!("  --no-audio           do not stream desktop audio");
     println!("  --encoder NAME       auto | vaapi | nvenc | amf | qsv | sw (default: auto)");
     println!("  --bitrate RATE       target bitrate, e.g. 30M or 8000k (default: 30M)");
     println!(
@@ -355,6 +362,13 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
         ),
         None => None,
     };
+    let audio_thread = match (engine.transport(), opts.audio) {
+        (Some(endpoint), true) => Some(
+            audio::spawn(Arc::clone(endpoint), Arc::clone(&svc))
+                .context("could not start the audio thread")?,
+        ),
+        _ => None,
+    };
     service::run_engine(engine, Arc::clone(&svc));
 
     // Engine exited (signal): stop the accept loop and clean up the socket.
@@ -363,6 +377,9 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
         Ok(Ok(())) => {}
         Ok(Err(err)) => eprintln!("emersia-daemon: control server: {err:#}"),
         Err(_) => eprintln!("emersia-daemon: control server thread panicked"),
+    }
+    if let Some(audio) = audio_thread {
+        let _ = audio.join();
     }
     if let Some(net) = net_thread {
         if net.join().is_err() {

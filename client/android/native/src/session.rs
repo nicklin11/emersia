@@ -82,6 +82,7 @@ pub struct Stats {
     pub handshake_us: AtomicU64,
     pub keyframe_requests: AtomicU64,
     pub input_events: AtomicU64,
+    pub audio_chunks: AtomicU64,
     /// Smoothed host capture → frame fully received on the headset, µs.
     /// Zero until the clock offset is known.
     pub capture_to_rx_us: AtomicU64,
@@ -156,6 +157,8 @@ pub trait VideoSink {
     fn service(&mut self) {}
     /// The stream is about to restart from a keyframe (new session).
     fn reset(&mut self) {}
+    /// A desktop audio chunk (`AUDIO_PCM`): interleaved stereo s16le.
+    fn audio(&mut self, _pcm: &[u8]) {}
 }
 
 /// Connection parameters.
@@ -547,6 +550,10 @@ fn stream(
             .bytes_received
             .fetch_add(payload.len() as u64, Ordering::Relaxed);
         let Some(codec) = Codec::from_payload_type(header.payload_type) else {
+            if header.payload_type == control::AUDIO_PCM {
+                sink.audio(&payload);
+                stats.audio_chunks.fetch_add(1, Ordering::Relaxed);
+            }
             if header.payload_type == control::PONG {
                 if let Some((sent, host_us)) = control::parse_pong(&payload) {
                     if clock_sync.sample(sent, host_us, now_us()).is_some() {
