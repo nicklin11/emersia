@@ -39,8 +39,9 @@ the [project board](https://github.com/users/nicklin11/projects/4).
   stream on a curved screen around you, floating in your room via passthrough,
   decoded straight into OpenXR cylinder layers with zero copies
   ([ADR 0009](docs/adr/0009-immersive-cylinder-layers.md)); point with a
-  controller and pull the trigger to click, thumbstick to scroll.
-- Next: adjustable screen layout, zero-copy capture on the host.
+  controller and pull the trigger to click, right thumbstick to scroll; the left
+thumbstick moves the screens closer/farther and resizes them (remembered).
+- Next: zero-copy capture on the host, more desktops (hyprland, GNOME/KDE).
 
 ### Companion app
 

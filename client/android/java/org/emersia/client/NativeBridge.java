@@ -32,7 +32,7 @@ final class NativeBridge {
     static native void nativeDetach(long handle, int stream);
 
     /** Starts immersive mode (OpenXR cylinder screens) on {@code session}; returns a handle. */
-    static native long nativeImmersiveStart(long session, android.app.Activity activity);
+    static native long nativeImmersiveStart(long session, android.app.Activity activity, String filesDir);
 
     /** Ends immersive mode; returns once the OpenXR session is gone. */
     static native void nativeImmersiveStop(long immersive);

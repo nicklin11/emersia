@@ -566,21 +566,26 @@ struct Immersive {
 /// screens in an OpenXR scene for every stream of `session` (ADR 0009).
 #[no_mangle]
 pub extern "system" fn Java_org_emersia_client_NativeBridge_nativeImmersiveStart(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
     activity: JObject,
+    files_dir: JString,
 ) -> jlong {
     init_logging();
     if handle == 0 {
         return 0;
     }
+    let Some(files_dir) = string(&mut env, &files_dir) else {
+        return 0;
+    };
     // SAFETY: as in nativeStatus.
     let running = unsafe { &*(handle as *const Running) };
     let (Ok(vm), Ok(activity)) = (env.get_java_vm(), env.new_global_ref(activity)) else {
         return 0;
     };
     let shared = crate::immersive::Shared {
+        layout_file: PathBuf::from(files_dir).join("immersive-layout"),
         input: running.input.clone(),
         decoders: running.decoders.clone(),
         idr_wanted: running.idr_wanted.clone(),

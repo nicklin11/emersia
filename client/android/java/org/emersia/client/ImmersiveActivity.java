@@ -31,7 +31,7 @@ public final class ImmersiveActivity extends Activity {
         // one surface per stream.
         session = NativeBridge.nativeStart(null, getFilesDir().getAbsolutePath(), server, key);
         NativeBridge.session = session;
-        if (session != 0) immersive = NativeBridge.nativeImmersiveStart(session, this);
+        if (session != 0) immersive = NativeBridge.nativeImmersiveStart(session, this, getFilesDir().getAbsolutePath());
         if (immersive == 0) finish();
     }
 
