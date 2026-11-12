@@ -96,7 +96,9 @@ fn report_encoder_error(service: &Service, error: &crate::encoder::EncoderError)
     }
 }
 
-/// A capturable output as reported by `screens`.
+/// A capture target as reported by `screens`: an output, or (`kind:
+/// "window"`, name `window:<id>`) a single window where the compositor
+/// supports window capture.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScreenInfo {
     pub kind: &'static str,
@@ -104,6 +106,11 @@ pub struct ScreenInfo {
     pub width: u32,
     pub height: u32,
     pub transform: String,
+    /// Window title and app id (windows only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
 }
 
 /// Monotonic, session-scoped capture-rate window.
@@ -909,8 +916,40 @@ fn screen_infos(state: &capture::State) -> Vec<ScreenInfo> {
             width: info.width,
             height: info.height,
             transform: format!("{:?}", info.transform).to_lowercase(),
+            title: None,
+            app_id: None,
+        })
+        .chain(capturable_windows(state))
+        .collect()
+}
+
+/// Open windows, when this compositor can capture single windows
+/// (`ext-foreign-toplevel-image-capture-source`, sway ≥ 1.12).
+fn capturable_windows(state: &capture::State) -> Vec<ScreenInfo> {
+    if state.toplevel_source_mgr.is_none() || state.ext_copy_mgr.is_none() {
+        return Vec::new();
+    }
+    state
+        .toplevels
+        .iter()
+        .filter(|t| !t.identifier.is_empty())
+        .map(|t| ScreenInfo {
+            kind: "window",
+            name: t.target(),
+            width: 0,
+            height: 0,
+            transform: "normal".into(),
+            title: Some(t.title.clone()),
+            app_id: Some(t.app_id.clone()),
         })
         .collect()
+}
+
+/// Names of every capture target (outputs and windows), for change detection.
+fn target_names(state: &capture::State) -> Vec<String> {
+    let mut names = state.output_labels();
+    names.extend(capturable_windows(state).into_iter().map(|w| w.name));
+    names
 }
 
 /// Map a pairing failure onto a stable wire error token.
@@ -959,6 +998,8 @@ pub struct Engine {
     /// Frames encoded on the zero-copy path, for status.
     zc_frames: u64,
     output: wayland_client::protocol::wl_output::WlOutput,
+    /// Set when the target is a single window instead of `output`.
+    window: Option<capture::windows::Toplevel>,
     transform: wayland_client::protocol::wl_output::Transform,
     backend: Backend,
     pub backend_name: &'static str,
@@ -1003,7 +1044,8 @@ impl Engine {
 
     /// Whether this frame should try the zero-copy path.
     fn zero_copy_wanted(&self) -> bool {
-        !matches!(self.zc, ZcState::Off)
+        // The zero-copy path captures outputs with wlr-screencopy.
+        self.window.is_none() && !matches!(self.zc, ZcState::Off)
     }
 
     /// Capture and encode one frame without the CPU touching pixels.
@@ -1288,6 +1330,7 @@ impl Engine {
             force_idr: false,
             zc_frames: 0,
             output,
+            window: None,
             transform,
             backend,
             backend_name: backend.protocol(),
@@ -1300,7 +1343,7 @@ impl Engine {
     /// roundtrips: registry globals, then their name/mode (and geometry).
     /// Returns whether the set of outputs changed.
     pub fn refresh_outputs(&mut self) -> anyhow::Result<bool> {
-        let before = self.state.output_labels();
+        let before = target_names(&self.state);
         self.queue
             .roundtrip(&mut self.state)
             .context("refreshing Wayland globals")?;
@@ -1313,7 +1356,7 @@ impl Engine {
                 .roundtrip(&mut self.state)
                 .context("reading new output layout")?;
         }
-        let after = self.state.output_labels();
+        let after = target_names(&self.state);
         if after != before {
             self.screens = screen_infos(&self.state);
             return Ok(true);
@@ -1321,8 +1364,23 @@ impl Engine {
         Ok(false)
     }
 
-    /// Select a named output from the live discovery state.
+    /// Select a named output — or a window, for `window:<id>` — from the
+    /// live discovery state.
     pub fn set_output(&mut self, name: &str) -> anyhow::Result<()> {
+        if let Some(id) = capture::windows::window_id(name) {
+            if self.backend != Backend::Ext || self.state.toplevel_source_mgr.is_none() {
+                anyhow::bail!("this compositor cannot capture single windows");
+            }
+            let window = self
+                .state
+                .toplevels
+                .iter()
+                .find(|t| t.identifier == id)
+                .with_context(|| format!("no open window {name:?}"))?;
+            self.window = Some(window.clone());
+            return Ok(());
+        }
+        self.window = None;
         let labels = self.state.output_labels();
         let index = capture::select_output(&labels, Some(name))?;
         let info = &self.state.outputs[index];
@@ -1336,6 +1394,11 @@ impl Engine {
     /// coordinates. Without `xdg-output` the output is assumed to be the
     /// whole layout (correct for a single monitor).
     pub fn input_layout(&self) -> Option<(capture::Rect, capture::Rect)> {
+        // No protocol says where a window sits on screen, so a window stream
+        // takes keyboard input only (pointer motion needs a layout).
+        if self.window.is_some() {
+            return None;
+        }
         let info = self.state.outputs.iter().find(|o| o.proxy == self.output)?;
         let output = info.logical.unwrap_or(capture::Rect {
             x: 0,
@@ -1350,7 +1413,13 @@ impl Engine {
     /// Capture exactly one frame with the selected backend.
     pub fn capture_once(&mut self) -> anyhow::Result<capture::CapturedFrame> {
         match self.backend {
-            Backend::Ext => capture::ext::capture(&mut self.queue, &mut self.state, &self.output),
+            Backend::Ext => {
+                let target = match &self.window {
+                    Some(w) => capture::ext::Target::Window(&w.handle),
+                    None => capture::ext::Target::Output(&self.output),
+                };
+                capture::ext::capture(&mut self.queue, &mut self.state, target)
+            }
             Backend::Wlr => capture::wlr::capture(
                 &mut self.queue,
                 &mut self.state,
@@ -2046,6 +2115,8 @@ mod tests {
                     width: 1920,
                     height: 1080,
                     transform: "normal".into(),
+                    title: None,
+                    app_id: None,
                 },
                 ScreenInfo {
                     kind: "output",
@@ -2053,6 +2124,8 @@ mod tests {
                     width: 1920,
                     height: 1080,
                     transform: "normal".into(),
+                    title: None,
+                    app_id: None,
                 },
             ],
             Some("wlr-screencopy"),

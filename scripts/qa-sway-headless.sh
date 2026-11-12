@@ -82,6 +82,13 @@ for o in "${small[@]}"; do swaymsg -t get_outputs | grep -q "\"$o\"" || fail "$o
 
 run() { env XDG_RUNTIME_DIR="$rt" WAYLAND_DISPLAY=wayland-1 XDG_CONFIG_HOME="$work/config" "$@"; }
 
+# A window to share (window capture needs sway >= 1.12; skipped otherwise).
+if command -v mpv >/dev/null; then
+  run mpv --really-quiet --vo=wlshm --title=emersia-qa-window --loop \
+    av://lavfi:testsrc=size=640x481:rate=30 >/dev/null 2>&1 &
+  pids+=($!)
+fi
+
 step "one-shot capture of the virtual output"
 run timeout 30 "$bin/emersia-daemon" capture --output HEADLESS-2 --out "$work/frame.png" | tee "$work/capture.log"
 grep -q "captured 1920x1080" "$work/capture.log" || fail "capture did not return 1920x1080"
@@ -146,6 +153,22 @@ for stream in $(seq 0 $((${#targets[@]} - 1))); do
   grep -q "^decoded:" "$work/receive-$stream.log" || fail "stream $stream did not decode"
 done
 
+window=$(ctl screens --json | python3 -c '
+import json, sys
+w = [s["name"] for s in json.load(sys.stdin)["screens"] if s["kind"] == "window"]
+print(w[0] if w else "")')
+window_result="window capture: skipped (needs sway >= 1.12 and mpv)"
+if [[ -n $window ]]; then
+  step "sharing a single window ($window, odd height 481)"
+  ctl stop >/dev/null
+  ctl --fps 30 start "$window" >/dev/null
+  timeout 60 "$bin/emersia-daemon" receive --server "127.0.0.1:$port" --device-id "$device" \
+    --host-key "$host_key" --private-key "$priv" --frames "$frames" --timeout 10 \
+    | tee "$work/receive-window.log" || fail "receiver failed (window)"
+  grep -q "^decoded:" "$work/receive-window.log" || fail "window stream did not decode"
+  window_result="window capture: OK"
+fi
+
 encoder_used=$(ctl status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["encoder"])')
 backend=$(grep -oP 'capture backend: \K.*' "$work/daemon.log")
 
@@ -155,7 +178,7 @@ step "removing $virt"
 # IPC — seen on sway 1.11) and stop capturing the output.
 kill "$damage_pid" 2>/dev/null || true
 wait "$damage_pid" 2>/dev/null || true
-ctl stop >/dev/null
+ctl stop >/dev/null 2>&1 || true
 # Then let the daemon go entirely: on sway 1.11 an unplug did not return while
 # a client still had the output bound, so check removal with no client.
 kill "$daemon_pid" 2>/dev/null || true
@@ -163,4 +186,4 @@ for _ in $(seq 30); do kill -0 "$daemon_pid" 2>/dev/null || break; sleep 0.1; do
 sleep 0.5
 "$bin/emersia" virtual remove "$virt" || fail "emersia virtual remove failed"
 ! "$bin/emersia" virtual list | grep -qx "$virt" || fail "$virt still listed"
-echo "qa-sway: PASS (${#targets[@]} streams incl. virtual output $virt) — $(swaymsg -t get_version | python3 -c 'import json,sys; print(json.load(sys.stdin)["human_readable"])'), backend $backend, encoder $encoder_used"
+echo "qa-sway: PASS (${#targets[@]} streams incl. virtual output $virt) — $(swaymsg -t get_version | python3 -c 'import json,sys; print(json.load(sys.stdin)["human_readable"])'), backend $backend, encoder $encoder_used; $window_result"

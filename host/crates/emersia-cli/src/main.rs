@@ -337,7 +337,13 @@ fn print_human(payload: &serde_json::Value) {
                     .get("transform")
                     .and_then(|v| v.as_str())
                     .unwrap_or("normal");
-                println!("  {name}  {kind}  {w}x{h}  transform={transform}");
+                if kind == "window" {
+                    let title = s.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                    let app = s.get("app_id").and_then(|v| v.as_str()).unwrap_or("");
+                    println!("  {name}  window  {app}: {title}");
+                } else {
+                    println!("  {name}  {kind}  {w}x{h}  transform={transform}");
+                }
             }
         }
         return;

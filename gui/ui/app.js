@@ -84,16 +84,22 @@ async function refresh() {
     showError(null);
 
     const scr = await invoke("screens");
-    const list = (scr.screens || scr.outputs || []).map((o) => o.name || o);
-    if (list.join() !== knownOutputs) {
-      knownOutputs = list.join();
+    const targets = (scr.screens || scr.outputs || []).map((o) => (typeof o === "string" ? { name: o } : o));
+    // Outputs by name; windows (kind "window") by app and title.
+    const label = (t) =>
+      t.kind === "window" ? `Window — ${t.app_id ? t.app_id + ": " : ""}${t.title || "untitled"}` : t.name;
+    const list = targets.map((t) => t.name);
+    const key = targets.map((t) => t.name + "\u0000" + label(t)).join("\u0001");
+    if (key !== knownOutputs) {
+      knownOutputs = key;
       const sel = $("outputs");
+      const previous = new Set(Array.from(sel.selectedOptions, (o) => o.value));
       sel.replaceChildren(
-        ...list.map((name, i) => {
+        ...targets.map((t, i) => {
           const opt = document.createElement("option");
-          opt.value = name;
-          opt.textContent = name;
-          opt.selected = i === 0;
+          opt.value = t.name;
+          opt.textContent = label(t);
+          opt.selected = previous.size ? previous.has(t.name) : i === 0;
           return opt;
         }),
       );

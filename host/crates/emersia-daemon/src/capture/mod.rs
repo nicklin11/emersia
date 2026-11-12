@@ -6,6 +6,7 @@
 //! connect, detect outputs, grab exactly one frame, then exit.
 
 pub mod ext;
+pub mod windows;
 pub mod wlr;
 
 use std::time::{Duration, Instant};
@@ -23,7 +24,9 @@ use wayland_client::protocol::{
     wl_shm_pool::WlShmPool,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
+use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1;
 use wayland_protocols::ext::image_capture_source::v1::client::{
+    ext_foreign_toplevel_image_capture_source_manager_v1::ExtForeignToplevelImageCaptureSourceManagerV1,
     ext_image_capture_source_v1::ExtImageCaptureSourceV1,
     ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
 };
@@ -256,6 +259,10 @@ pub struct State {
     pub shm: Option<WlShm>,
     pub ext_source_mgr: Option<ExtOutputImageCaptureSourceManagerV1>,
     pub ext_copy_mgr: Option<ExtImageCopyCaptureManagerV1>,
+    /// Window enumeration and window capture sources (single-window targets).
+    pub toplevel_list: Option<ExtForeignToplevelListV1>,
+    pub toplevel_source_mgr: Option<ExtForeignToplevelImageCaptureSourceManagerV1>,
+    pub toplevels: Vec<windows::Toplevel>,
     pub wlr_mgr: Option<ZwlrScreencopyManagerV1>,
     pub xdg_output_mgr: Option<ZxdgOutputManagerV1>,
     /// For screencopy into GPU buffers (zero-copy path, #35).
@@ -274,6 +281,9 @@ impl State {
             shm: None,
             ext_source_mgr: None,
             ext_copy_mgr: None,
+            toplevel_list: None,
+            toplevel_source_mgr: None,
+            toplevels: Vec::new(),
             wlr_mgr: None,
             xdg_output_mgr: None,
             dmabuf_mgr: None,
@@ -370,6 +380,12 @@ impl Dispatch<WlRegistry, ()> for State {
                 }
                 "ext_image_copy_capture_manager_v1" => {
                     state.ext_copy_mgr = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "ext_foreign_toplevel_list_v1" => {
+                    state.toplevel_list = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "ext_foreign_toplevel_image_capture_source_manager_v1" => {
+                    state.toplevel_source_mgr = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 "zwp_linux_dmabuf_v1" => {
                     // v3: create_immed + format events (enough for LINEAR).
@@ -552,6 +568,7 @@ wayland_client::delegate_noop!(State: ignore WlBuffer);
 wayland_client::delegate_noop!(State: ignore ExtOutputImageCaptureSourceManagerV1);
 wayland_client::delegate_noop!(State: ignore ExtImageCaptureSourceV1);
 wayland_client::delegate_noop!(State: ignore ExtImageCopyCaptureManagerV1);
+wayland_client::delegate_noop!(State: ignore ExtForeignToplevelImageCaptureSourceManagerV1);
 wayland_client::delegate_noop!(State: ignore ZwlrScreencopyManagerV1);
 
 #[cfg(test)]
