@@ -66,7 +66,7 @@ swaymsg -t get_outputs | grep -q '"HEADLESS-2"' || fail "virtual output was not 
 run() { env XDG_RUNTIME_DIR="$rt" WAYLAND_DISPLAY=wayland-1 XDG_CONFIG_HOME="$work/config" "$@"; }
 
 step "one-shot capture of the virtual output"
-run "$bin/emersia-daemon" capture --output HEADLESS-2 --out "$work/frame.png" | tee "$work/capture.log"
+run timeout 30 "$bin/emersia-daemon" capture --output HEADLESS-2 --out "$work/frame.png" | tee "$work/capture.log"
 grep -q "captured 1920x1080" "$work/capture.log" || fail "capture did not return 1920x1080"
 
 step "streaming the virtual output to a test receiver"
@@ -111,7 +111,7 @@ ctl --fps 30 start HEADLESS-2 "$virt" >/dev/null
 pids+=($!)
 
 for stream in 0 1; do
-  "$bin/emersia-daemon" receive --server "127.0.0.1:$port" --device-id "$device" \
+  timeout 90 "$bin/emersia-daemon" receive --server "127.0.0.1:$port" --device-id "$device" \
     --host-key "$host_key" --private-key "$priv" --frames "$frames" --timeout 10 \
     --stream "$stream" | tee "$work/receive-$stream.log" || fail "receiver failed (stream $stream)"
   grep -q "^decoded:" "$work/receive-$stream.log" || fail "stream $stream did not decode"

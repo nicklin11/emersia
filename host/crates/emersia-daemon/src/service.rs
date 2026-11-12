@@ -910,6 +910,8 @@ pub struct Engine {
     codec: crate::codec::Codec,
     /// Rolling estimate of the capture rate actually being achieved.
     measured_fps: f64,
+    /// Last encoder restart caused by a capture-rate change.
+    last_rate_restart: Option<Instant>,
     output: wayland_client::protocol::wl_output::WlOutput,
     transform: wayland_client::protocol::wl_output::Transform,
     backend: Backend,
@@ -1070,12 +1072,17 @@ impl Engine {
                 || enc.config().input_format != input_format
             {
                 self.encoder = None;
-            } else if (enc.config().fps as i64 - effective as i64).abs()
-                > (effective as i64 / 4).max(1)
+            } else if rate_mismatch(enc.config().fps, effective)
+                && self
+                    .last_rate_restart
+                    .is_none_or(|t| t.elapsed() >= RATE_RESTART_MIN_INTERVAL)
             {
-                // The delivered rate moved far enough that the encoder's
-                // timing is now wrong. Restarting also forces a keyframe,
-                // which is convenient rather than incidental.
+                // The delivered rate is far from what the encoder budgets
+                // bits for (rate control works per declared frame). Restart
+                // — but with hysteresis: each restart costs ~100 ms and a
+                // keyframe burst, and a damage-driven desktop swings between
+                // idle and busy constantly (CI saw 15 keyframes in 20 frames).
+                self.last_rate_restart = Some(Instant::now());
                 self.encoder = None;
             } else {
                 return Ok(true);
@@ -1141,6 +1148,7 @@ impl Engine {
             bitrate: crate::encoder::EncoderConfig::default().bitrate,
             codec: crate::codec::Codec::H264,
             measured_fps: 0.0,
+            last_rate_restart: None,
             output,
             transform,
             backend,
@@ -1233,6 +1241,15 @@ pub fn rtp_timestamp(epoch: Instant, at: Instant) -> u32 {
 /// encoders answer in a few ms; the bound keeps a stalled encoder from
 /// stalling capture (the unit then ships on a later iteration, as before).
 const UNIT_WAIT: Duration = Duration::from_millis(30);
+
+/// Encoder restarts for a changed capture rate are at most this frequent.
+const RATE_RESTART_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Whether the encoder's declared rate is more than 2x off the delivered one.
+fn rate_mismatch(declared: u32, delivered: u32) -> bool {
+    let (d, e) = (declared.max(1), delivered.max(1));
+    d > e * 2 || e > d * 2
+}
 
 /// How long `emersia pair headset` keeps the pairing window open.
 pub const HEADSET_PAIR_WINDOW: Duration = Duration::from_secs(120);
@@ -1644,6 +1661,15 @@ impl StreamView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoder_rate_restarts_only_on_large_mismatches() {
+        assert!(!rate_mismatch(60, 45), "a 25% swing is not worth a restart");
+        assert!(!rate_mismatch(30, 60));
+        assert!(rate_mismatch(60, 5), "idle desktop vs 60 fps budget");
+        assert!(rate_mismatch(5, 60));
+        assert!(!rate_mismatch(0, 1));
+    }
 
     #[test]
     fn rtp_timestamp_follows_real_time_not_the_target_rate() {

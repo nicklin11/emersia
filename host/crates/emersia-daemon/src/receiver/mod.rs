@@ -48,7 +48,10 @@ fn decode_verify(stream: &[u8], ext: &str) -> Result<String, String> {
     std::fs::write(&src, stream).map_err(|e| format!("writing temp input: {e}"))?;
 
     let result = std::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        // -nostdin + null stdin: an inherited, never-closing stdin (a CI
+        // runner's) otherwise leaves ffmpeg waiting on it.
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
+        .stdin(std::process::Stdio::null())
         .args(["-f", ext, "-i"])
         .arg(&src)
         .args(["-frames:v", "1"])
