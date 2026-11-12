@@ -35,7 +35,7 @@ Local control plane between the `emersia` CLI (and later the Tauri GUI) and
 | `devices` | list paired devices | `id`, `name`, `paired_at`, `revoked`, `input` |
 | `revoke` | remove a paired device | `device` |
 | `device_input` | allow a device's input, or make it view-only (`input: false`: it streams, its input is dropped before uinput) | `device`, `input` |
-| `screens` | list capturable outputs/windows | `kind`: `output`\|`window`, `name`, `size` |
+| `screens` | list capturable outputs/windows | `kind`: `output`\|`window`, `name`, `width`, `height`; windows are named `window:<id>` and carry `title`, `app_id`. Windows are listed only where the compositor can capture them (`ext-foreign-toplevel-image-capture-source`: sway ≥ 1.12; not niri). `start window:<id>` shares that window; it takes keyboard input only (no protocol reports a window's position for pointer mapping) and uses the shm path, not zero-copy. |
 | `select` | set capture targets | `targets: [...]` (empty = none: capture stops) |
 | `start` / `stop` | begin/end capture streaming | — |
 | `events` | subscribe to state changes | server then pushes `{"v":1,"event":…}` lines: `stream_state`, `device_connected`, `device_revoked`, `stats` |

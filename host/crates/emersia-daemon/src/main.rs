@@ -582,7 +582,11 @@ fn run_capture(opts: &CaptureOpts) -> anyhow::Result<()> {
 
     let started = Instant::now();
     let captured = match backend {
-        capture::Backend::Ext => capture::ext::capture(&mut queue, &mut state, &output)?,
+        capture::Backend::Ext => capture::ext::capture(
+            &mut queue,
+            &mut state,
+            capture::ext::Target::Output(&output),
+        )?,
         capture::Backend::Wlr => capture::wlr::capture(&mut queue, &mut state, &output, transform)?,
     };
     let elapsed = started.elapsed();

@@ -14,7 +14,9 @@ use wayland_protocols::ext::image_copy_capture::v1::client::{
     ext_image_copy_capture_session_v1::{Event as SessionEvent, ExtImageCopyCaptureSessionV1},
 };
 
-use crate::frame::{pack, untransform, Frame};
+use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
+
+use crate::frame::{crop_even, pack, untransform, Frame};
 use crate::shm::ShmBuffer;
 
 use super::{
@@ -22,7 +24,14 @@ use super::{
     FRAME_TIMEOUT,
 };
 
-/// Capture one frame from `output` with `ext-image-copy-capture`.
+/// What to capture: a whole output, or one window (sway ≥ 1.12).
+#[derive(Clone, Copy)]
+pub enum Target<'a> {
+    Output(&'a WlOutput),
+    Window(&'a ExtForeignToplevelHandleV1),
+}
+
+/// Capture one frame from `target` with `ext-image-copy-capture`.
 ///
 /// Flow: create source/session → wait for the compositor's buffer constraints
 /// → allocate a matching shm buffer → `capture()` → wait for `ready` → read
@@ -30,16 +39,12 @@ use super::{
 pub fn capture(
     queue: &mut EventQueue<State>,
     state: &mut State,
-    output: &WlOutput,
+    target: Target<'_>,
 ) -> anyhow::Result<CapturedFrame> {
     let total_started = Instant::now();
     let qh = queue.handle();
     state.ext.reset();
 
-    let source_mgr = state
-        .ext_source_mgr
-        .clone()
-        .context("the compositor does not advertise ext_output_image_capture_source_manager_v1")?;
     let copy_mgr = state
         .ext_copy_mgr
         .clone()
@@ -49,7 +54,18 @@ pub fn capture(
         .clone()
         .context("the compositor does not advertise wl_shm")?;
 
-    let source = source_mgr.create_source(output, &qh, ());
+    let source = match target {
+        Target::Output(output) => state
+            .ext_source_mgr
+            .clone()
+            .context("the compositor does not advertise ext_output_image_capture_source_manager_v1")?
+            .create_source(output, &qh, ()),
+        Target::Window(window) => state
+            .toplevel_source_mgr
+            .clone()
+            .context("this compositor cannot capture single windows (no ext_foreign_toplevel_image_capture_source_manager_v1)")?
+            .create_source(window, &qh, ()),
+    };
     let options = if state.paint_cursor {
         Options::PaintCursors
     } else {
@@ -115,6 +131,8 @@ pub fn capture(
     let decode = decode_started.elapsed();
     let transform_started = Instant::now();
     let (pixels, out_w, out_h) = untransform(pixels, width, height, transform);
+    // Windows can have odd sizes; the encoder needs even ones.
+    let (pixels, out_w, out_h) = crop_even(pixels, out_w, out_h);
     let transform = transform_started.elapsed();
     Ok(CapturedFrame {
         frame: Frame::new(out_w, out_h, pixels, pixel_format),

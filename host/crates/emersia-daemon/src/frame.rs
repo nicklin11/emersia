@@ -187,6 +187,22 @@ pub fn untransform(
     (Pixels::Owned(out), ow, oh)
 }
 
+/// Drop a trailing odd column/row so both dimensions are even, as 4:2:0
+/// encoding requires. Outputs are always even; windows often are not.
+/// No copy when nothing needs cropping.
+pub fn crop_even(buf: Pixels, w: u32, h: u32) -> (Pixels, u32, u32) {
+    let (ew, eh) = (w & !1, h & !1);
+    if (ew, eh) == (w, h) {
+        return (buf, w, h);
+    }
+    let (src_row, dst_row) = (w as usize * 4, ew as usize * 4);
+    let mut out = Vec::with_capacity(dst_row * eh as usize);
+    for row in buf.chunks_exact(src_row).take(eh as usize) {
+        out.extend_from_slice(&row[..dst_row]);
+    }
+    (Pixels::Owned(out), ew, eh)
+}
+
 /// Flip a buffer the compositor marked `Y_INVERT` (rows stored bottom-up).
 pub fn flip_rows(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     // Format-agnostic: only whole 4-byte pixels and rows are moved.
@@ -486,5 +502,17 @@ mod tests {
         let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
         let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
         assert_eq!((width, height), (3, 2), "IHDR dimensions");
+    }
+
+    #[test]
+    fn crop_even_drops_the_odd_column_and_row() {
+        // 3x3 pixels, each pixel's 4 bytes = its index.
+        let px: Vec<u8> = (0..9u8).flat_map(|i| [i; 4]).collect();
+        let (out, w, h) = crop_even(Pixels::Owned(px), 3, 3);
+        assert_eq!((w, h), (2, 2));
+        let firsts: Vec<u8> = out.chunks_exact(4).map(|p| p[0]).collect();
+        assert_eq!(firsts, [0, 1, 3, 4]);
+        let even = Pixels::Owned(vec![7; 2 * 2 * 4]);
+        assert_eq!(crop_even(even, 2, 2).1, 2);
     }
 }
