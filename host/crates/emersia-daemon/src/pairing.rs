@@ -103,6 +103,9 @@ pub struct Device {
     /// input is dropped). Stores written before this field load as allowed.
     #[serde(default = "input_allowed_by_default")]
     pub input: bool,
+    /// Unix seconds this device last connected or disconnected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<u64>,
 }
 
 fn input_allowed_by_default() -> bool {
@@ -329,6 +332,7 @@ impl PairingDb {
             revoked: false,
             revoked_at: None,
             input,
+            last_seen: None,
         };
         self.db.devices.insert(id, device.clone());
         // Single-use: the code is consumed on success.
@@ -363,6 +367,21 @@ impl PairingDb {
         let device = device.clone();
         self.save()?;
         Ok(device)
+    }
+
+    /// Record that device `id` was just seen (session start or end).
+    /// Persisted; unknown ids are ignored.
+    pub fn touch(&mut self, id: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(d) = self.db.devices.get_mut(id) {
+            d.last_seen = Some(now);
+            if let Err(e) = self.save() {
+                eprintln!("emersia-daemon: could not record last-seen: {e}");
+            }
+        }
     }
 
     /// Whether the active device `id` may inject input.
@@ -765,6 +784,18 @@ mod tests {
             "re-pairing does not regain control"
         );
         assert!(reopened.set_input("nope", true).is_err());
+        assert_eq!(reopened.active_device(&id).unwrap().last_seen, None);
+        reopened.touch(&id);
+        reopened.touch("unknown");
+        let seen = PairingDb::load(&path)
+            .unwrap()
+            .active_device(&id)
+            .unwrap()
+            .last_seen;
+        assert!(
+            seen.is_some_and(|t| t > 1_700_000_000),
+            "last-seen persisted: {seen:?}"
+        );
     }
 
     #[test]

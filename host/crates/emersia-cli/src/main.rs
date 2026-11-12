@@ -281,6 +281,21 @@ fn send(socket: &std::path::Path, request: &Request) -> Result<Response, Failure
 }
 
 /// Print a response; a daemon-side error is a CLI runtime failure.
+/// "just now", "5 min ago", "3 h ago", "2 days ago" for a Unix time.
+fn ago(unix: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(unix);
+    let s = now.saturating_sub(unix);
+    match s {
+        0..60 => "just now".into(),
+        60..3600 => format!("{} min ago", s / 60),
+        3600..86400 => format!("{} h ago", s / 3600),
+        _ => format!("{} days ago", s / 86400),
+    }
+}
+
 fn print_response(response: &Response, raw_json: bool) -> Result<(), Failure> {
     match response {
         Response::Ok(ok) => {
@@ -360,7 +375,12 @@ fn print_human(payload: &serde_json::Value) {
                     (false, true) => "active",
                     (false, false) => "active, view-only",
                 };
-                println!("  {id}  {name}  [{state}]");
+                let seen = d
+                    .get("last_seen")
+                    .and_then(|v| v.as_u64())
+                    .map(|t| format!("  last seen {}", ago(t)))
+                    .unwrap_or_default();
+                println!("  {id}  {name}  [{state}]{seen}");
             }
         }
         return;

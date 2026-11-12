@@ -277,6 +277,10 @@ fn run(
                     .map(|d| d.name.clone())
                     .unwrap_or(hex_id)
             };
+            // Last-seen (companion app device list): on connect and on leave.
+            for id in current.symmetric_difference(&known_peers) {
+                service.lock_pairing().touch(&hex::encode(id));
+            }
             for id in current.difference(&known_peers) {
                 if notify {
                     crate::notify::send(crate::notify::Event::Connected, &name(id));

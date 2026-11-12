@@ -49,3 +49,6 @@ button:hover { filter: brightness(1.08); }
 .pairing { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
 .code { font: 700 40px/1.2 ui-monospace, monospace; letter-spacing: .12em; margin: 8px 0; }
 .error { color: var(--danger); background: var(--card); border: 1px solid var(--danger); border-radius: 8px; padding: 8px 12px; }
+.setup { border-color: var(--danger); }
+.setup li { display: block; }
+.setup code { display: block; margin-top: 4px; user-select: all; font: 12px ui-monospace, monospace; }

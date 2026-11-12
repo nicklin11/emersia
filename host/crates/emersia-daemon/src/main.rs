@@ -401,6 +401,13 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
     let server_thread =
         std::thread::spawn(move || -> anyhow::Result<()> { server.serve(serve_svc) });
 
+    svc.set_setup(
+        opts.input,
+        engine
+            .transport()
+            .and_then(|t| network::lock(t).local_addr().ok())
+            .map(|a| a.port()),
+    );
     let net_thread = match engine.transport() {
         Some(endpoint) => Some(
             network::spawn(
