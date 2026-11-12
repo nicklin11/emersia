@@ -274,7 +274,9 @@ mod tests {
             }
             let line = state.lock().unwrap().clone();
             if let PairState::Code { code, .. } = &line {
-                if !decided {
+                // The device shows its code as soon as it has sent REVEAL;
+                // the host may not have processed that datagram yet.
+                if !decided && !host.pending().is_empty() {
                     let pending = host.pending();
                     assert_eq!(&pending[0].code, code, "both sides show the same code");
                     let (to, result) = host.decide(&pending[0].device_key, host_accepts).unwrap();
