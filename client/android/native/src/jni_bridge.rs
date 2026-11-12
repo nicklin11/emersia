@@ -581,6 +581,7 @@ pub extern "system" fn Java_org_emersia_client_NativeBridge_nativeImmersiveStart
         return 0;
     };
     let shared = crate::immersive::Shared {
+        input: running.input.clone(),
         decoders: running.decoders.clone(),
         idr_wanted: running.idr_wanted.clone(),
         stats: running.stats.clone(),
