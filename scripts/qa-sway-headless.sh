@@ -135,6 +135,9 @@ for stream in 0 1; do
   grep -q "^decoded:" "$work/receive-$stream.log" || fail "stream $stream did not decode"
 done
 
+encoder_used=$(ctl status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["encoder"])')
+backend=$(grep -oP 'capture backend: \K.*' "$work/daemon.log")
+
 step "removing $virt"
 # Quiesce first: stop the background-colour loop (each `bg` spawns a
 # swaybg client; one left on an unplugged output spins and starves sway's
@@ -149,6 +152,4 @@ for _ in $(seq 30); do kill -0 "$daemon_pid" 2>/dev/null || break; sleep 0.1; do
 sleep 0.5
 "$bin/emersia" virtual remove "$virt" || fail "emersia virtual remove failed"
 ! "$bin/emersia" virtual list | grep -qx "$virt" || fail "$virt still listed"
-backend=$(grep -oP 'capture backend: \K.*' "$work/daemon.log")
-encoder_used=$(ctl status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["encoder"])')
 echo "qa-sway: PASS (2 streams incl. virtual output $virt) — $(swaymsg -t get_version | python3 -c 'import json,sys; print(json.load(sys.stdin)["human_readable"])'), backend $backend, encoder $encoder_used"
