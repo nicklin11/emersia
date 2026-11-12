@@ -28,6 +28,9 @@ use wayland_protocols::ext::image_capture_source::v1::client::{
     ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
 };
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1;
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+};
 use wayland_protocols::xdg::xdg_output::zv1::client::{
     zxdg_output_manager_v1::ZxdgOutputManagerV1,
     zxdg_output_v1::{self, ZxdgOutputV1},
@@ -235,6 +238,8 @@ pub struct WlrState {
     pub buffer_width: u32,
     pub buffer_height: u32,
     pub buffer_stride: u32,
+    /// `(fourcc, width, height)` when the compositor offers a dmabuf copy.
+    pub dmabuf: Option<(u32, u32, u32)>,
     pub y_invert: bool,
     pub ready: bool,
     pub failed: bool,
@@ -253,6 +258,8 @@ pub struct State {
     pub ext_copy_mgr: Option<ExtImageCopyCaptureManagerV1>,
     pub wlr_mgr: Option<ZwlrScreencopyManagerV1>,
     pub xdg_output_mgr: Option<ZxdgOutputManagerV1>,
+    /// For screencopy into GPU buffers (zero-copy path, #35).
+    pub dmabuf_mgr: Option<ZwpLinuxDmabufV1>,
     pub outputs: Vec<OutputInfo>,
     /// Composite the pointer into captured frames. On by default: a mirrored
     /// desktop without a visible cursor cannot be driven from the headset.
@@ -269,6 +276,7 @@ impl State {
             ext_copy_mgr: None,
             wlr_mgr: None,
             xdg_output_mgr: None,
+            dmabuf_mgr: None,
             outputs: Vec::new(),
             paint_cursor: true,
             ext: ExtState::default(),
@@ -363,6 +371,10 @@ impl Dispatch<WlRegistry, ()> for State {
                 "ext_image_copy_capture_manager_v1" => {
                     state.ext_copy_mgr = Some(registry.bind(name, version.min(1), qh, ()));
                 }
+                "zwp_linux_dmabuf_v1" => {
+                    // v3: create_immed + format events (enough for LINEAR).
+                    state.dmabuf_mgr = Some(registry.bind(name, version.min(3), qh, ()));
+                }
                 "zxdg_output_manager_v1" => {
                     // v2+ sends `done` semantics we rely on via wl_output; v3
                     // drops the per-object `done`. Either works for geometry.
@@ -413,6 +425,30 @@ impl State {
             .iter()
             .filter_map(|o| o.logical)
             .reduce(Rect::union)
+    }
+}
+
+impl Dispatch<ZwpLinuxDmabufV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &ZwpLinuxDmabufV1,
+        _: <ZwpLinuxDmabufV1 as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpLinuxBufferParamsV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &ZwpLinuxBufferParamsV1,
+        _: <ZwpLinuxBufferParamsV1 as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
     }
 }
 

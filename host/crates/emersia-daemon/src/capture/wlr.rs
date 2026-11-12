@@ -149,7 +149,14 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
             FrameEvent::Ready { .. } => state.wlr.ready = true,
             FrameEvent::Failed => state.wlr.failed = true,
             FrameEvent::BufferDone => state.wlr.buffer_done = true,
-            FrameEvent::LinuxDmabuf { .. } => state.wlr.dmabuf_only = true,
+            FrameEvent::LinuxDmabuf {
+                format,
+                width,
+                height,
+            } => {
+                state.wlr.dmabuf = Some((format, width, height));
+                state.wlr.dmabuf_only = !state.wlr.have_buffer;
+            }
             // `damage` is informational for a one-shot grab.
             _ => {}
         }

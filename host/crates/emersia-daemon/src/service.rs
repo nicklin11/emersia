@@ -912,6 +912,12 @@ pub struct Engine {
     measured_fps: f64,
     /// Last encoder restart caused by a capture-rate change.
     last_rate_restart: Option<Instant>,
+    /// Zero-copy capture + in-process encode (#35).
+    zc: ZcState,
+    /// The next zero-copy frame must be a keyframe (no restart needed).
+    force_idr: bool,
+    /// Frames encoded on the zero-copy path, for status.
+    zc_frames: u64,
     output: wayland_client::protocol::wl_output::WlOutput,
     transform: wayland_client::protocol::wl_output::Transform,
     backend: Backend,
@@ -945,6 +951,76 @@ impl Engine {
     pub fn with_cursor(mut self, paint: bool) -> Self {
         self.state.paint_cursor = paint;
         self
+    }
+
+    /// Allow (default) or forbid the zero-copy path.
+    pub fn with_zero_copy(mut self, enabled: bool) -> Self {
+        if !enabled {
+            self.zc = ZcState::Off;
+        }
+        self
+    }
+
+    /// Whether this frame should try the zero-copy path.
+    fn zero_copy_wanted(&self) -> bool {
+        !matches!(self.zc, ZcState::Off)
+    }
+
+    /// Capture and encode one frame without the CPU touching pixels.
+    fn zero_copy_frame(&mut self, fps: u32) -> Result<ZcOut, ZcError> {
+        if self.transform != wayland_client::protocol::wl_output::Transform::Normal {
+            return Err(ZcError::Unavailable(anyhow::anyhow!(
+                "rotated outputs use the classic path"
+            )));
+        }
+        if matches!(self.zc, ZcState::Untried) {
+            let pool = crate::zerocopy::DmabufPool::new(&crate::encoder::render_node())
+                .map_err(ZcError::Unavailable)?;
+            self.zc = ZcState::Active { pool, enc: None };
+        }
+        let ZcState::Active { pool, enc } = &mut self.zc else {
+            return Err(ZcError::Unavailable(anyhow::anyhow!("disabled")));
+        };
+        let proven = enc.is_some();
+        let classify = |e: anyhow::Error| {
+            if proven {
+                ZcError::Transient(e)
+            } else {
+                ZcError::Unavailable(e)
+            }
+        };
+        let frame = crate::zerocopy::capture(&mut self.queue, &mut self.state, &self.output, pool)
+            .map_err(classify)?;
+        let captured_at = Instant::now();
+        if enc.as_ref().map(|e| e.geometry()) != Some((frame.width, frame.height)) {
+            let config = crate::zerocopy::Config {
+                render_node: crate::encoder::render_node(),
+                codec: self.codec,
+                bitrate: self.bitrate,
+                fps,
+                width: frame.width,
+                height: frame.height,
+            };
+            *enc = Some(crate::zerocopy::ZeroCopy::start(&config).map_err(ZcError::Unavailable)?);
+            self.force_idr = true;
+        }
+        let encoder = enc.as_mut().expect("just ensured");
+        let packets = encoder
+            .encode(
+                frame.fd,
+                frame.stride,
+                pool.fourcc(),
+                captured_at,
+                std::mem::take(&mut self.force_idr),
+            )
+            .map_err(ZcError::Unavailable)?;
+        self.zc_frames += 1;
+        Ok(ZcOut {
+            packets,
+            timings: frame.timings,
+            captured_at,
+            name: encoder.name.clone(),
+        })
     }
 
     /// Share an already bound endpoint (extra streams send through the
@@ -999,6 +1075,11 @@ impl Engine {
         let transport = self.transport.take();
         fresh.transport = transport;
         fresh.encoder_choice = self.encoder_choice;
+        // Buffers belong to the old connection; try again on the new one
+        // unless the path was ruled out.
+        if matches!(self.zc, ZcState::Off) {
+            fresh.zc = ZcState::Off;
+        }
         fresh.state.paint_cursor = self.state.paint_cursor;
         fresh.bitrate = self.bitrate;
         fresh.codec = self.codec;
@@ -1022,6 +1103,13 @@ impl Engine {
         bitrate: Option<u32>,
     ) -> Self {
         self.encoder_choice = choice;
+        // The zero-copy path is VAAPI: only when VAAPI is acceptable.
+        if !matches!(
+            choice,
+            crate::encoder::EncoderChoice::Auto | crate::encoder::EncoderChoice::Vaapi
+        ) {
+            self.zc = ZcState::Off;
+        }
         if let Some(b) = bitrate {
             self.bitrate = b;
         }
@@ -1156,6 +1244,9 @@ impl Engine {
             codec: crate::codec::Codec::H264,
             measured_fps: 0.0,
             last_rate_restart: None,
+            zc: ZcState::Untried,
+            force_idr: false,
+            zc_frames: 0,
             output,
             transform,
             backend,
@@ -1305,15 +1396,18 @@ pub fn run_stream(mut engine: Engine, service: Arc<Service>, stream: u8) {
                     eprintln!("emersia-daemon: new session, restarting encoder for a keyframe");
                 }
                 engine.encoder = None;
+                engine.force_idr = true;
             }
             last_sessions = sessions;
             // A device lost a frame and cannot decode until an IDR. Restarting
             // the encoder is the only way to force one through the ffmpeg
             // pipe, so requests are coalesced and rate-limited.
             if view.take_keyframe_request()
-                && engine.encoder.is_some()
+                && (engine.encoder.is_some() || engine.zero_copy_wanted())
                 && last_forced_keyframe.elapsed() >= KEYFRAME_REQUEST_MIN_INTERVAL
             {
+                // Zero-copy: an IDR on the next frame, no restart.
+                engine.force_idr = true;
                 eprintln!("emersia-daemon: keyframe requested by a device");
                 engine.encoder = None;
                 last_forced_keyframe = Instant::now();
@@ -1394,6 +1488,74 @@ pub fn run_stream(mut engine: Engine, service: Arc<Service>, stream: u8) {
                 view.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
                 view.set_input_layout(engine.input_layout());
                 applied_output = Some(name);
+            }
+        }
+        // Zero-copy path (#35): GPU buffer -> VAAPI in-process. Falls back to
+        // the shm + ffmpeg path below when it cannot work here.
+        let has_peers = engine
+            .transport
+            .as_ref()
+            .is_some_and(|t| crate::network::lock(t).peer_count() > 0);
+        if has_peers && engine.zero_copy_wanted() {
+            let started = Instant::now();
+            match engine.zero_copy_frame(service.fps_target().max(1)) {
+                Ok(out) => {
+                    view.record_capture(out.timings);
+                    engine.encoder = None; // the classic encoder is not in use
+                    let pt = engine.codec.payload_type();
+                    let timestamp = rtp_timestamp(stream_epoch, out.captured_at);
+                    let ids = engine
+                        .transport
+                        .as_ref()
+                        .map(|t| crate::network::lock(t).peer_ids())
+                        .unwrap_or_default();
+                    let mut shipped = 0u32;
+                    for packet in &out.packets {
+                        for id in &ids {
+                            if let Some(Ok(_)) = engine.transport.as_ref().map(|t| {
+                                crate::network::lock(t).send_frame_on(
+                                    stream,
+                                    id,
+                                    timestamp,
+                                    packet.keyframe,
+                                    pt,
+                                    &packet.data,
+                                )
+                            }) {
+                                shipped += 1;
+                            }
+                        }
+                    }
+                    if shipped > 0 {
+                        view.record_encoded(shipped);
+                    }
+                    view.set_encoder(Some(out.name), false, engine.zc_frames, engine.zc_frames);
+                    let frame_latency = started.elapsed();
+                    let since_last = last_frame.elapsed();
+                    let interval = Duration::from_secs_f64(1.0 / service.fps_target() as f64);
+                    let elapsed = started.elapsed();
+                    if elapsed < interval {
+                        std::thread::sleep(interval - elapsed);
+                    }
+                    view.record_frame(frame_latency, since_last);
+                    engine.note_capture(since_last);
+                    last_frame = Instant::now();
+                    continue;
+                }
+                Err(ZcError::Transient(err)) => {
+                    if !engine.latch_protocol_failure(&err) {
+                        view.record_error(format!("{err:#}"));
+                    }
+                    continue;
+                }
+                Err(ZcError::Unavailable(err)) => {
+                    eprintln!(
+                        "emersia-daemon: stream {stream}: zero-copy path unavailable ({err:#}); \
+                         using the shm + ffmpeg pipeline"
+                    );
+                    let _ = engine.latch_protocol_failure(&err);
+                    engine.zc = ZcState::Off;
+                }
             }
         }
         let started = Instant::now();
@@ -1553,6 +1715,35 @@ pub fn run_stream(mut engine: Engine, service: Arc<Service>, stream: u8) {
             }
         }
     }
+}
+
+/// Zero-copy path state for one engine.
+enum ZcState {
+    /// Not tried yet (or reset by a Wayland reconnect).
+    Untried,
+    /// Working: GPU buffer pool, encoder once the geometry is known.
+    Active {
+        pool: crate::zerocopy::DmabufPool,
+        enc: Option<crate::zerocopy::ZeroCopy>,
+    },
+    /// Ruled out (unsupported here, or disabled): classic shm + ffmpeg.
+    Off,
+}
+
+/// Why a zero-copy frame did not happen.
+enum ZcError {
+    /// The path cannot work here: switch this engine to the classic path.
+    Unavailable(anyhow::Error),
+    /// The path works but this frame failed (e.g. capture timeout).
+    Transient(anyhow::Error),
+}
+
+/// One zero-copy frame's output.
+struct ZcOut {
+    packets: Vec<crate::zerocopy::Packet>,
+    timings: CaptureTimings,
+    captured_at: Instant,
+    name: String,
 }
 
 /// The service as one stream sees it. Stream 0 delegates everything (today's
