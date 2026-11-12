@@ -24,7 +24,7 @@ wayland-protocols = { version = "0.32.12", features = ["client", "staging", "uns
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 
 # Zero-copy path (#35): GPU buffers for screencopy, in-process VAAPI encode.
-gbm = "0.18"
+gbm = { version = "0.18", default-features = false }
 ffmpeg-sys-next = "9"
 
 emersia-protocol = { path = "../emersia-protocol" }
