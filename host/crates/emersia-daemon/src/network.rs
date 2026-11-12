@@ -216,9 +216,14 @@ fn run(
         drop(ep);
         for record in records {
             match record.payload_type {
-                control::KEYFRAME_REQUEST => service.request_keyframe(),
+                // Payload: optional stream id (absent = stream 0).
+                control::KEYFRAME_REQUEST => {
+                    service.request_keyframe(record.payload.first().copied().unwrap_or(0))
+                }
                 control::INPUT if input_enabled => match crate::input::decode(&record.payload) {
-                    Ok(events) => injector.apply(&events, service.input_layout()),
+                    Ok(events) => {
+                        injector.apply(&events, |stream| service.input_layout_for(stream))
+                    }
                     Err(e) => eprintln!(
                         "emersia-daemon: bad input record from {}: {e}",
                         hex::encode(record.device_id)

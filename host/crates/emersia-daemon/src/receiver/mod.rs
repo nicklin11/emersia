@@ -32,6 +32,7 @@ Options:
   --save DIR           write the elementary stream to DIR/stream.h264
   --no-decode          skip the decode verification step
   --fps N              expected rate, used to report drift (informational)
+  --stream N           stream to save/decode-verify (default 0); all are counted
   -h, --help           print this help
 ";
 
@@ -99,6 +100,7 @@ struct Opts {
     timeout: Duration,
     save: Option<PathBuf>,
     fps: Option<u32>,
+    stream: u8,
     /// Verify the stream really decodes.
     decode: bool,
 }
@@ -135,6 +137,7 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
     let mut save = None;
     let mut fps = None;
     let mut decode = true;
+    let mut stream = 0u8;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -161,6 +164,11 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
             }
             "--save" => save = Some(PathBuf::from(value("--save")?)),
             "--no-decode" => decode = false,
+            "--stream" => {
+                stream = value("--stream")?
+                    .parse()
+                    .map_err(|_| Fail::Usage("--stream must be 0..255".into()))?
+            }
             "--fps" => {
                 fps = Some(
                     value("--fps")?
@@ -185,6 +193,7 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
         timeout,
         save,
         fps,
+        stream,
         decode,
     };
 
@@ -227,7 +236,9 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
     let mut bytes = 0usize;
     let mut last_sequence = None;
     let mut max_gap = 0u32;
-    let mut reassembler = Reassembler::default();
+    // One reassembler per stream: fragments of different streams interleave.
+    let mut reassemblers: std::collections::HashMap<u8, Reassembler> = Default::default();
+    let mut per_stream: std::collections::BTreeMap<u8, usize> = Default::default();
     // Access units arrive in stream order, so the elementary stream is just
     // their Annex-B bytes concatenated: that is a decodable .h264/.h265 file.
     let mut elementary: Vec<u8> = Vec::new();
@@ -256,9 +267,17 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
         bytes += payload.len();
 
         // A frame may span many datagrams; only count whole frames.
-        let Some(whole) = reassembler.push(header, &payload) else {
+        let Some(whole) = reassemblers
+            .entry(header.stream)
+            .or_default()
+            .push(header, &payload)
+        else {
             continue;
         };
+        *per_stream.entry(header.stream).or_default() += 1;
+        if header.stream != opts.stream {
+            continue;
+        }
         frames += 1;
         if header.keyframe {
             keyframes += 1;
@@ -313,6 +332,11 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
     println!("elapsed:   {:.2} s", elapsed.as_secs_f64());
     println!("measured:  {measured:.1} fps");
     println!("max gap:   {max_gap} datagram(s)");
+    let streams: Vec<String> = per_stream
+        .iter()
+        .map(|(s, n)| format!("stream {s}: {n}"))
+        .collect();
+    println!("streams:   {}", streams.join(", "));
     if let Some(want) = opts.fps {
         println!("target:    {want} fps");
     }

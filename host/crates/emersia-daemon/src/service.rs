@@ -184,6 +184,8 @@ struct Inner {
     streaming: bool,
     fps_target: u32,
     selected: Option<String>,
+    /// Outputs streamed as streams 1.. alongside `selected`.
+    also: Vec<String>,
     outputs: Vec<ScreenInfo>,
     backend: Option<&'static str>,
     stats: Stats,
@@ -227,11 +229,14 @@ pub struct Service {
     /// The daemon's own long-term identity (ADR 0006). Devices need this to
     /// pin the host they are talking to.
     host_public_key: String,
-    /// Set by the network thread when a device asks for an IDR.
-    keyframe_requested: AtomicBool,
+    /// Set by the network thread when a device asks for an IDR, per stream.
+    keyframe_requested: [AtomicBool; crate::transport::MAX_STREAMS as usize],
     /// `(streamed output, global layout bounds)` in logical coordinates, for
     /// mapping headset pointer input. Published by the engine.
-    input_layout: Mutex<Option<(crate::capture::Rect, crate::capture::Rect)>>,
+    input_layout: Mutex<
+        [Option<(crate::capture::Rect, crate::capture::Rect)>;
+            crate::transport::MAX_STREAMS as usize],
+    >,
     /// Origin of frame timestamps and of PONG clock replies.
     stream_epoch: Instant,
     /// In-headset pairing window and its exchanges (ADR 0008). Lock order:
@@ -251,8 +256,8 @@ impl Service {
             shutdown: AtomicBool::new(false),
             pairing: Mutex::new(pairing),
             host_public_key: host_public_key_hex.to_string(),
-            keyframe_requested: AtomicBool::new(false),
-            input_layout: Mutex::new(None),
+            keyframe_requested: Default::default(),
+            input_layout: Mutex::new(Default::default()),
             stream_epoch: Instant::now(),
             headset_pairing: Mutex::new(crate::transport_pairing::HostPairing::new(
                 crate::crypto::parse_public_key_hex(host_public_key_hex).unwrap_or([0; 32]),
@@ -331,22 +336,55 @@ impl Service {
         self.stream_epoch
     }
 
-    pub fn set_input_layout(&self, layout: Option<(crate::capture::Rect, crate::capture::Rect)>) {
-        *self.input_layout.lock().unwrap_or_else(|e| e.into_inner()) = layout;
+    pub fn set_stream_input_layout(
+        &self,
+        stream: u8,
+        layout: Option<(crate::capture::Rect, crate::capture::Rect)>,
+    ) {
+        if let Some(slot) = self
+            .input_layout
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(usize::from(stream))
+        {
+            *slot = layout;
+        }
     }
 
-    pub fn input_layout(&self) -> Option<(crate::capture::Rect, crate::capture::Rect)> {
-        *self.input_layout.lock().unwrap_or_else(|e| e.into_inner())
+    pub fn input_layout_for(
+        &self,
+        stream: u8,
+    ) -> Option<(crate::capture::Rect, crate::capture::Rect)> {
+        self.input_layout
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(usize::from(stream))
+            .copied()
+            .flatten()
     }
 
-    /// A device lost its reference chain and asked for a keyframe.
-    pub fn request_keyframe(&self) {
-        self.keyframe_requested.store(true, Ordering::Relaxed);
+    /// A device lost its reference chain on `stream` and asked for a keyframe.
+    pub fn request_keyframe(&self, stream: u8) {
+        if let Some(flag) = self.keyframe_requested.get(usize::from(stream)) {
+            flag.store(true, Ordering::Relaxed);
+        }
     }
 
-    /// Consume a pending keyframe request.
-    pub fn take_keyframe_request(&self) -> bool {
-        self.keyframe_requested.swap(false, Ordering::Relaxed)
+    /// Consume a pending keyframe request for `stream`.
+    pub fn take_keyframe_request(&self, stream: u8) -> bool {
+        self.keyframe_requested
+            .get(usize::from(stream))
+            .is_some_and(|f| f.swap(false, Ordering::Relaxed))
+    }
+
+    /// The output streamed as `stream` (≥ 1), while streaming.
+    pub fn extra_target(&self, stream: u8) -> Option<String> {
+        let inner = self.lock();
+        let index = usize::from(stream).checked_sub(1)?;
+        inner
+            .streaming
+            .then(|| inner.also.get(index).cloned())
+            .flatten()
     }
 
     /// Take device ids revoked since the last call, so the engine can drop
@@ -461,6 +499,7 @@ impl Service {
                     let mut inner = self.lock();
                     let was = inner.streaming;
                     inner.streaming = false;
+                    inner.also.clear();
                     was
                 };
                 if was {
@@ -716,9 +755,23 @@ impl Service {
             }
             inner.fps_target = fps;
         }
+        let max_extra = usize::from(crate::transport::MAX_STREAMS) - 1;
+        if args.also.len() > max_extra {
+            return err_response(
+                id,
+                ErrorCode::InvalidArgs,
+                format!("at most {} outputs at once", max_extra + 1),
+            );
+        }
+        for want in &args.also {
+            if !inner.outputs.iter().any(|o| &o.name == want) {
+                return err_response(id, ErrorCode::NotFound, format!("no output named {want:?}"));
+            }
+        }
         if args.output.is_some() {
             inner.selected = args.output.clone();
         }
+        inner.also = args.also.clone();
         if inner.selected.is_none() {
             inner.selected = inner.outputs.first().map(|o| o.name.clone());
         }
@@ -756,6 +809,12 @@ impl Service {
             "streaming": inner.streaming,
             "backend": inner.backend,
             "selected_output": inner.selected,
+            // Every streamed output, stream 0 first (one headset panel each).
+            "streams": if inner.streaming {
+                inner.selected.iter().chain(inner.also.iter()).cloned().collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            },
             "fps_target": inner.fps_target,
             "frames": inner.stats.frames,
             "latency_ms": round2(inner.stats.last_latency_ms),
@@ -881,6 +940,13 @@ impl Engine {
     /// Whether captured frames include the pointer.
     pub fn with_cursor(mut self, paint: bool) -> Self {
         self.state.paint_cursor = paint;
+        self
+    }
+
+    /// Share an already bound endpoint (extra streams send through the
+    /// primary engine's endpoint: one port, one session per device).
+    pub fn with_shared_transport(mut self, endpoint: crate::network::SharedEndpoint) -> Self {
+        self.transport = Some(endpoint);
         self
     }
 
@@ -1147,9 +1213,21 @@ pub const HEADSET_PAIR_WINDOW: Duration = Duration::from_secs(120);
 /// an encoder restart, and a burst of loss produces a burst of requests.
 const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
-pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
-    service.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
-    service.set_input_layout(engine.input_layout());
+pub fn run_engine(engine: Engine, service: Arc<Service>) {
+    run_stream(engine, service, 0);
+}
+
+/// One capture → encode → send loop for `stream`. Stream 0 is the primary
+/// output and owns the status/statistics; streams 1.. capture the extra
+/// outputs given to `start` (one headset panel each), each with its own
+/// Wayland connection and encoder, because capture blocks on damage per output.
+pub fn run_stream(mut engine: Engine, service: Arc<Service>, stream: u8) {
+    let view = StreamView {
+        service: Arc::clone(&service),
+        stream,
+    };
+    view.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
+    view.set_input_layout(engine.input_layout());
     let mut last_frame = Instant::now();
     // Fixed for the daemon's life, so timestamps stay monotonic across
     // encoder restarts (a device joining, a keyframe request). Shared with the
@@ -1181,7 +1259,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
             // A device lost a frame and cannot decode until an IDR. Restarting
             // the encoder is the only way to force one through the ffmpeg
             // pipe, so requests are coalesced and rate-limited.
-            if service.take_keyframe_request()
+            if view.take_keyframe_request()
                 && engine.encoder.is_some()
                 && last_forced_keyframe.elapsed() >= KEYFRAME_REQUEST_MIN_INTERVAL
             {
@@ -1191,7 +1269,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
             }
         }
 
-        if !service.is_streaming() {
+        if !view.is_streaming() {
             std::thread::sleep(IDLE_TICK);
             last_frame = Instant::now();
             continue;
@@ -1201,7 +1279,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
         // Reusing that queue can only produce more undefined requests, so
         // rebuild the connection before attempting another capture.
         if engine.wayland_protocol_failed() {
-            let selected = service.selected_output();
+            let selected = view.selected_output();
             let had_selection = selected.is_some();
             match engine.reconnect(selected.as_deref()) {
                 Ok(restored) => {
@@ -1209,15 +1287,15 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                         if let Some(fallback) =
                             engine.screens.first().map(|screen| screen.name.clone())
                         {
-                            service.set_selected_output(Some(fallback));
+                            view.set_selected_output(Some(fallback));
                         }
                     }
-                    service.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
-                    service.set_input_layout(engine.input_layout());
-                    service.set_encoder(None, false, 0, 0);
-                    service.clear_error();
-                    service.reset_capture_metrics();
-                    applied_output = service.selected_output();
+                    view.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
+                    view.set_input_layout(engine.input_layout());
+                    view.set_encoder(None, false, 0, 0);
+                    view.clear_error();
+                    view.reset_capture_metrics();
+                    applied_output = view.selected_output();
                     last_frame = Instant::now();
                     eprintln!(
                         "emersia-daemon: Wayland connection replaced after a protocol error; \
@@ -1227,8 +1305,8 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                     continue;
                 }
                 Err(err) => {
-                    service.set_encoder(None, false, 0, 0);
-                    service.set_error(format!("Wayland reconnect failed: {err:#}"));
+                    view.set_encoder(None, false, 0, 0);
+                    view.set_error(format!("Wayland reconnect failed: {err:#}"));
                     eprintln!("emersia-daemon: Wayland reconnect failed: {err:#}");
                     last_frame = Instant::now();
                     std::thread::sleep(WAYLAND_RECONNECT_RETRY_DELAY);
@@ -1237,17 +1315,17 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
             }
         }
 
-        if let Some(name) = service.selected_output() {
+        if let Some(name) = view.selected_output() {
             if let Err(e) = engine.set_output(&name) {
                 if !engine.latch_protocol_failure(&e) {
-                    service.record_error(format!("output selection: {e:#}"));
+                    view.record_error(format!("output selection: {e:#}"));
                     eprintln!("emersia-daemon: output selection failed: {e:#}");
                 }
                 continue;
             }
             if applied_output.as_deref() != Some(name.as_str()) {
-                service.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
-                service.set_input_layout(engine.input_layout());
+                view.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
+                view.set_input_layout(engine.input_layout());
                 applied_output = Some(name);
             }
         }
@@ -1260,7 +1338,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                 let captured_at = Instant::now()
                     .checked_sub(timings.shm_read + timings.decode + timings.transform)
                     .unwrap_or_else(Instant::now);
-                service.record_capture(timings);
+                view.record_capture(timings);
                 if engine
                     .transport
                     .as_ref()
@@ -1274,15 +1352,15 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                         frame.height,
                         frame.format,
                         service.fps_target().max(1),
-                        service.measured_fps().max(engine.measured_fps),
+                        view.measured_fps().max(engine.measured_fps),
                     ) {
                         Ok(true) => {
                             if let Some(enc) = engine.encoder.as_mut() {
                                 if let Err(e) = enc.encode_captured_at(frame.pixels, captured_at) {
-                                    service.record_error(format!("encode: {e}"));
+                                    view.record_error(format!("encode: {e}"));
                                     eprintln!("emersia-daemon: encode failed: {e}");
                                     engine.encoder = None;
-                                    service.set_encoder(None, false, 0, 0);
+                                    view.set_encoder(None, false, 0, 0);
                                     continue;
                                 }
                             }
@@ -1311,10 +1389,10 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                                     Ok(Some(au)) => au,
                                     Ok(None) => break,
                                     Err(e) => {
-                                        service.record_error(format!("encoder: {e}"));
+                                        view.record_error(format!("encoder: {e}"));
                                         eprintln!("emersia-daemon: encoder output failed: {e}");
                                         engine.encoder = None;
-                                        service.set_encoder(None, false, 0, 0);
+                                        view.set_encoder(None, false, 0, 0);
                                         output_failed = true;
                                         break;
                                     }
@@ -1339,8 +1417,9 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                                     .unwrap_or_else(|| au.annexb.clone());
                                 for id in &ids {
                                     match engine.transport.as_ref().map(|t| {
-                                        crate::network::lock(t)
-                                            .send_frame(id, timestamp, keyframe, pt, &payload)
+                                        crate::network::lock(t).send_frame_on(
+                                            stream, id, timestamp, keyframe, pt, &payload,
+                                        )
                                     }) {
                                         Some(Ok(_)) => shipped += 1,
                                         Some(Err(e)) => {
@@ -1357,10 +1436,10 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                                 continue;
                             }
                             if shipped > 0 {
-                                service.record_encoded(shipped);
+                                view.record_encoded(shipped);
                             }
                             if let Some(enc) = engine.encoder.as_ref() {
-                                service.set_encoder_with_drops(
+                                view.set_encoder_with_drops(
                                     Some(enc.candidate().name.clone()),
                                     enc.is_software(),
                                     enc.frames_in(),
@@ -1390,7 +1469,7 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                 if elapsed < interval {
                     std::thread::sleep(interval - elapsed);
                 }
-                service.record_frame(frame_latency, since_last);
+                view.record_frame(frame_latency, since_last);
                 engine.note_capture(since_last);
                 last_frame = Instant::now();
             }
@@ -1402,9 +1481,117 @@ pub fn run_engine(mut engine: Engine, service: Arc<Service>) {
                     eprintln!("emersia-daemon: Wayland capture connection poisoned: {err:#}");
                     continue;
                 }
-                service.record_error(format!("{err:#}"));
+                view.record_error(format!("{err:#}"));
                 eprintln!("emersia-daemon: capture failed: {err:#}");
             }
+        }
+    }
+}
+
+/// The service as one stream sees it. Stream 0 delegates everything (today's
+/// single-stream behaviour); extra streams have their own target, keyframe
+/// flag and input layout, and leave the status/statistics to stream 0.
+struct StreamView {
+    service: Arc<Service>,
+    stream: u8,
+}
+
+impl StreamView {
+    fn primary(&self) -> bool {
+        self.stream == 0
+    }
+    fn is_streaming(&self) -> bool {
+        if self.primary() {
+            self.service.is_streaming()
+        } else {
+            self.service.extra_target(self.stream).is_some()
+        }
+    }
+    fn selected_output(&self) -> Option<String> {
+        if self.primary() {
+            self.service.selected_output()
+        } else {
+            self.service.extra_target(self.stream)
+        }
+    }
+    fn set_selected_output(&self, output: Option<String>) {
+        if self.primary() {
+            self.service.set_selected_output(output);
+        }
+    }
+    fn publish_discovery(&self, screens: Vec<ScreenInfo>, backend: Option<&'static str>) {
+        if self.primary() {
+            self.service.publish_discovery(screens, backend);
+        }
+    }
+    fn set_input_layout(&self, layout: Option<(capture::Rect, capture::Rect)>) {
+        self.service.set_stream_input_layout(self.stream, layout);
+    }
+    fn take_keyframe_request(&self) -> bool {
+        self.service.take_keyframe_request(self.stream)
+    }
+    fn measured_fps(&self) -> f64 {
+        if self.primary() {
+            self.service.measured_fps()
+        } else {
+            0.0
+        }
+    }
+    fn set_encoder(&self, name: Option<String>, software: bool, frames_in: u64, frames_out: u64) {
+        if self.primary() {
+            self.service
+                .set_encoder(name, software, frames_in, frames_out);
+        }
+    }
+    fn set_encoder_with_drops(
+        &self,
+        name: Option<String>,
+        software: bool,
+        frames_in: u64,
+        frames_out: u64,
+        dropped: u64,
+    ) {
+        if self.primary() {
+            self.service
+                .set_encoder_with_drops(name, software, frames_in, frames_out, dropped);
+        }
+    }
+    fn clear_error(&self) {
+        if self.primary() {
+            self.service.clear_error();
+        }
+    }
+    fn reset_capture_metrics(&self) {
+        if self.primary() {
+            self.service.reset_capture_metrics();
+        }
+    }
+    fn label(&self, message: String) -> String {
+        if self.primary() {
+            message
+        } else {
+            format!("stream {}: {message}", self.stream)
+        }
+    }
+    fn set_error(&self, message: String) {
+        self.service.set_error(self.label(message));
+    }
+    fn record_error(&self, message: String) {
+        self.service.record_error(self.label(message));
+    }
+    fn record_capture(&self, timings: CaptureTimings) {
+        if self.primary() {
+            self.service.record_capture(timings);
+        }
+    }
+    fn record_encoded(&self, count: u32) {
+        if self.primary() {
+            self.service.record_encoded(count);
+        }
+    }
+    fn record_frame(&self, latency: Duration, since_last: Duration) {
+        if self.primary() {
+            self.service.record_frame(latency, since_last);
         }
     }
 }
@@ -1763,6 +1950,7 @@ mod tests {
             Command::Start(StartArgs {
                 output: Some("NOPE".into()),
                 fps: None,
+                also: Vec::new(),
             }),
         ));
         assert_eq!(err_code(res), ErrorCode::NotFound);
@@ -1772,6 +1960,7 @@ mod tests {
             Command::Start(StartArgs {
                 output: None,
                 fps: Some(0),
+                also: Vec::new(),
             }),
         ));
         assert_eq!(err_code(res), ErrorCode::InvalidArgs);
@@ -1786,6 +1975,7 @@ mod tests {
             Command::Start(StartArgs {
                 output: Some("HDMI-A-1".into()),
                 fps: Some(60),
+                also: Vec::new(),
             }),
         )));
         assert_eq!(p["output"], "HDMI-A-1");

@@ -16,6 +16,7 @@ const TAG_POINTER: u8 = 1;
 const TAG_BUTTON: u8 = 2;
 const TAG_SCROLL: u8 = 3;
 const TAG_KEY: u8 = 4;
+const TAG_POINTER_ON: u8 = 5;
 
 /// Highest evdev key code accepted (`KEY_MAX`).
 pub const KEY_MAX: u16 = 0x2ff;
@@ -50,6 +51,12 @@ impl Button {
 pub enum InputEvent {
     /// Absolute position on the streamed output, 0..=65535 on each axis.
     Pointer {
+        x: u16,
+        y: u16,
+    },
+    /// [`Pointer`](Self::Pointer) on a given stream's output (multi-panel).
+    PointerOn {
+        stream: u8,
         x: u16,
         y: u16,
     },
@@ -112,6 +119,11 @@ pub fn encode(events: &[InputEvent]) -> Result<Vec<u8>, InputError> {
                 out.extend_from_slice(&x.to_be_bytes());
                 out.extend_from_slice(&y.to_be_bytes());
             }
+            InputEvent::PointerOn { stream, x, y } => {
+                out.extend_from_slice(&[TAG_POINTER_ON, stream]);
+                out.extend_from_slice(&x.to_be_bytes());
+                out.extend_from_slice(&y.to_be_bytes());
+            }
             InputEvent::Button { button, down } => {
                 out.extend_from_slice(&[TAG_BUTTON, button.to_u8(), u8::from(down)]);
             }
@@ -162,6 +174,14 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<InputEvent>, InputError> {
                     y: u16::from_be_bytes([b[2], b[3]]),
                 }
             }
+            TAG_POINTER_ON => {
+                let b = take(&mut rest, 5)?;
+                InputEvent::PointerOn {
+                    stream: b[0],
+                    x: u16::from_be_bytes([b[1], b[2]]),
+                    y: u16::from_be_bytes([b[3], b[4]]),
+                }
+            }
             TAG_BUTTON => {
                 let b = take(&mut rest, 2)?;
                 InputEvent::Button {
@@ -210,13 +230,18 @@ mod tests {
                 code: 30,
                 down: false,
             },
+            InputEvent::PointerOn {
+                stream: 1,
+                x: 7,
+                y: 9,
+            },
         ]
     }
 
     #[test]
     fn roundtrips() {
         let bytes = encode(&sample()).unwrap();
-        assert_eq!(bytes.len(), 1 + 5 + 3 + 5 + 4);
+        assert_eq!(bytes.len(), 1 + 5 + 3 + 5 + 4 + 6);
         assert_eq!(decode(&bytes).unwrap(), sample());
     }
 

@@ -634,6 +634,7 @@ mod tests {
             version: 1,
             keyframe,
             payload_type: Codec::H264.payload_type(),
+            stream: 0,
             sequence: frame_sequence + u32::from(frag_count),
             frame_sequence,
             timestamp: 0,

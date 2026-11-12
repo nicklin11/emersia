@@ -369,7 +369,34 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
         ),
         _ => None,
     };
+    // Extra streams: one engine per additional output (each blocks on its
+    // own output's damage), idle until `start A B …` names them.
+    let mut stream_threads = Vec::new();
+    if let Some(endpoint) = engine.transport() {
+        let extra = engine
+            .screens
+            .len()
+            .min(usize::from(transport::MAX_STREAMS))
+            .saturating_sub(1);
+        for stream in 1..=extra as u8 {
+            let extra_engine = service::Engine::discover(opts.backend)
+                .context("extra stream: capture engine discovery failed")?
+                .with_shared_transport(Arc::clone(endpoint))
+                .with_encoder(opts.encoder, Some(opts.bitrate))
+                .with_cursor(opts.cursor);
+            let svc = Arc::clone(&svc);
+            stream_threads.push(
+                std::thread::Builder::new()
+                    .name(format!("emersia-stream-{stream}"))
+                    .spawn(move || service::run_stream(extra_engine, svc, stream))
+                    .context("could not start a stream thread")?,
+            );
+        }
+    }
     service::run_engine(engine, Arc::clone(&svc));
+    for t in stream_threads {
+        let _ = t.join();
+    }
 
     // Engine exited (signal): stop the accept loop and clean up the socket.
     svc.request_shutdown();
