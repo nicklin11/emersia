@@ -1000,6 +1000,10 @@ pub struct Engine {
     output: wayland_client::protocol::wl_output::WlOutput,
     /// Set when the target is a single window instead of `output`.
     window: Option<capture::windows::Toplevel>,
+    /// Portal screencast, started on the first frame (`Backend::Portal`).
+    portal: Option<capture::portal::PortalCapture>,
+    /// Stream index, which keys this engine's portal restore token.
+    portal_stream: u8,
     transform: wayland_client::protocol::wl_output::Transform,
     backend: Backend,
     pub backend_name: &'static str,
@@ -1035,6 +1039,20 @@ impl Engine {
     }
 
     /// Allow (default) or forbid the zero-copy path.
+    /// Which stream this engine feeds (keys its portal restore token).
+    pub fn with_portal_stream(mut self, stream: u8) -> Self {
+        self.portal_stream = stream;
+        self
+    }
+
+    /// End a portal screencast when streaming stops, so the desktop's
+    /// "sharing" indicator turns off with ours.
+    fn release_portal(&mut self) {
+        if self.portal.take().is_some() {
+            eprintln!("emersia-daemon: screen-share portal session closed");
+        }
+    }
+
     pub fn with_zero_copy(mut self, enabled: bool) -> Self {
         if !enabled {
             self.zc = ZcState::Off;
@@ -1045,7 +1063,7 @@ impl Engine {
     /// Whether this frame should try the zero-copy path.
     fn zero_copy_wanted(&self) -> bool {
         // The zero-copy path captures outputs with wlr-screencopy.
-        self.window.is_none() && !matches!(self.zc, ZcState::Off)
+        self.window.is_none() && self.backend != Backend::Portal && !matches!(self.zc, ZcState::Off)
     }
 
     /// Capture and encode one frame without the CPU touching pixels.
@@ -1331,6 +1349,8 @@ impl Engine {
             zc_frames: 0,
             output,
             window: None,
+            portal: None,
+            portal_stream: 0,
             transform,
             backend,
             backend_name: backend.protocol(),
@@ -1394,6 +1414,13 @@ impl Engine {
     /// coordinates. Without `xdg-output` the output is assumed to be the
     /// whole layout (correct for a single monitor).
     pub fn input_layout(&self) -> Option<(capture::Rect, capture::Rect)> {
+        if self.backend == Backend::Portal {
+            // The portal said where the shared monitor is; without that
+            // (a window, or not answered yet) the stream is keyboard-only.
+            let output = self.portal.as_ref()?.geometry()?;
+            let bounds = self.state.layout_bounds().unwrap_or(output);
+            return Some((output, bounds.union(output)));
+        }
         // No protocol says where a window sits on screen, so a window stream
         // takes keyboard input only (pointer motion needs a layout).
         if self.window.is_some() {
@@ -1426,6 +1453,18 @@ impl Engine {
                 &self.output,
                 self.transform,
             ),
+            Backend::Portal => {
+                let stream = self.portal_stream;
+                let cursor = self.state.paint_cursor;
+                self.portal
+                    .get_or_insert_with(|| {
+                        capture::portal::PortalCapture::start(
+                            crate::portal_token_path(stream),
+                            cursor,
+                        )
+                    })
+                    .next_frame(Duration::from_secs(1))
+            }
         }
     }
 }
@@ -1540,6 +1579,7 @@ pub fn run_stream(mut engine: Engine, service: Arc<Service>, stream: u8) {
             }
         }
         if !view.is_streaming() {
+            engine.release_portal();
             std::thread::sleep(IDLE_TICK);
             last_frame = Instant::now();
             continue;

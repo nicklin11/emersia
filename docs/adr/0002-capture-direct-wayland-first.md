@@ -52,3 +52,15 @@ the primary mechanism.
   `block-out-from "screencast"`) are honored by the portal path but not by
   direct `wlr-screencopy` — a known trade-off, mitigated by the explicit
   "you are sharing" indicator (M4).
+- Portal backend (M5): `xdg-desktop-portal` ScreenCast over zbus (blocking),
+  frames from PipeWire (`pipewire` crate) as mapped memfd/shm buffers. Chosen
+  by `--backend portal`, or automatically when neither capture protocol is
+  advertised. The handshake and PipeWire loop live on a worker thread; the
+  engine waits ≤ 1 s per frame and repeats the last frame on a static screen,
+  so an unanswered dialog is a status message and `stop` is prompt. The
+  restore token (`persist_mode=2`) is saved per stream; the session is closed
+  when streaming stops, so the desktop's own sharing indicator follows ours.
+  Verified headless in CI (`scripts/qa-portal-headless.sh`: private D-Bus,
+  PipeWire, WirePlumber, sway, xdg-desktop-portal-wlr with `chooser_type=none`).
+  Known: xdg-desktop-portal-wlr 0.8 crashes when its stream renegotiates after
+  an output reconfiguration on sway 1.12.

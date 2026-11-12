@@ -40,7 +40,7 @@ jobs:
           # for the in-process zero-copy encoder (#35).
           sudo apt-get install -y --no-install-recommends ffmpeg pkg-config clang \
             libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libavdevice-dev \
-            libswscale-dev libswresample-dev libgbm-dev
+            libswscale-dev libswresample-dev libgbm-dev libpipewire-0.3-dev
           ffmpeg -version | head -1
       - name: rustfmt
         if: hashFiles('host/Cargo.toml') != ''
@@ -97,14 +97,18 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends sway ffmpeg pkg-config clang \
+            pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr dbus mpv \
             libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libavdevice-dev \
-            libswscale-dev libswresample-dev libgbm-dev
+            libswscale-dev libswresample-dev libgbm-dev libpipewire-0.3-dev
           sway --version
       - name: Build
         run: cargo build --release --manifest-path host/Cargo.toml
       - name: Headless sway end-to-end
         timeout-minutes: 8
         run: scripts/qa-sway-headless.sh --encoder sw < /dev/null
+      - name: Portal capture end-to-end (ScreenCast + PipeWire)
+        timeout-minutes: 5
+        run: scripts/qa-portal-headless.sh < /dev/null
 
   # Companion app (M4): Tauri 2 on webkit2gtk; UI is dependency-free JS.
   gui:
