@@ -31,6 +31,8 @@ Options:
   --timeout SEC        per-read timeout in seconds (default 5)
   --save DIR           write the elementary stream to DIR/stream.h264
   --no-decode          skip the decode verification step
+  --send-input         send a no-op input record (zero scroll) every second,
+                       to check the host's input permission (QA)
   --fps N              expected rate, used to report drift (informational)
   --stream N           stream to save/decode-verify (default 0); all are counted
   -h, --help           print this help
@@ -106,6 +108,8 @@ struct Opts {
     stream: u8,
     /// Verify the stream really decodes.
     decode: bool,
+    /// Send a no-op input record each second (QA of input permissions).
+    send_input: bool,
 }
 
 fn parse_device_id(hex_str: &str) -> Result<[u8; DEVICE_ID_LEN], Fail> {
@@ -140,6 +144,7 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
     let mut save = None;
     let mut fps = None;
     let mut decode = true;
+    let mut send_input = false;
     let mut stream = 0u8;
 
     let mut it = args.iter();
@@ -167,6 +172,7 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
             }
             "--save" => save = Some(PathBuf::from(value("--save")?)),
             "--no-decode" => decode = false,
+            "--send-input" => send_input = true,
             "--stream" => {
                 stream = value("--stream")?
                     .parse()
@@ -198,6 +204,7 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
         fps,
         stream,
         decode,
+        send_input,
     };
 
     let device_id = parse_device_id(&opts.device_id)?;
@@ -254,6 +261,12 @@ pub fn run(args: &[String]) -> Result<(), Fail> {
         if last_ping.elapsed() >= Duration::from_secs(1) {
             last_ping = Instant::now();
             let _ = client.send_control(crate::transport::control::PING, &0u64.to_be_bytes());
+            if opts.send_input {
+                let noop = [crate::input::InputEvent::Scroll { dx: 0, dy: 0 }];
+                if let Ok(payload) = crate::input::encode(&noop) {
+                    let _ = client.send_control(crate::transport::control::INPUT, &payload);
+                }
+            }
         }
         let (header, payload) = match client.recv_record(opts.timeout) {
             Ok(v) => v,

@@ -99,6 +99,14 @@ pub struct Device {
     /// Unix seconds when revoked, if applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<u64>,
+    /// May this device inject input? `false` = view-only (it can watch, its
+    /// input is dropped). Stores written before this field load as allowed.
+    #[serde(default = "input_allowed_by_default")]
+    pub input: bool,
+}
+
+fn input_allowed_by_default() -> bool {
+    true
 }
 
 /// A pairing code awaiting redemption.
@@ -310,6 +318,9 @@ impl PairingDb {
         }
 
         let id = derive_device_id(public_key_hex);
+        // Re-pairing keeps a device's input permission (a view-only headset
+        // does not regain control by pairing again).
+        let input = self.db.devices.get(&id).is_none_or(|d| d.input);
         let device = Device {
             id: id.clone(),
             name: name.to_string(),
@@ -317,6 +328,7 @@ impl PairingDb {
             paired_at: now,
             revoked: false,
             revoked_at: None,
+            input,
         };
         self.db.devices.insert(id, device.clone());
         // Single-use: the code is consumed on success.
@@ -340,6 +352,24 @@ impl PairingDb {
             .collect()
     }
 
+    /// Allow or forbid a device's input. Persisted.
+    pub fn set_input(&mut self, id: &str, input: bool) -> Result<Device, PairingError> {
+        let device = self
+            .db
+            .devices
+            .get_mut(id)
+            .ok_or_else(|| PairingError::NotFound(id.to_string()))?;
+        device.input = input;
+        let device = device.clone();
+        self.save()?;
+        Ok(device)
+    }
+
+    /// Whether the active device `id` may inject input.
+    pub fn input_allowed(&self, id: &str) -> bool {
+        self.active_device(id).is_some_and(|d| d.input)
+    }
+
     /// Revoke a device by id. Returns the revoked record.
     pub fn revoke(&mut self, id: &str) -> Result<Device, PairingError> {
         let now = now_unix();
@@ -358,7 +388,6 @@ impl PairingDb {
         Ok(revoked)
     }
 
-    #[cfg(test)]
     /// Look up one active (non-revoked) device.
     pub fn active_device(&self, id: &str) -> Option<&Device> {
         self.db.devices.get(id).filter(|d| !d.revoked)
@@ -712,5 +741,37 @@ mod tests {
             d.accept_code("12", "x", &pubkey).unwrap_err(),
             PairingError::Invalid(_)
         ));
+    }
+
+    #[test]
+    fn view_only_flag_persists_and_survives_repairing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("devices.json");
+        let mut store = PairingDb::load(&path).unwrap();
+        let key = "11".repeat(32);
+        let code = store.new_code().unwrap().to_string();
+        let id = store.accept_code(&code, "Quest", &key).unwrap().id;
+        assert!(
+            store.input_allowed(&id),
+            "new devices may control by default"
+        );
+        store.set_input(&id, false).unwrap();
+        let mut reopened = PairingDb::load(&path).unwrap();
+        assert!(!reopened.input_allowed(&id), "view-only is persisted");
+        let code = reopened.new_code().unwrap().to_string();
+        reopened.accept_code(&code, "Quest", &key).unwrap();
+        assert!(
+            !reopened.input_allowed(&id),
+            "re-pairing does not regain control"
+        );
+        assert!(reopened.set_input("nope", true).is_err());
+    }
+
+    #[test]
+    fn stores_without_the_input_field_load_as_allowed() {
+        let d: Device =
+            serde_json::from_str(r#"{"id":"ab","name":"q","public_key":"00","paired_at":1}"#)
+                .unwrap();
+        assert!(d.input);
     }
 }

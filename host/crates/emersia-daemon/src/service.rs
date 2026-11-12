@@ -530,10 +530,21 @@ impl Service {
                         name: d.name.clone(),
                         paired_at: d.paired_at,
                         revoked: d.revoked,
+                        input: d.input,
                     })
                     .collect();
                 let active = devices.iter().filter(|d| !d.revoked).count();
                 ok_response(&id, json!({ "devices": devices, "active": active }))
+            }
+            Command::DeviceInput(args) => {
+                let outcome = self.lock_pairing().set_input(&args.device, args.input);
+                match outcome {
+                    Ok(device) => ok_response(
+                        &id,
+                        json!({ "device": device.id, "name": device.name, "input": device.input }),
+                    ),
+                    Err(e) => err_response(&id, pairing_error_code(&e), e.to_string()),
+                }
             }
             Command::Revoke(args) => {
                 // Scope the pairing guard so it is released before `inner` is

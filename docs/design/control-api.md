@@ -32,8 +32,9 @@ Local control plane between the `emersia` CLI (and later the Tauri GUI) and
 |---|---|---|
 | `status` | daemon + stream state | `streaming`, `backend` (`screencopy`/`image-copy-capture`/`portal`/`x11`), `encoder`, `latency_ms`, `measured_fps`, `capture_measured_fps`, `capture_window_frames`, `capture_window_elapsed_ms`, `capture_phases`, `connected_devices` |
 | `pair` | start/accept pairing | `action`: `new`\|`accept`, `code` |
-| `devices` | list paired devices | `id`, `name`, `paired_at`, `revoked` |
+| `devices` | list paired devices | `id`, `name`, `paired_at`, `revoked`, `input` |
 | `revoke` | remove a paired device | `device` |
+| `device_input` | allow a device's input, or make it view-only (`input: false`: it streams, its input is dropped before uinput) | `device`, `input` |
 | `screens` | list capturable outputs/windows | `kind`: `output`\|`window`, `name`, `size` |
 | `select` | set capture targets | `targets: [...]` (empty = none: capture stops) |
 | `start` / `stop` | begin/end capture streaming | — |
@@ -58,7 +59,7 @@ selection still requires compositor measurements.
 ## CLI mapping
 
 Every command maps 1:1: `emersia status`, `emersia pair new|accept`,
-`emersia devices`, `emersia revoke <id>`, `emersia screens`,
+`emersia devices`, `emersia revoke <id>`, `emersia allow-input <id> on|off`, `emersia screens`,
 `emersia select …`, `emersia start|stop`, `emersia events --follow`.
 
 ## Non-goals (M1)
