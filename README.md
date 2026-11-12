@@ -41,7 +41,13 @@ the [project board](https://github.com/users/nicklin11/projects/4).
   ([ADR 0009](docs/adr/0009-immersive-cylinder-layers.md)); point with a
   controller and pull the trigger to click, right thumbstick to scroll; the left
 thumbstick moves the screens closer/farther and resizes them (remembered).
-- Next: zero-copy capture on the host, more desktops (hyprland, GNOME/KDE).
+- Host capture: zero-copy on wlroots/niri (GPU buffer → in-process VAAPI,
+  ~3 % CPU for two 1080p60 monitors), single windows on sway ≥ 1.12, and the
+  **portal backend** (xdg-desktop-portal ScreenCast + PipeWire) for GNOME,
+  KDE and others — chosen automatically when the compositor has no capture
+  protocol, or with `--backend portal`; the permission dialog appears once
+  (restore token kept), and `emersia stop` ends the desktop's sharing
+  indicator.
 
 ### Companion app
 
@@ -97,7 +103,8 @@ script prints the exact `ufw` command when it detects one.
 | Host OS | Status |
 |---|---|
 | Linux — niri, sway, hyprland (direct Wayland capture) | 🎯 M1 (first) |
-| Linux — GNOME/KDE (portal fallback), X11 | M5 |
+| Linux — GNOME/KDE (portal backend; CI-tested headless, desktops untested) | M5 (in progress) |
+| Linux — X11 | M5 |
 | Windows 10/11 | M6 |
 | macOS | M7 |
 

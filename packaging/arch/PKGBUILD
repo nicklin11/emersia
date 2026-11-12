@@ -43,8 +43,9 @@ check() {
 
 package_emersia-git() {
   pkgdesc+=" (host daemon and CLI)"
-  depends=(ffmpeg mesa gcc-libs glibc)
+  depends=(ffmpeg mesa libpipewire gcc-libs glibc)
   optdepends=('libva-mesa-driver: AMD/Intel hardware encoding'
+              'xdg-desktop-portal: screen capture on GNOME/KDE (portal backend)'
               'libnotify: desktop notification when a headset connects'
               'emersia-gui-git: tray sharing indicator and pairing UI')
   provides=(emersia)

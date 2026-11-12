@@ -6,6 +6,7 @@
 //! connect, detect outputs, grab exactly one frame, then exit.
 
 pub mod ext;
+pub mod portal;
 pub mod windows;
 pub mod wlr;
 
@@ -74,6 +75,8 @@ pub struct CapturedFrame {
 pub enum Backend {
     Ext,
     Wlr,
+    /// xdg-desktop-portal ScreenCast + PipeWire (GNOME, KDE, …).
+    Portal,
 }
 
 impl Backend {
@@ -82,6 +85,7 @@ impl Backend {
         match self {
             Backend::Ext => "ext-image-copy-capture",
             Backend::Wlr => "wlr-screencopy",
+            Backend::Portal => "portal",
         }
     }
 }
@@ -92,6 +96,7 @@ pub enum BackendPref {
     Auto,
     Ext,
     Wlr,
+    Portal,
 }
 
 /// Pick the backend: `ext-image-copy-capture` is preferred (ADR 0002),
@@ -107,11 +112,11 @@ pub fn choose_backend(pref: BackendPref, has_ext: bool, has_wlr: bool) -> anyhow
         BackendPref::Wlr => {
             bail!("--backend wlr requested but the compositor does not advertise wlr-screencopy")
         }
+        BackendPref::Portal => Ok(Backend::Portal),
         BackendPref::Auto if has_ext => Ok(Backend::Ext),
         BackendPref::Auto if has_wlr => Ok(Backend::Wlr),
-        BackendPref::Auto => {
-            bail!("the compositor advertises neither ext-image-copy-capture nor wlr-screencopy")
-        }
+        // GNOME, KDE: no capture protocol for clients; ask the portal.
+        BackendPref::Auto => Ok(Backend::Portal),
     }
 }
 
@@ -589,7 +594,15 @@ mod tests {
             choose_backend(BackendPref::Auto, false, true).unwrap(),
             Backend::Wlr
         );
-        assert!(choose_backend(BackendPref::Auto, false, false).is_err());
+        assert_eq!(
+            choose_backend(BackendPref::Auto, false, false).unwrap(),
+            Backend::Portal,
+            "no capture protocol: fall back to the portal"
+        );
+        assert_eq!(
+            choose_backend(BackendPref::Portal, true, true).unwrap(),
+            Backend::Portal
+        );
     }
 
     #[test]

@@ -31,7 +31,7 @@ use emersia_transport::{codec, crypto, input, transport};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use capture::{BackendPref, State};
@@ -282,8 +282,9 @@ fn parse_backend(value: &str) -> Result<BackendPref, String> {
         "auto" => Ok(BackendPref::Auto),
         "ext" => Ok(BackendPref::Ext),
         "wlr" => Ok(BackendPref::Wlr),
+        "portal" => Ok(BackendPref::Portal),
         other => Err(format!(
-            "invalid value for --backend: {other:?} (expected auto, ext or wlr)"
+            "invalid value for --backend: {other:?} (expected auto, ext, wlr or portal)"
         )),
     }
 }
@@ -441,7 +442,8 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
                 .with_encoder(opts.encoder, Some(opts.bitrate))
                 .with_codec(opts.codec)
                 .with_cursor(opts.cursor)
-                .with_zero_copy(opts.zero_copy);
+                .with_zero_copy(opts.zero_copy)
+                .with_portal_stream(stream);
             let svc = Arc::clone(&svc);
             stream_threads.push(
                 std::thread::Builder::new()
@@ -588,6 +590,11 @@ fn run_capture(opts: &CaptureOpts) -> anyhow::Result<()> {
             capture::ext::Target::Output(&output),
         )?,
         capture::Backend::Wlr => capture::wlr::capture(&mut queue, &mut state, &output, transform)?,
+        capture::Backend::Portal => {
+            // The first frame can wait on the user answering the dialog.
+            let mut portal = capture::portal::PortalCapture::start(portal_token_path(0), true);
+            portal.next_frame(Duration::from_secs(120))?
+        }
     };
     let elapsed = started.elapsed();
     let frame = captured.frame;
@@ -626,6 +633,16 @@ fn availability(available: bool) -> &'static str {
     } else {
         "missing"
     }
+}
+
+/// Where the screen-share portal's restore token for `stream` is kept, so
+/// the permission dialog appears once, not on every start.
+pub fn portal_token_path(stream: u8) -> std::path::PathBuf {
+    pairing::default_db_path()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("portal-restore-token-{stream}"))
 }
 
 #[cfg(test)]
