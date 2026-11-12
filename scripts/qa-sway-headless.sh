@@ -118,6 +118,10 @@ for stream in 0 1; do
 done
 
 step "removing $virt"
+# Stop capturing it first: older sway (1.9) stops answering IPC when an
+# output is unplugged mid-capture.
+ctl stop >/dev/null
+sleep 1
 "$bin/emersia" virtual remove "$virt" || fail "emersia virtual remove failed"
 ! "$bin/emersia" virtual list | grep -qx "$virt" || fail "$virt still listed"
 backend=$(grep -oP 'capture backend: \K.*' "$work/daemon.log")
