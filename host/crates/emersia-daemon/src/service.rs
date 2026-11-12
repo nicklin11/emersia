@@ -45,6 +45,8 @@ const DEFAULT_FPS: u32 = 30;
 
 /// Engine idle tick — how often a stopped engine checks for new commands.
 const IDLE_TICK: Duration = Duration::from_millis(20);
+/// How often the output list is re-read for hot-plugged/virtual outputs.
+const OUTPUT_REFRESH: Duration = Duration::from_secs(1);
 
 /// Rolling window used for the session-scoped capture-rate telemetry.
 const CAPTURE_RATE_WINDOW: Duration = Duration::from_secs(2);
@@ -908,6 +910,8 @@ pub struct Engine {
     codec: crate::codec::Codec,
     /// Rolling estimate of the capture rate actually being achieved.
     measured_fps: f64,
+    /// Last encoder restart caused by a capture-rate change.
+    last_rate_restart: Option<Instant>,
     output: wayland_client::protocol::wl_output::WlOutput,
     transform: wayland_client::protocol::wl_output::Transform,
     backend: Backend,
@@ -1068,12 +1072,17 @@ impl Engine {
                 || enc.config().input_format != input_format
             {
                 self.encoder = None;
-            } else if (enc.config().fps as i64 - effective as i64).abs()
-                > (effective as i64 / 4).max(1)
+            } else if rate_mismatch(enc.config().fps, effective)
+                && self
+                    .last_rate_restart
+                    .is_none_or(|t| t.elapsed() >= RATE_RESTART_MIN_INTERVAL)
             {
-                // The delivered rate moved far enough that the encoder's
-                // timing is now wrong. Restarting also forces a keyframe,
-                // which is convenient rather than incidental.
+                // The delivered rate is far from what the encoder budgets
+                // bits for (rate control works per declared frame). Restart
+                // — but with hysteresis: each restart costs ~100 ms and a
+                // keyframe burst, and a damage-driven desktop swings between
+                // idle and busy constantly (CI saw 15 keyframes in 20 frames).
+                self.last_rate_restart = Some(Instant::now());
                 self.encoder = None;
             } else {
                 return Ok(true);
@@ -1139,12 +1148,39 @@ impl Engine {
             bitrate: crate::encoder::EncoderConfig::default().bitrate,
             codec: crate::codec::Codec::H264,
             measured_fps: 0.0,
+            last_rate_restart: None,
             output,
             transform,
             backend,
             backend_name: backend.protocol(),
             screens,
         })
+    }
+
+    /// Pick up outputs added or removed since discovery (a monitor plugged
+    /// in, a virtual output created with `emersia virtual add`). Two
+    /// roundtrips: registry globals, then their name/mode (and geometry).
+    /// Returns whether the set of outputs changed.
+    pub fn refresh_outputs(&mut self) -> anyhow::Result<bool> {
+        let before = self.state.output_labels();
+        self.queue
+            .roundtrip(&mut self.state)
+            .context("refreshing Wayland globals")?;
+        self.queue
+            .roundtrip(&mut self.state)
+            .context("reading new output descriptions")?;
+        let qh = self.queue.handle();
+        if self.state.request_missing_geometry(&qh) {
+            self.queue
+                .roundtrip(&mut self.state)
+                .context("reading new output layout")?;
+        }
+        let after = self.state.output_labels();
+        if after != before {
+            self.screens = screen_infos(&self.state);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Select a named output from the live discovery state.
@@ -1206,6 +1242,15 @@ pub fn rtp_timestamp(epoch: Instant, at: Instant) -> u32 {
 /// stalling capture (the unit then ships on a later iteration, as before).
 const UNIT_WAIT: Duration = Duration::from_millis(30);
 
+/// Encoder restarts for a changed capture rate are at most this frequent.
+const RATE_RESTART_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Whether the encoder's declared rate is more than 2x off the delivered one.
+fn rate_mismatch(declared: u32, delivered: u32) -> bool {
+    let (d, e) = (declared.max(1), delivered.max(1));
+    d > e * 2 || e > d * 2
+}
+
 /// How long `emersia pair headset` keeps the pairing window open.
 pub const HEADSET_PAIR_WINDOW: Duration = Duration::from_secs(120);
 
@@ -1233,29 +1278,28 @@ pub fn run_stream(mut engine: Engine, service: Arc<Service>, stream: u8) {
     // encoder restarts (a device joining, a keyframe request). Shared with the
     // network thread, which answers clock probes on the same clock.
     let stream_epoch = service.stream_epoch();
-    let mut last_peers = 0usize;
+    let mut last_sessions = 0u64;
     let mut applied_output: Option<String> = None;
     let mut last_forced_keyframe = Instant::now();
+    let mut last_refresh = Instant::now();
 
     while !service.is_shutting_down() && !crate::signal_received() {
         // Receiving (handshakes, revocation, device messages) runs on the
         // network thread; the engine only watches the peer count.
         if let Some(transport) = engine.transport.as_ref() {
-            let peers = crate::network::lock(transport).peer_count();
-            if peers > last_peers {
-                // A device just connected. It has no prior frames, so it cannot
-                // decode anything until a keyframe arrives. Dropping the
-                // encoder makes the next frame an IDR, which is the only way to
-                // force one over a raw ffmpeg pipe — there is no control
-                // channel. Costs one encoder restart per connection.
-                if last_peers > 0 || engine.encoder.is_some() {
-                    eprintln!(
-                        "emersia-daemon: new device connected, restarting encoder for a keyframe"
-                    );
+            let sessions = crate::network::lock(transport).sessions_established();
+            if sessions != last_sessions {
+                // A device just (re)connected. Its new session has no prior
+                // frames, so it cannot decode until a keyframe arrives — also
+                // when it merely reconnected, which leaves the peer count
+                // unchanged. Dropping the encoder makes the next frame an IDR,
+                // the only way to force one over a raw ffmpeg pipe.
+                if engine.encoder.is_some() {
+                    eprintln!("emersia-daemon: new session, restarting encoder for a keyframe");
                 }
                 engine.encoder = None;
             }
-            last_peers = peers;
+            last_sessions = sessions;
             // A device lost a frame and cannot decode until an IDR. Restarting
             // the encoder is the only way to force one through the ffmpeg
             // pipe, so requests are coalesced and rate-limited.
@@ -1269,6 +1313,22 @@ pub fn run_stream(mut engine: Engine, service: Arc<Service>, stream: u8) {
             }
         }
 
+        // Hot plug: re-read the output list once a second. Stream 0 publishes
+        // it (so `start` can validate new names); every stream refreshes its
+        // own connection so it can select an output created after startup.
+        if last_refresh.elapsed() >= OUTPUT_REFRESH {
+            last_refresh = Instant::now();
+            match engine.refresh_outputs() {
+                Ok(true) => {
+                    view.publish_discovery(engine.screens.clone(), Some(engine.backend_name));
+                    view.set_input_layout(engine.input_layout());
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    let _ = engine.latch_protocol_failure(&e);
+                }
+            }
+        }
         if !view.is_streaming() {
             std::thread::sleep(IDLE_TICK);
             last_frame = Instant::now();
@@ -1599,6 +1659,15 @@ impl StreamView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoder_rate_restarts_only_on_large_mismatches() {
+        assert!(!rate_mismatch(60, 45), "a 25% swing is not worth a restart");
+        assert!(!rate_mismatch(30, 60));
+        assert!(rate_mismatch(60, 5), "idle desktop vs 60 fps budget");
+        assert!(rate_mismatch(5, 60));
+        assert!(!rate_mismatch(0, 1));
+    }
 
     #[test]
     fn rtp_timestamp_follows_real_time_not_the_target_rate() {

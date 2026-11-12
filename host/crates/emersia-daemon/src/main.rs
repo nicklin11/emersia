@@ -373,11 +373,9 @@ fn run_serve(opts: &ServeOpts) -> anyhow::Result<()> {
     // own output's damage), idle until `start A B …` names them.
     let mut stream_threads = Vec::new();
     if let Some(endpoint) = engine.transport() {
-        let extra = engine
-            .screens
-            .len()
-            .min(usize::from(transport::MAX_STREAMS))
-            .saturating_sub(1);
+        // Always the maximum: outputs can appear later (hot plug, `emersia
+        // virtual add`), and an idle engine costs one Wayland connection.
+        let extra = usize::from(transport::MAX_STREAMS) - 1;
         for stream in 1..=extra as u8 {
             let extra_engine = service::Engine::discover(opts.backend)
                 .context("extra stream: capture engine discovery failed")?
