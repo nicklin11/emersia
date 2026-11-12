@@ -23,6 +23,45 @@ function stat(label, value) {
 
 let knownOutputs = "";
 
+/** "just now", "5 min ago", … for a Unix time in seconds. */
+function ago(unix) {
+  const s = Math.max(0, Date.now() / 1000 - unix);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return `${Math.floor(s / 86400)} days ago`;
+}
+
+/** First-run guidance: only what is actually wrong or not yet proven. */
+function renderSetup(setup, devices) {
+  const items = [];
+  const item = (text, command) => {
+    const li = document.createElement("li");
+    li.textContent = text;
+    if (command) {
+      const code = document.createElement("code");
+      code.textContent = command;
+      li.append(code);
+    }
+    items.push(li);
+  };
+  if (setup && setup.input_enabled && !setup.uinput_writable) {
+    item(
+      "Headset input is off: this user cannot write /dev/uinput. Add yourself to the input group, then log out and back in:",
+      "sudo usermod -aG input $USER",
+    );
+  }
+  const everConnected = devices.some((d) => d.last_seen);
+  if (setup && setup.stream_port && !everConnected) {
+    item(
+      `No headset has connected yet. If a firewall is active, allow UDP port ${setup.stream_port} (e.g. ufw):`,
+      `sudo ufw allow proto udp to any port ${setup.stream_port} comment 'Emersia stream'`,
+    );
+  }
+  $("setup-items").replaceChildren(...items);
+  $("setup").hidden = items.length === 0;
+}
+
 async function refresh() {
   try {
     const s = await invoke("status");
@@ -62,6 +101,7 @@ async function refresh() {
     }
 
     const d = await invoke("devices");
+    renderSetup(s.setup, d.devices || []);
     const ul = $("devices");
     ul.replaceChildren(
       ...(d.devices || [])
@@ -69,7 +109,8 @@ async function refresh() {
         .map((dev) => {
           const li = document.createElement("li");
           const name = document.createElement("span");
-          name.textContent = `${dev.name}  ·  ${dev.id}`;
+          name.textContent = `${dev.name}  ·  ${dev.last_seen ? "seen " + ago(dev.last_seen) : "never connected"}`;
+          name.title = dev.id;
           // View-only headsets watch but cannot control the desktop (#140).
           const ctl = document.createElement("label");
           ctl.className = "small";

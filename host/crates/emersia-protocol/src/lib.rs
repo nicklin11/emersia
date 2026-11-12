@@ -144,6 +144,9 @@ pub struct DeviceInfo {
     /// May this device inject input? (false = view-only)
     #[serde(default = "default_true")]
     pub input: bool,
+    /// Unix seconds the device last connected or disconnected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<u64>,
 }
 
 fn default_true() -> bool {

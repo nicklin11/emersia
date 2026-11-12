@@ -181,6 +181,19 @@ struct Stats {
 }
 
 /// Mutable service state, guarded by one mutex.
+/// How the daemon was started, for first-run guidance (#M4).
+#[derive(Debug, Default)]
+struct Setup {
+    input_enabled: bool,
+    stream_port: Option<u16>,
+}
+
+/// Can this process open `/dev/uinput` for writing (needed for input)?
+fn uinput_writable() -> bool {
+    // SAFETY: a NUL-terminated literal path; access(2) only reads it.
+    unsafe { libc::access(c"/dev/uinput".as_ptr(), libc::W_OK) == 0 }
+}
+
 #[derive(Debug, Default)]
 struct Inner {
     streaming: bool,
@@ -194,6 +207,8 @@ struct Inner {
     last_error: Option<String>,
     /// Devices currently connected to the streaming endpoint.
     stream_peers: usize,
+    /// Facts the companion app needs for first-run guidance.
+    setup: Setup,
     /// Devices revoked since the engine last drained; the engine disconnects
     /// them, which is how "revoke kills an active session" is honoured.
     revoked_pending: Vec<[u8; 8]>,
@@ -249,6 +264,14 @@ pub struct Service {
 }
 
 impl Service {
+    /// Record how the daemon was started (input on/off, stream port) for
+    /// the `setup` block of `status`.
+    pub fn set_setup(&self, input_enabled: bool, stream_port: Option<u16>) {
+        let mut inner = self.lock();
+        inner.setup.input_enabled = input_enabled;
+        inner.setup.stream_port = stream_port;
+    }
+
     pub fn new(pairing: PairingDb, host_public_key_hex: &str) -> Self {
         Self {
             inner: Mutex::new(Inner {
@@ -531,6 +554,7 @@ impl Service {
                         paired_at: d.paired_at,
                         revoked: d.revoked,
                         input: d.input,
+                        last_seen: d.last_seen,
                     })
                     .collect();
                 let active = devices.iter().filter(|d| !d.revoked).count();
@@ -848,6 +872,11 @@ impl Service {
             "last_error": inner.last_error,
             "protocol_version": PROTOCOL_VERSION,
             "host_public_key": self.host_public_key,
+            "setup": {
+                "input_enabled": inner.setup.input_enabled,
+                "uinput_writable": uinput_writable(),
+                "stream_port": inner.setup.stream_port,
+            },
         })
     }
 }
