@@ -35,8 +35,12 @@ the [project board](https://github.com/users/nicklin11/projects/4).
   creates a headset-only monitor (niri: see
   [virtual outputs](docs/design/virtual-outputs.md) for the EDID / dummy-plug
   route).
-- Next: the immersive OpenXR view (curved screens placed in 3D), zero-copy
-  capture.
+- Immersive mode: the **Immersive** button (or the Emersia VR app) puts every
+  stream on a curved screen around you, floating in your room via passthrough,
+  decoded straight into OpenXR cylinder layers with zero copies
+  ([ADR 0009](docs/adr/0009-immersive-cylinder-layers.md)); point with a
+  controller and pull the trigger to click, thumbstick to scroll.
+- Next: adjustable screen layout, zero-copy capture on the host.
 
 ### Companion app
 
