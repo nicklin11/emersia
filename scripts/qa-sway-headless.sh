@@ -67,7 +67,10 @@ grep -q "captured 1920x1080" "$work/capture.log" || fail "capture did not return
 
 step "streaming the virtual output to a test receiver"
 port=$((40000 + RANDOM % 20000))
-run "$bin/emersia-daemon" serve --stream-port "$port" --socket "$rt/ctl.sock" \
+# Started directly (not through `run`): `$!` must be the daemon itself, or
+# cleanup kills a wrapper subshell and leaves the daemon running.
+env XDG_RUNTIME_DIR="$rt" WAYLAND_DISPLAY=wayland-1 XDG_CONFIG_HOME="$work/config" \
+  "$bin/emersia-daemon" serve --stream-port "$port" --socket "$rt/ctl.sock" \
   --encoder "$encoder" >"$work/daemon.log" 2>&1 &
 pids+=($!)
 ctl() { "$bin/emersia" --socket "$rt/ctl.sock" "$@"; }
