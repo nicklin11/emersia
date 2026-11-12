@@ -82,6 +82,7 @@ jobs:
   sway:
     name: sway-e2e
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -96,7 +97,8 @@ jobs:
       - name: Build
         run: cargo build --release --manifest-path host/Cargo.toml
       - name: Headless sway end-to-end
-        run: scripts/qa-sway-headless.sh --encoder sw
+        timeout-minutes: 8
+        run: scripts/qa-sway-headless.sh --encoder sw < /dev/null
 
   # Aggregate check — this is the single required status on `main`.
   ci:

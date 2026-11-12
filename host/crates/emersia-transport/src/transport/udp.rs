@@ -90,6 +90,9 @@ pub struct HostEndpoint {
     peers: HashMap<[u8; DEVICE_ID_LEN], Peer>,
     /// Control records from connected devices, oldest first.
     inbox: std::collections::VecDeque<ControlRecord>,
+    /// Sessions established since bind, including a device reconnecting
+    /// (which replaces its session without changing the peer count).
+    sessions: u64,
 }
 
 /// Decides whether a device may start a handshake.
@@ -109,6 +112,7 @@ impl HostEndpoint {
             pending: HashMap::new(),
             peers: HashMap::new(),
             inbox: std::collections::VecDeque::new(),
+            sessions: 0,
         })
     }
 
@@ -228,6 +232,7 @@ impl HostEndpoint {
             return HostOutcome::Silent;
         }
         let pending = self.pending.remove(&from).expect("just checked");
+        self.sessions += 1;
         self.peers.insert(
             pending.device_id,
             Peer {
@@ -321,6 +326,12 @@ impl HostEndpoint {
             }
         }
         Ok(processed)
+    }
+
+    /// Sessions established so far. A change means some device starts from
+    /// scratch and needs a keyframe — also when it merely reconnected.
+    pub fn sessions_established(&self) -> u64 {
+        self.sessions
     }
 
     /// Number of confirmed peers.
@@ -721,6 +732,7 @@ mod tests {
     fn handshake_over_real_sockets_connects_a_peer() {
         let (mut host, _client, id) = established();
         assert_eq!(host.peer_count(), 1);
+        assert_eq!(host.sessions_established(), 1);
         assert_eq!(host.peer_ids(), vec![id]);
         assert!(host
             .send_frame(&id, 0, true, Codec::H264.payload_type(), b"hello")

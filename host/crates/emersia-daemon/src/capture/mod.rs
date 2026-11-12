@@ -392,6 +392,20 @@ impl State {
         }
     }
 
+    /// Geometry requests for outputs that appeared since the last call (hot
+    /// plug, virtual outputs). Returns whether any was sent.
+    pub fn request_missing_geometry(&self, qh: &QueueHandle<Self>) -> bool {
+        let Some(mgr) = &self.xdg_output_mgr else {
+            return false;
+        };
+        let mut sent = false;
+        for output in self.outputs.iter().filter(|o| o.logical.is_none()) {
+            mgr.get_xdg_output(&output.proxy, qh, output.global_name);
+            sent = true;
+        }
+        sent
+    }
+
     /// Union of every output's logical rectangle: the space an absolute
     /// pointer device spans on wlroots compositors and niri.
     pub fn layout_bounds(&self) -> Option<Rect> {

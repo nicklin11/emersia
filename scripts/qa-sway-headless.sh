@@ -35,7 +35,16 @@ work=$(mktemp -d)
 pids=()
 cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
-  wait 2>/dev/null || true
+  # A process blocked on a hung compositor never finishes SIGTERM handling;
+  # give a grace period, then SIGKILL, so cleanup itself cannot hang.
+  for _ in $(seq 30); do
+    alive=0
+    for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && alive=1; done
+    ((alive)) || break
+    sleep 0.1
+  done
+  for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null || true; done
+  pkill -9 -P $$ 2>/dev/null || true
   rm -rf "$rt" "$work"
 }
 trap cleanup EXIT
@@ -66,7 +75,7 @@ swaymsg -t get_outputs | grep -q '"HEADLESS-2"' || fail "virtual output was not 
 run() { env XDG_RUNTIME_DIR="$rt" WAYLAND_DISPLAY=wayland-1 XDG_CONFIG_HOME="$work/config" "$@"; }
 
 step "one-shot capture of the virtual output"
-run "$bin/emersia-daemon" capture --output HEADLESS-2 --out "$work/frame.png" | tee "$work/capture.log"
+run timeout 30 "$bin/emersia-daemon" capture --output HEADLESS-2 --out "$work/frame.png" | tee "$work/capture.log"
 grep -q "captured 1920x1080" "$work/capture.log" || fail "capture did not return 1920x1080"
 
 step "streaming the virtual output to a test receiver"
@@ -75,8 +84,9 @@ port=$((40000 + RANDOM % 20000))
 # cleanup kills a wrapper subshell and leaves the daemon running.
 env XDG_RUNTIME_DIR="$rt" WAYLAND_DISPLAY=wayland-1 XDG_CONFIG_HOME="$work/config" \
   "$bin/emersia-daemon" serve --stream-port "$port" --socket "$rt/ctl.sock" \
-  --encoder "$encoder" >"$work/daemon.log" 2>&1 &
-pids+=($!)
+  --encoder "$encoder" --no-audio >"$work/daemon.log" 2>&1 &
+daemon_pid=$!
+pids+=($daemon_pid)
 ctl() { "$bin/emersia" --socket "$rt/ctl.sock" "$@"; }
 for _ in $(seq 50); do ctl status >/dev/null 2>&1 && break; sleep 0.1; done
 ctl status >/dev/null || fail "daemon did not start"
@@ -88,19 +98,58 @@ code=$(ctl pair new --json | python3 -c 'import json,sys; print(json.load(sys.st
 device=$(ctl pair accept "$code" --name qa --public-key "$pub" --json \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["device"])')
 host_key=$(ctl status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["host_public_key"])')
-ctl --fps 30 start HEADLESS-2 >/dev/null
+step "creating a virtual output with 'emersia virtual add' while the daemon runs"
+virt=$("$bin/emersia" virtual add 1280x720) || fail "emersia virtual add failed"
+echo "created $virt"
+# The daemon re-reads outputs once a second (hot plug).
+for _ in $(seq 50); do
+  ctl screens --json | grep -q "\"$virt\"" && break
+  sleep 0.1
+done
+ctl screens --json | grep -q "\"$virt\"" || fail "daemon did not pick up $virt"
+
+step "streaming HEADLESS-2 and $virt at once (two streams)"
+ctl --fps 30 start HEADLESS-2 "$virt" >/dev/null
 
 # Capture is damage-driven: keep the output changing while we receive.
-(for i in $(seq 200); do
-   swaymsg "output HEADLESS-2 bg #$(printf '%02x%02x%02x' $((i * 7 % 256)) 80 $((255 - i * 7 % 256))) solid_color" >/dev/null 2>&1 || exit 0
+# The virtual output gets no `bg` (a swaybg left on an output that is later
+# unplugged spins and starves sway 1.11's IPC); its damage is the cursor,
+# which captures now composite, moving back and forth across it.
+read -r vx vy vw vh < <(swaymsg -r -t get_outputs | python3 -c '
+import json, sys
+o = [o for o in json.load(sys.stdin) if o["name"] == sys.argv[1]][0]["rect"]
+print(o["x"], o["y"], o["width"], o["height"])' "$virt")
+(for i in $(seq 400); do
+   c=$(printf '%02x%02x%02x' $((i * 7 % 256)) 80 $((255 - i * 7 % 256)))
+   swaymsg "output HEADLESS-2 bg #$c solid_color" >/dev/null 2>&1 || exit 0
+   swaymsg "seat seat0 cursor set $((vx + 50 + i * 37 % (vw - 100))) $((vy + vh / 2))" >/dev/null 2>&1 || exit 0
    sleep 0.05
  done) &
-pids+=($!)
+damage_pid=$!
+pids+=($damage_pid)
 
-"$bin/emersia-daemon" receive --server "127.0.0.1:$port" --device-id "$device" \
-  --host-key "$host_key" --private-key "$priv" --frames "$frames" --timeout 10 \
-  | tee "$work/receive.log" || fail "receiver failed"
-grep -q "^decoded:" "$work/receive.log" || fail "stream did not decode"
-backend=$(grep -oP 'capture backend: \K.*' "$work/daemon.log")
+for stream in 0 1; do
+  timeout 90 "$bin/emersia-daemon" receive --server "127.0.0.1:$port" --device-id "$device" \
+    --host-key "$host_key" --private-key "$priv" --frames "$frames" --timeout 10 \
+    --stream "$stream" | tee "$work/receive-$stream.log" || fail "receiver failed (stream $stream)"
+  grep -q "^decoded:" "$work/receive-$stream.log" || fail "stream $stream did not decode"
+done
+
 encoder_used=$(ctl status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["encoder"])')
-echo "qa-sway: PASS — $(swaymsg -t get_version | python3 -c 'import json,sys; print(json.load(sys.stdin)["human_readable"])'), backend $backend, encoder $encoder_used"
+backend=$(grep -oP 'capture backend: \K.*' "$work/daemon.log")
+
+step "removing $virt"
+# Quiesce first: stop the background-colour loop (each `bg` spawns a
+# swaybg client; one left on an unplugged output spins and starves sway's
+# IPC — seen on sway 1.11) and stop capturing the output.
+kill "$damage_pid" 2>/dev/null || true
+wait "$damage_pid" 2>/dev/null || true
+ctl stop >/dev/null
+# Then let the daemon go entirely: on sway 1.11 an unplug did not return while
+# a client still had the output bound, so check removal with no client.
+kill "$daemon_pid" 2>/dev/null || true
+for _ in $(seq 30); do kill -0 "$daemon_pid" 2>/dev/null || break; sleep 0.1; done
+sleep 0.5
+"$bin/emersia" virtual remove "$virt" || fail "emersia virtual remove failed"
+! "$bin/emersia" virtual list | grep -qx "$virt" || fail "$virt still listed"
+echo "qa-sway: PASS (2 streams incl. virtual output $virt) — $(swaymsg -t get_version | python3 -c 'import json,sys; print(json.load(sys.stdin)["human_readable"])'), backend $backend, encoder $encoder_used"
