@@ -6,6 +6,9 @@ pub const ASPECT: f32 = 16.0 / 9.0;
 /// Bounds the user can adjust within.
 pub const RADIUS_RANGE: (f32, f32) = (1.0, 3.5);
 pub const WIDTH_RANGE: (f32, f32) = (0.8, 3.5);
+/// Widest a row of screens may wrap around the viewer, radians (~230°).
+/// More screens than fit start another row (#142).
+pub const MAX_ROW_SPAN: f32 = 4.0;
 
 /// Screen arrangement: curved screens on a cylinder around the viewer.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,12 +42,35 @@ impl Layout {
         self.width / ASPECT
     }
 
-    /// Yaw (radians, positive = left) of screen `index` of `count`, laid out
-    /// left to right and centred on the forward direction.
-    pub fn yaw(&self, index: usize, count: usize) -> f32 {
+    /// Screens per row and number of rows for `count` screens: as many per
+    /// row as fit in [`MAX_ROW_SPAN`], rows balanced (5 → 3 + 2).
+    pub fn grid(&self, count: usize) -> (usize, usize) {
+        let fit = ((MAX_ROW_SPAN + self.gap) / (self.arc() + self.gap)).floor() as usize;
+        let fit = fit.max(1);
+        let rows = count.div_ceil(fit).max(1);
+        (count.div_ceil(rows).max(1), rows)
+    }
+
+    /// Placement of screen `index` of `count`: yaw (radians, positive = left)
+    /// and height of its centre (metres, + = up). Rows fill left to right,
+    /// top to bottom, each centred ahead; the block of rows is centred at eye
+    /// level.
+    pub fn place(&self, index: usize, count: usize) -> (f32, f32) {
+        let (cols, rows) = self.grid(count);
+        let (row, col) = (index / cols, index % cols);
+        let in_row = cols.min(count.saturating_sub(row * cols)).max(1);
         let arc = self.arc();
-        let total = count as f32 * arc + count.saturating_sub(1) as f32 * self.gap;
-        total / 2.0 - arc / 2.0 - index as f32 * (arc + self.gap)
+        let total = in_row as f32 * arc + in_row.saturating_sub(1) as f32 * self.gap;
+        let yaw = total / 2.0 - arc / 2.0 - col as f32 * (arc + self.gap);
+        // Vertical gap: the same angular gap, as a distance on the cylinder.
+        let pitch = self.height() + self.gap * self.radius;
+        let y = (rows as f32 - 1.0) / 2.0 * pitch - row as f32 * pitch;
+        (yaw, y)
+    }
+
+    /// Yaw of screen `index` of `count`; see [`place`](Self::place).
+    pub fn yaw(&self, index: usize, count: usize) -> f32 {
+        self.place(index, count).0
     }
 
     /// Where a ray from `origin` along `dir` (OpenXR LOCAL space: -Z forward,
@@ -71,13 +97,18 @@ impl Layout {
         let (px, py, pz) = (ox + t * dx, oy + t * dy, oz + t * dz);
         let yaw = (-px).atan2(-pz);
         let arc = self.arc();
-        let v = 0.5 - py / self.height();
-        if !(0.0..=1.0).contains(&v) {
-            return None;
-        }
         (0..count).find_map(|i| {
-            let u = (self.yaw(i, count) + arc / 2.0 - yaw) / arc;
-            (0.0..=1.0).contains(&u).then_some((i, u, v))
+            let (centre, y) = self.place(i, count);
+            let v = 0.5 - (py - y) / self.height();
+            // Yaw difference wrapped to (-π, π].
+            let mut d = centre - yaw;
+            if d > std::f32::consts::PI {
+                d -= std::f32::consts::TAU;
+            } else if d <= -std::f32::consts::PI {
+                d += std::f32::consts::TAU;
+            }
+            let u = (d + arc / 2.0) / arc;
+            ((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v)).then_some((i, u, v))
         })
     }
 
@@ -220,5 +251,46 @@ mod tests {
         assert_eq!(Layout::from_line("nonsense"), Layout::default());
         assert_eq!(Layout::from_line("NaN 2"), Layout::default());
         assert_eq!(Layout::from_line("99 99").radius, RADIUS_RANGE.1);
+    }
+
+    #[test]
+    fn up_to_four_default_screens_share_one_row() {
+        let l = Layout::default();
+        for n in 1..=4 {
+            assert_eq!(l.grid(n), (n, 1), "{n} screens");
+            assert!((0..n).all(|i| l.place(i, n).1 == 0.0), "eye level");
+        }
+    }
+
+    #[test]
+    fn more_screens_stack_into_balanced_rows_that_never_overlap() {
+        let l = Layout::default();
+        assert_eq!(l.grid(5), (3, 2));
+        assert_eq!(l.grid(8), (4, 2));
+        for n in 5..=8 {
+            let (cols, rows) = l.grid(n);
+            assert!(cols as f32 * l.arc() + (cols - 1) as f32 * l.gap <= MAX_ROW_SPAN);
+            assert!(cols * rows >= n);
+            // Every screen's centre hits that screen, at its centre.
+            for i in 0..n {
+                let (yaw, y) = l.place(i, n);
+                let dir = [-yaw.sin(), y / l.radius, -yaw.cos()];
+                let (hit, u, v) = l.hit([0.0; 3], dir, n).unwrap();
+                assert_eq!(hit, i, "{n} screens, screen {i}");
+                assert!(close(u, 0.5) && close(v, 0.5), "{u} {v}");
+            }
+        }
+        // Rows sit above and below eye level, symmetric.
+        assert!(close(l.place(0, 6).1, -l.place(5, 6).1) && l.place(0, 6).1 > 0.0);
+    }
+
+    #[test]
+    fn huge_screens_still_get_one_per_row() {
+        let l = Layout {
+            radius: 1.0,
+            width: 3.5,
+            ..Layout::default()
+        };
+        assert_eq!(l.grid(3), (1, 3));
     }
 }

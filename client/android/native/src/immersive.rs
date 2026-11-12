@@ -513,7 +513,7 @@ pub unsafe fn run(
             .values()
             .enumerate()
             .map(|(i, screen)| {
-                let yaw = layout.yaw(i, count);
+                let (yaw, y) = layout.place(i, count);
                 xr::sys::CompositionLayerCylinderKHR {
                     ty: xr::sys::CompositionLayerCylinderKHR::TYPE,
                     next: std::ptr::null(),
@@ -538,7 +538,7 @@ pub unsafe fn run(
                             z: 0.0,
                             w: (yaw / 2.0).cos(),
                         },
-                        position: xr::Vector3f::default(),
+                        position: xr::Vector3f { x: 0.0, y, z: 0.0 },
                     },
                     radius: layout.radius,
                     central_angle: layout.arc(),

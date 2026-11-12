@@ -71,6 +71,14 @@ step "creating a virtual output (swaymsg create_output)"
 swaymsg create_output >/dev/null
 swaymsg output HEADLESS-2 mode 1920x1080 pos 1280 0 >/dev/null
 swaymsg -t get_outputs | grep -q '"HEADLESS-2"' || fail "virtual output was not created"
+# Three small extra outputs: with the virtual one created later, six streams
+# run at once (more than the old 4-stream cap; #142).
+small=(HEADLESS-3 HEADLESS-4 HEADLESS-5)
+for i in 0 1 2; do
+  swaymsg create_output >/dev/null
+  swaymsg output "${small[$i]}" mode 640x360 pos $((i * 640)) 1080 >/dev/null
+done
+for o in "${small[@]}"; do swaymsg -t get_outputs | grep -q "\"$o\"" || fail "$o was not created"; done
 
 run() { env XDG_RUNTIME_DIR="$rt" WAYLAND_DISPLAY=wayland-1 XDG_CONFIG_HOME="$work/config" "$@"; }
 
@@ -108,8 +116,9 @@ for _ in $(seq 50); do
 done
 ctl screens --json | grep -q "\"$virt\"" || fail "daemon did not pick up $virt"
 
-step "streaming HEADLESS-2 and $virt at once (two streams)"
-ctl --fps 30 start HEADLESS-2 "$virt" >/dev/null
+targets=(HEADLESS-2 "$virt" HEADLESS-1 "${small[@]}")
+step "streaming ${#targets[@]} outputs at once: ${targets[*]}"
+ctl --fps 30 start "${targets[@]}" >/dev/null
 
 # Capture is damage-driven: keep the output changing while we receive.
 # The virtual output gets no `bg` (a swaybg left on an output that is later
@@ -121,14 +130,16 @@ o = [o for o in json.load(sys.stdin) if o["name"] == sys.argv[1]][0]["rect"]
 print(o["x"], o["y"], o["width"], o["height"])' "$virt")
 (for i in $(seq 400); do
    c=$(printf '%02x%02x%02x' $((i * 7 % 256)) 80 $((255 - i * 7 % 256)))
-   swaymsg "output HEADLESS-2 bg #$c solid_color" >/dev/null 2>&1 || exit 0
+   for o in HEADLESS-2 HEADLESS-1 "${small[@]}"; do
+     swaymsg "output $o bg #$c solid_color" >/dev/null 2>&1 || exit 0
+   done
    swaymsg "seat seat0 cursor set $((vx + 50 + i * 37 % (vw - 100))) $((vy + vh / 2))" >/dev/null 2>&1 || exit 0
    sleep 0.05
  done) &
 damage_pid=$!
 pids+=($damage_pid)
 
-for stream in 0 1; do
+for stream in $(seq 0 $((${#targets[@]} - 1))); do
   timeout 90 "$bin/emersia-daemon" receive --server "127.0.0.1:$port" --device-id "$device" \
     --host-key "$host_key" --private-key "$priv" --frames "$frames" --timeout 10 \
     --stream "$stream" | tee "$work/receive-$stream.log" || fail "receiver failed (stream $stream)"
@@ -152,4 +163,4 @@ for _ in $(seq 30); do kill -0 "$daemon_pid" 2>/dev/null || break; sleep 0.1; do
 sleep 0.5
 "$bin/emersia" virtual remove "$virt" || fail "emersia virtual remove failed"
 ! "$bin/emersia" virtual list | grep -qx "$virt" || fail "$virt still listed"
-echo "qa-sway: PASS (2 streams incl. virtual output $virt) — $(swaymsg -t get_version | python3 -c 'import json,sys; print(json.load(sys.stdin)["human_readable"])'), backend $backend, encoder $encoder_used"
+echo "qa-sway: PASS (${#targets[@]} streams incl. virtual output $virt) — $(swaymsg -t get_version | python3 -c 'import json,sys; print(json.load(sys.stdin)["human_readable"])'), backend $backend, encoder $encoder_used"

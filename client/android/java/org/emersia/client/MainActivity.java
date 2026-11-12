@@ -233,13 +233,16 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         super.onPause();
     }
 
+    /** Mirrors emersia_transport::transport::MAX_STREAMS (stream ids 0..8). */
+    static final int MAX_STREAMS = 8;
+
     /**
      * Opens a Horizon OS panel for every extra stream the host sends (e.g.
      * `emersia start DP-3 HDMI-A-1`): stream 0 is this panel.
      */
     private void openNewPanels() {
         int seen = NativeBridge.nativeStreams(handle);
-        for (int stream = 1; stream < 4; stream++) {
+        for (int stream = 1; stream < MAX_STREAMS; stream++) {
             int bit = 1 << stream;
             if ((seen & bit) != 0 && (openPanels & bit) == 0) {
                 openPanels |= bit; // until the panel reports itself
