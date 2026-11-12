@@ -228,6 +228,8 @@ pub unsafe fn run(
     wanted.khr_opengl_es_enable = true;
     wanted.khr_android_surface_swapchain = true;
     wanted.khr_composition_layer_cylinder = true;
+    // Optional: the room behind the screens (Quest passthrough).
+    wanted.fb_passthrough = available.fb_passthrough;
     let instance = entry
         .create_instance(
             &xr::ApplicationInfo {
@@ -273,6 +275,31 @@ pub unsafe fn run(
         .khr_android_surface_swapchain
         .ok_or("surface swapchain extension not loaded")?
         .create_swapchain_android_surface;
+
+    // Passthrough: the user's room as the bottom layer, screens on top.
+    let passthrough = if available.fb_passthrough {
+        match session
+            .create_passthrough(xr::PassthroughFlagsFB::IS_RUNNING_AT_CREATION)
+            .and_then(|p| {
+                let layer = session.create_passthrough_layer(
+                    &p,
+                    xr::PassthroughFlagsFB::IS_RUNNING_AT_CREATION,
+                    xr::PassthroughLayerPurposeFB::RECONSTRUCTION,
+                )?;
+                Ok((p, layer))
+            }) {
+            Ok(pair) => {
+                log::info!("passthrough on");
+                Some(pair)
+            }
+            Err(e) => {
+                log::warn!("passthrough unavailable ({e}); black background");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Controller input: aim pose, trigger (click), thumbstick (scroll).
     let action_set = instance
@@ -461,14 +488,28 @@ pub unsafe fn run(
                 }
             })
             .collect();
-        let pointers: Vec<*const xr::sys::CompositionLayerBaseHeader> = if state.should_render {
-            layers
-                .iter()
-                .map(|l| (l as *const xr::sys::CompositionLayerCylinderKHR).cast())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let passthrough_layer =
+            passthrough
+                .as_ref()
+                .map(|(_, layer)| xr::sys::CompositionLayerPassthroughFB {
+                    ty: xr::sys::CompositionLayerPassthroughFB::TYPE,
+                    next: std::ptr::null(),
+                    flags: xr::CompositionLayerFlags::EMPTY,
+                    space: xr::sys::Space::NULL,
+                    layer_handle: *layer.inner(),
+                });
+        let mut pointers: Vec<*const xr::sys::CompositionLayerBaseHeader> = Vec::new();
+        if state.should_render {
+            // Passthrough must come first: layers composite bottom to top.
+            if let Some(pt) = &passthrough_layer {
+                pointers.push((pt as *const xr::sys::CompositionLayerPassthroughFB).cast());
+            }
+            pointers.extend(
+                layers
+                    .iter()
+                    .map(|l| (l as *const xr::sys::CompositionLayerCylinderKHR).cast()),
+            );
+        }
         let end = xr::sys::FrameEndInfo {
             ty: xr::sys::FrameEndInfo::TYPE,
             next: std::ptr::null(),
@@ -495,6 +536,7 @@ pub unsafe fn run(
     for screen in screens.values() {
         let _ = (instance.fp().destroy_swapchain)(screen.swapchain);
     }
+    drop(passthrough);
     drop(space);
     drop(session);
     drop(egl);

@@ -18,6 +18,8 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
     <uses-feature android:name="android.hardware.vr.headtracking" android:required="false" />
+    <!-- Immersive mode shows the room behind the screens when available. -->
+    <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false" />
 
     <!-- OpenXR (Khronos loader): talk to the runtime broker. -->
     <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
