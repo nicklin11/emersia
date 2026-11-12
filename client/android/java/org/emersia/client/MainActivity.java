@@ -79,6 +79,12 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     private final Runnable poll = new Runnable() {
         @Override public void run() {
             if (handle != 0) {
+                // Remember where the host moved to, so the next launch goes there.
+                String server = NativeBridge.nativeServer(handle);
+                SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+                if (!server.isEmpty() && !server.equals(prefs.getString(EXTRA_SERVER, ""))) {
+                    prefs.edit().putString(EXTRA_SERVER, server).apply();
+                }
                 String text = NativeBridge.nativeStatus(handle);
                 status.setText(text);
                 long now = System.currentTimeMillis();
@@ -155,6 +161,9 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     /** Listen for a PC's pairing beacon and run the code exchange (ADR 0008). */
     private void startPairing() {
         if (pairHandle != 0) return;
+        // The stream listens on the discovery port for presence announcements;
+        // pairing needs it. A new pairing replaces the host anyway.
+        stop();
         String name = Build.MODEL != null ? Build.MODEL.replace('_', ' ') : "Quest";
         pairHandle = NativeBridge.nativePairStart(getFilesDir().getAbsolutePath(), name);
         if (pairHandle == 0) {

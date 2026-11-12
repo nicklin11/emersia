@@ -22,6 +22,9 @@ final class NativeBridge {
     /** Human-readable status block for the overlay. */
     static native String nativeStatus(long handle);
 
+    /** The host address in use; changes when the host moved and was followed. */
+    static native String nativeServer(long handle);
+
     /** Pointer position on the video, 0..1 on each axis. */
     static native void nativePointer(long handle, float x, float y);
 

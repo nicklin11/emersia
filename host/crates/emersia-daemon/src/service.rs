@@ -323,6 +323,10 @@ impl Service {
         self.lock().stream_peers = count;
     }
 
+    pub fn host_public_key(&self) -> &str {
+        &self.host_public_key
+    }
+
     pub fn stream_epoch(&self) -> Instant {
         self.stream_epoch
     }
