@@ -44,7 +44,11 @@ Native OpenXR (Khronos loader 1.1.65, bundled and hash-pinned), no engine:
   cylinders and sent as `PointerOn{stream}`; trigger = click, thumbstick =
   scroll. The pointer the user sees is the desktop's own cursor, composited by
   the host — nothing extra is rendered.
-- Not yet: passthrough, recentering and user-adjustable layout.
+- Passthrough (#130): with `XR_FB_passthrough` the room is the bottom layer
+  and the screens float in it (keyboard and desk stay visible); black when the
+  runtime lacks it. Quest 2: `LCnt=3` (passthrough + 2 screens) at 72/72 FPS.
+- Recentering is the system's (hold the Meta button); LOCAL space follows it.
+- Not yet: user-adjustable layout (distance, size, arrangement).
 - Verification gap: compositor stats prove the layers are composited, but an
   idle headset captures black, so the image itself still needs to be checked
   by someone wearing it.
