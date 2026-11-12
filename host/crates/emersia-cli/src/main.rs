@@ -98,6 +98,14 @@ fn run(args: &[String]) -> Result<(), Failure> {
         })?,
     };
 
+    if let Command::Pair(PairArgs {
+        action: PairAction::Open,
+        ..
+    }) = invocation.command
+    {
+        return pair_headset(&socket);
+    }
+
     let request = Request {
         v: PROTOCOL_VERSION,
         id: next_id(),
@@ -105,6 +113,92 @@ fn run(args: &[String]) -> Result<(), Failure> {
     };
     let response = send(&socket, &request)?;
     print_response(&response, invocation.json)
+}
+
+fn pair_request(action: PairAction, device: Option<String>) -> Request {
+    Request {
+        v: PROTOCOL_VERSION,
+        id: next_id(),
+        command: Command::Pair(PairArgs {
+            action,
+            code: None,
+            name: None,
+            public_key: None,
+            device,
+        }),
+    }
+}
+
+fn ok_payload(response: Response) -> Result<serde_json::Value, Failure> {
+    match response {
+        Response::Ok(ok) => Ok(ok.ok),
+        Response::Err(err) => Err(Failure::Runtime(format!(
+            "{}: {}",
+            serde_json::to_value(err.error.code)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            err.error.message
+        ))),
+    }
+}
+
+/// `emersia pair headset`: open a window, wait for a headset to reach a code,
+/// have the user compare it with the headset, confirm or reject (ADR 0008).
+fn pair_headset(socket: &std::path::Path) -> Result<(), Failure> {
+    let opened = ok_payload(send(socket, &pair_request(PairAction::Open, None))?)?;
+    let window = opened["expires_in_s"].as_u64().unwrap_or(120);
+    println!("Pairing window open for {window} s.");
+    println!("In the headset, open Emersia and choose \"Pair with a PC\" — waiting…");
+    let close = || {
+        let _ = send(socket, &pair_request(PairAction::Close, None));
+    };
+    loop {
+        std::thread::sleep(Duration::from_millis(300));
+        let state = ok_payload(send(socket, &pair_request(PairAction::Pending, None))?)?;
+        if !state["open"].as_bool().unwrap_or(false) {
+            return Err(Failure::Runtime(
+                "pairing window expired without a headset; run it again".into(),
+            ));
+        }
+        let Some(first) = state["pending"].as_array().and_then(|p| p.first()).cloned() else {
+            continue;
+        };
+        let name = first["name"].as_str().unwrap_or("headset");
+        let code = first["code"].as_str().unwrap_or("");
+        let device = first["device"].as_str().unwrap_or("").to_string();
+        println!();
+        println!("  Headset \"{name}\" wants to pair.");
+        println!("  Code:  {code}");
+        println!();
+        print!("Does the headset show exactly this code? [y/N] ");
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        let _ = std::io::stdin().read_line(&mut answer);
+        let yes = matches!(answer.trim(), "y" | "Y" | "yes" | "Yes");
+        let action = if yes {
+            PairAction::Confirm
+        } else {
+            PairAction::Reject
+        };
+        let result = ok_payload(send(socket, &pair_request(action, Some(device)))?);
+        close();
+        return match (yes, result) {
+            (true, Ok(v)) => {
+                println!(
+                    "Paired \"{}\" ({}). Confirm on the headset too; it starts mirroring.",
+                    v["name"].as_str().unwrap_or(name),
+                    v["device"].as_str().unwrap_or("")
+                );
+                Ok(())
+            }
+            (false, _) => {
+                println!("Rejected. Nothing was paired.");
+                Ok(())
+            }
+            (true, Err(e)) => Err(e),
+        };
+    }
 }
 
 /// Connect, send one request line, read one response line.
@@ -365,12 +459,31 @@ fn build_command(
             let action = match positionals.first().map(String::as_str) {
                 Some("new") => PairAction::New,
                 Some("accept") => PairAction::Accept,
+                Some("headset") => PairAction::Open,
+                Some("pending") => PairAction::Pending,
+                Some("confirm") => PairAction::Confirm,
+                Some("reject") => PairAction::Reject,
+                Some("close") => PairAction::Close,
                 other => {
                     return Err(Failure::Usage(format!(
-                        "'pair' needs 'new' or 'accept' (got {other:?})"
+                        "'pair' needs new, accept, headset, pending, confirm, reject or close (got {other:?})"
                     )))
                 }
             };
+            if matches!(action, PairAction::Confirm | PairAction::Reject) {
+                let device = positionals.get(1).cloned().ok_or_else(|| {
+                    Failure::Usage(
+                        "'pair confirm|reject' needs a device key (see 'pair pending')".into(),
+                    )
+                })?;
+                return Ok(Command::Pair(PairArgs {
+                    action,
+                    code: None,
+                    name: None,
+                    public_key: None,
+                    device: Some(device),
+                }));
+            }
             // `accept` cannot work without a code, a name and a public key.
             if action == PairAction::Accept {
                 if positionals.get(1).is_none() {
@@ -391,6 +504,7 @@ fn build_command(
                 code: positionals.get(1).cloned(),
                 name: device_name,
                 public_key,
+                device: None,
             }))
         }
         "revoke" => {
@@ -416,7 +530,10 @@ fn print_help() {
     println!("  start [OUTPUT]         begin capture streaming");
     println!("  stop                   end capture streaming");
     println!("  events                 current state snapshot (follow-mode later)");
-    println!("  pair new                 mint a short-lived pairing code");
+    println!(
+        "  pair headset             pair a headset from inside it (compare a code)
+  pair new                 mint a short-lived pairing code"
+    );
     println!("  pair accept CODE --name N --public-key HEX");
     println!("                           register a device identity");
     println!("  devices                  list paired devices");
@@ -494,6 +611,7 @@ mod tests {
                 code: None,
                 name: None,
                 public_key: None,
+                device: None,
             })
         );
     }

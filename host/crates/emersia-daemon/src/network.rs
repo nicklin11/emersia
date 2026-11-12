@@ -15,10 +15,61 @@ use crate::inject::Injector;
 use crate::service::Service;
 use crate::transport::control;
 use crate::transport::udp::HostEndpoint;
+use crate::transport_pairing as pairing;
 
 /// Read timeout: how quickly the thread notices shutdown and revocations when
 /// no datagram arrives.
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
+/// Beacon period while a pairing window is open.
+const BEACON_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Directed IPv4 broadcast address of every up, non-loopback interface.
+///
+/// The limited broadcast 255.255.255.255 leaves through the default route
+/// only; a headset on another interface (a Wi-Fi hotspot next to wired
+/// Ethernet, the reference setup) would never see it. The address is computed
+/// from address and netmask rather than read from the interface: hotspot
+/// setups often configure no broadcast address at all (the kernel then reports
+/// 0.0.0.0, which delivers the beacon to this host only).
+fn broadcast_addresses() -> Vec<std::net::Ipv4Addr> {
+    let mut out = Vec::new();
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs allocates a list we walk read-only and free once.
+    unsafe {
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return out;
+        }
+        let mut cur = ifap;
+        while let Some(ifa) = cur.as_ref() {
+            let flags = ifa.ifa_flags;
+            let up = flags & libc::IFF_UP as u32 != 0;
+            let loopback = flags & libc::IFF_LOOPBACK as u32 != 0;
+            let ipv4 = |sa: *mut libc::sockaddr| {
+                (!sa.is_null() && (*sa).sa_family as i32 == libc::AF_INET)
+                    .then(|| u32::from_be((*(sa as *const libc::sockaddr_in)).sin_addr.s_addr))
+            };
+            if let (true, false, Some(addr), Some(mask)) =
+                (up, loopback, ipv4(ifa.ifa_addr), ipv4(ifa.ifa_netmask))
+            {
+                if let Some(bcast) = directed_broadcast(addr, mask) {
+                    if !out.contains(&bcast) {
+                        out.push(bcast);
+                    }
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+    }
+    out
+}
+
+/// `addr | !mask`, or `None` for point-to-point style /31–/32 networks
+/// (VPN tunnels like tailscale), which have no broadcast.
+fn directed_broadcast(addr: u32, mask: u32) -> Option<std::net::Ipv4Addr> {
+    (mask.count_ones() <= 30).then(|| std::net::Ipv4Addr::from(addr | !mask))
+}
+
 /// Largest datagram accepted.
 const MAX_DATAGRAM: usize = 65_535;
 
@@ -39,6 +90,9 @@ pub fn spawn(
 ) -> std::io::Result<JoinHandle<()>> {
     let socket = lock(&endpoint).try_clone_socket()?;
     socket.set_read_timeout(Some(READ_TIMEOUT))?;
+    // Pairing beacons are broadcast from the stream socket, so a headset
+    // learns the stream port from the beacon's source.
+    socket.set_broadcast(true)?;
     std::thread::Builder::new()
         .name("emersia-net".into())
         .spawn(move || run(socket, endpoint, service, input_enabled))
@@ -52,6 +106,11 @@ fn run(
 ) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut injector = Injector::default();
+    let stream_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+    let host_name = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|h| h.trim().to_string())
+        .unwrap_or_else(|_| "emersia host".into());
+    let mut last_beacon: Option<std::time::Instant> = None;
     while !service.is_shutting_down() && !crate::signal_received() {
         let received = match socket.recv_from(&mut buf) {
             Ok(v) => Some(v),
@@ -71,6 +130,33 @@ fn run(
                 None
             }
         };
+
+        // In-headset pairing (ADR 0008): cleartext, answered only while the
+        // user has a window open, and never handed to the endpoint.
+        let received = match received {
+            Some((n, from)) if pairing::is_pairing_packet(&buf[..n]) => {
+                let reply = service.lock_headset_pairing().handle(&buf[..n], from);
+                if let Some(reply) = reply {
+                    let _ = socket.send_to(&reply, from);
+                }
+                None
+            }
+            other => other,
+        };
+        for (to, packet) in service.take_pairing_outbox() {
+            let _ = socket.send_to(&packet, to);
+        }
+        if last_beacon.is_none_or(|t| t.elapsed() >= BEACON_INTERVAL) {
+            last_beacon = Some(std::time::Instant::now());
+            let beacon = service
+                .lock_headset_pairing()
+                .beacon(stream_port, &host_name);
+            if let Some(beacon) = beacon {
+                for addr in broadcast_addresses() {
+                    let _ = socket.send_to(&beacon, (addr, pairing::DISCOVERY_PORT));
+                }
+            }
+        }
 
         let mut ep = lock(&endpoint);
         // A revoked device loses its session immediately, not at the next
@@ -129,5 +215,27 @@ fn run(
             injector.release_all();
         }
         service.set_stream_peers(peers);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directed_broadcast_comes_from_address_and_mask() {
+        let ip = |s: &str| u32::from(s.parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(
+            directed_broadcast(ip("192.168.60.1"), ip("255.255.255.0")),
+            Some("192.168.60.255".parse().unwrap())
+        );
+        assert_eq!(
+            directed_broadcast(ip("172.18.19.95"), ip("255.255.224.0")),
+            Some("172.18.31.255".parse().unwrap())
+        );
+        assert_eq!(
+            directed_broadcast(ip("100.64.0.1"), ip("255.255.255.255")),
+            None
+        );
     }
 }

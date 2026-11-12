@@ -121,6 +121,10 @@ pub struct PairArgs {
     /// Hex-encoded X25519 public key proving the device identity (`accept`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
+    /// Hex device public key of a pending in-headset pairing (`confirm`,
+    /// `reject`), as listed by `pending`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
 }
 
 /// A paired device as reported by `devices`.
@@ -138,6 +142,17 @@ pub struct DeviceInfo {
 pub enum PairAction {
     New,
     Accept,
+    /// Open an in-headset pairing window: the daemon broadcasts discovery
+    /// beacons and answers SAS exchanges (ADR 0008).
+    Open,
+    /// List headsets that reached a code and await the host user's decision.
+    Pending,
+    /// The codes match: pair this headset.
+    Confirm,
+    /// The codes differ (or the user declined).
+    Reject,
+    /// Close the pairing window.
+    Close,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -5,6 +5,7 @@
 //! and `jni_bridge` exist only on Android.
 
 pub mod identity;
+pub mod pairing;
 pub mod session;
 pub mod status;
 

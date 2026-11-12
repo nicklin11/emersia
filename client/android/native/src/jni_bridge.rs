@@ -300,3 +300,112 @@ pub extern "system" fn Java_org_emersia_client_NativeBridge_nativeKey(
         }
     }
 }
+
+/// A running in-headset pairing (ADR 0008).
+struct Pairing {
+    state: Arc<std::sync::Mutex<crate::pairing::PairState>>,
+    confirmed: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+/// `long nativePairStart(String filesDir, String deviceName)` → handle, or 0.
+#[no_mangle]
+pub extern "system" fn Java_org_emersia_client_NativeBridge_nativePairStart(
+    mut env: JNIEnv,
+    _class: JClass,
+    files_dir: JString,
+    device_name: JString,
+) -> jlong {
+    init_logging();
+    let (Some(dir), Some(name)) = (string(&mut env, &files_dir), string(&mut env, &device_name))
+    else {
+        return 0;
+    };
+    let identity = match crate::identity::load_or_create(&PathBuf::from(dir)) {
+        Ok(i) => i,
+        Err(e) => {
+            log::error!("pairing: {e}");
+            return 0;
+        }
+    };
+    let state = Arc::new(std::sync::Mutex::new(crate::pairing::PairState::Searching));
+    let confirmed = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let (state, confirmed, stop) = (state.clone(), confirmed.clone(), stop.clone());
+        std::thread::Builder::new()
+            .name("emersia-pair".into())
+            .spawn(move || {
+                let addr = ("0.0.0.0", emersia_transport::pairing::DISCOVERY_PORT);
+                match std::net::UdpSocket::bind(addr) {
+                    Ok(discovery) => {
+                        crate::pairing::run(&discovery, &identity, &name, &state, &confirmed, &stop)
+                    }
+                    Err(e) => {
+                        *state.lock().unwrap_or_else(|p| p.into_inner()) =
+                            crate::pairing::PairState::Failed(format!("discovery port: {e}"));
+                    }
+                }
+            })
+            .ok()
+    };
+    Box::into_raw(Box::new(Pairing {
+        state,
+        confirmed,
+        stop,
+        worker,
+    })) as jlong
+}
+
+/// `String nativePairStatus(long handle)` — see `PairState::to_line`.
+#[no_mangle]
+pub extern "system" fn Java_org_emersia_client_NativeBridge_nativePairStatus(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    if handle == 0 {
+        return jstr(&mut env, "error|not started");
+    }
+    // SAFETY: valid until nativePairStop, called on the same (UI) thread.
+    let pairing = unsafe { &*(handle as *const Pairing) };
+    let line = pairing
+        .state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .to_line();
+    jstr(&mut env, &line)
+}
+
+/// `void nativePairConfirm(long handle)` — the headset user says the codes match.
+#[no_mangle]
+pub extern "system" fn Java_org_emersia_client_NativeBridge_nativePairConfirm(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    if handle != 0 {
+        // SAFETY: as in nativePairStatus.
+        let pairing = unsafe { &*(handle as *const Pairing) };
+        pairing.confirmed.store(true, Ordering::Relaxed);
+    }
+}
+
+/// `void nativePairStop(long handle)` — cancel/finish; frees the handle.
+#[no_mangle]
+pub extern "system" fn Java_org_emersia_client_NativeBridge_nativePairStop(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: from Box::into_raw in nativePairStart; Java drops its copy.
+    let mut pairing = unsafe { Box::from_raw(handle as *mut Pairing) };
+    pairing.stop.store(true, Ordering::Relaxed);
+    if let Some(w) = pairing.worker.take() {
+        let _ = w.join();
+    }
+}

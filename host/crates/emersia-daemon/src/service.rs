@@ -234,6 +234,11 @@ pub struct Service {
     input_layout: Mutex<Option<(crate::capture::Rect, crate::capture::Rect)>>,
     /// Origin of frame timestamps and of PONG clock replies.
     stream_epoch: Instant,
+    /// In-headset pairing window and its exchanges (ADR 0008). Lock order:
+    /// never held while taking `pairing` (the trust store) or `inner`.
+    headset_pairing: Mutex<crate::transport_pairing::HostPairing>,
+    /// Pairing RESULT packets for the network thread to send.
+    pairing_outbox: Mutex<Vec<(std::net::SocketAddr, Vec<u8>)>>,
 }
 
 impl Service {
@@ -249,6 +254,10 @@ impl Service {
             keyframe_requested: AtomicBool::new(false),
             input_layout: Mutex::new(None),
             stream_epoch: Instant::now(),
+            headset_pairing: Mutex::new(crate::transport_pairing::HostPairing::new(
+                crate::crypto::parse_public_key_hex(host_public_key_hex).unwrap_or([0; 32]),
+            )),
+            pairing_outbox: Mutex::new(Vec::new()),
         }
     }
 
@@ -515,7 +524,129 @@ impl Service {
 
     /// `pair new` mints a short-lived code; `pair accept <code>` registers a
     /// device identity against it.
+    pub(crate) fn lock_headset_pairing(
+        &self,
+    ) -> std::sync::MutexGuard<'_, crate::transport_pairing::HostPairing> {
+        self.headset_pairing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// RESULT packets waiting to be sent by the network thread.
+    pub fn take_pairing_outbox(&self) -> Vec<(std::net::SocketAddr, Vec<u8>)> {
+        std::mem::take(
+            &mut *self
+                .pairing_outbox
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+
+    /// In-headset pairing actions (ADR 0008).
+    fn handle_headset_pair(&self, id: &str, args: emersia_protocol::PairArgs) -> Response {
+        let device_key = |args: &emersia_protocol::PairArgs| {
+            args.device
+                .as_deref()
+                .and_then(|d| crate::crypto::parse_public_key_hex(d).ok())
+        };
+        match args.action {
+            PairAction::Open => {
+                let mut hp = self.lock_headset_pairing();
+                hp.open(HEADSET_PAIR_WINDOW);
+                ok_response(
+                    id,
+                    json!({ "open": true, "expires_in_s": HEADSET_PAIR_WINDOW.as_secs() }),
+                )
+            }
+            PairAction::Close => {
+                self.lock_headset_pairing().close();
+                ok_response(id, json!({ "open": false }))
+            }
+            PairAction::Pending => {
+                let hp = self.lock_headset_pairing();
+                let pending: Vec<_> = hp
+                    .pending()
+                    .into_iter()
+                    .map(|p| {
+                        let key = hex::encode(p.device_key);
+                        json!({
+                            "device": key,
+                            "id": crate::crypto::device_id_hex(&key),
+                            "name": p.name,
+                            "code": p.code,
+                        })
+                    })
+                    .collect();
+                ok_response(
+                    id,
+                    json!({
+                        "open": hp.is_open(),
+                        "remaining_s": hp.remaining().as_secs(),
+                        "pending": pending,
+                    }),
+                )
+            }
+            PairAction::Reject => {
+                let Some(key) = device_key(&args) else {
+                    return err_response(id, ErrorCode::InvalidArgs, "pair reject needs a device");
+                };
+                let decided = self.lock_headset_pairing().decide(&key, false);
+                match decided {
+                    Some(packet) => {
+                        self.queue_pairing_packet(packet);
+                        ok_response(id, json!({ "paired": false }))
+                    }
+                    None => err_response(id, ErrorCode::NotFound, "no such pending headset"),
+                }
+            }
+            PairAction::Confirm => {
+                let Some(key) = device_key(&args) else {
+                    return err_response(id, ErrorCode::InvalidArgs, "pair confirm needs a device");
+                };
+                let pending = self
+                    .lock_headset_pairing()
+                    .pending()
+                    .into_iter()
+                    .find(|p| p.device_key == key);
+                let Some(pending) = pending else {
+                    return err_response(id, ErrorCode::NotFound, "no such pending headset");
+                };
+                // Store the device through the same validated path as a code
+                // pairing, so the trust store has one way in.
+                let stored = {
+                    let mut db = self.lock_pairing();
+                    db.new_code().and_then(|code| {
+                        db.accept_code(&code.to_string(), &pending.name, &hex::encode(key))
+                    })
+                };
+                match stored {
+                    Ok(device) => {
+                        if let Some(packet) = self.lock_headset_pairing().decide(&key, true) {
+                            self.queue_pairing_packet(packet);
+                        }
+                        ok_response(
+                            id,
+                            json!({ "paired": true, "device": device.id, "name": device.name }),
+                        )
+                    }
+                    Err(e) => err_response(id, pairing_error_code(&e), e.to_string()),
+                }
+            }
+            PairAction::New | PairAction::Accept => unreachable!("handled by handle_pair"),
+        }
+    }
+
+    fn queue_pairing_packet(&self, packet: (std::net::SocketAddr, Vec<u8>)) {
+        self.pairing_outbox
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(packet);
+    }
+
     fn handle_pair(&self, id: &str, args: emersia_protocol::PairArgs) -> Response {
+        if !matches!(args.action, PairAction::New | PairAction::Accept) {
+            return self.handle_headset_pair(id, args);
+        }
         let mut db = self.lock_pairing();
         match args.action {
             PairAction::New => match db.new_code() {
@@ -528,6 +659,11 @@ impl Service {
                 ),
                 Err(e) => err_response(id, pairing_error_code(&e), e.to_string()),
             },
+            PairAction::Open
+            | PairAction::Pending
+            | PairAction::Confirm
+            | PairAction::Reject
+            | PairAction::Close => unreachable!("handled above"),
             PairAction::Accept => {
                 let (Some(code), Some(name), Some(public_key)) =
                     (args.code, args.name, args.public_key)
@@ -993,6 +1129,9 @@ pub fn rtp_timestamp(epoch: Instant, at: Instant) -> u32 {
 /// stalling capture (the unit then ships on a later iteration, as before).
 const UNIT_WAIT: Duration = Duration::from_millis(30);
 
+/// How long `emersia pair headset` keeps the pairing window open.
+pub const HEADSET_PAIR_WINDOW: Duration = Duration::from_secs(120);
+
 /// Minimum spacing between keyframes forced by device requests. Each one costs
 /// an encoder restart, and a burst of loss produces a burst of requests.
 const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
@@ -1416,6 +1555,76 @@ mod tests {
         service
     }
 
+    fn headset_pair(action: emersia_protocol::PairAction, device: Option<String>) -> Command {
+        Command::Pair(emersia_protocol::PairArgs {
+            action,
+            code: None,
+            name: None,
+            public_key: None,
+            device,
+        })
+    }
+
+    /// Open → device exchange → pending shows the code → confirm stores the
+    /// device and queues an authentic RESULT for the network thread.
+    #[test]
+    fn headset_pairing_confirm_stores_device_and_queues_result() {
+        use crate::transport_pairing::{DeviceExchange, Message};
+        use emersia_protocol::PairAction;
+        let service = Service::new_for_tests();
+        let host_key = crate::crypto::parse_public_key_hex(&service.host_public_key).unwrap();
+        // Closed window: pairing packets are ignored.
+        let device = crate::crypto::DeviceIdentity::generate().unwrap();
+        let mut dev = DeviceExchange::new(host_key, device.public_key_bytes()).unwrap();
+        let from: std::net::SocketAddr = "192.168.60.76:40000".parse().unwrap();
+        assert!(service
+            .lock_headset_pairing()
+            .handle(&dev.commit("Quest 2"), from)
+            .is_none());
+
+        ok_payload(service.handle(req("1", headset_pair(PairAction::Open, None))));
+        let nonce = match service
+            .lock_headset_pairing()
+            .handle(&dev.commit("Quest 2"), from)
+            .and_then(|p| Message::decode(&p))
+        {
+            Some(Message::Nonce { nonce, .. }) => nonce,
+            other => panic!("expected nonce, got {other:?}"),
+        };
+        let reveal = dev.on_nonce(nonce);
+        service.lock_headset_pairing().handle(&reveal, from);
+
+        let pending = ok_payload(service.handle(req("2", headset_pair(PairAction::Pending, None))));
+        let entry = &pending["pending"][0];
+        assert_eq!(entry["name"], "Quest 2");
+        assert_eq!(entry["code"].as_str(), dev.code().as_deref());
+        let key = entry["device"].as_str().unwrap().to_string();
+        assert_eq!(key, device.public_key_hex());
+
+        let done = ok_payload(service.handle(req(
+            "3",
+            headset_pair(PairAction::Confirm, Some(key.clone())),
+        )));
+        assert_eq!(done["paired"], true);
+        assert_eq!(done["device"], crate::crypto::device_id_hex(&key));
+        assert!(service
+            .lock_pairing()
+            .active_device(done["device"].as_str().unwrap())
+            .is_some());
+
+        let outbox = service.take_pairing_outbox();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].0, from);
+        let Some(Message::Result { accepted, tag, .. }) = Message::decode(&outbox[0].1) else {
+            panic!("expected a RESULT");
+        };
+        assert_eq!(dev.verify_result(accepted, &tag), Some(true));
+
+        // The exchange is finished; confirming again finds nothing.
+        let again = service.handle(req("4", headset_pair(PairAction::Confirm, Some(key))));
+        assert!(matches!(again, Response::Err(_)));
+    }
+
     fn req(id: &str, command: Command) -> Request {
         Request {
             v: PROTOCOL_VERSION,
@@ -1593,6 +1802,7 @@ mod tests {
                 code: None,
                 name: None,
                 public_key: None,
+                device: None,
             }),
         )));
         let code = p["code"].as_str().expect("code in response");
@@ -1610,6 +1820,7 @@ mod tests {
                 code: None,
                 name: None,
                 public_key: None,
+                device: None,
             }),
         )));
         let code = minted["code"].as_str().unwrap().to_string();
@@ -1621,6 +1832,7 @@ mod tests {
                 code: Some(code),
                 name: Some("Quest 3".into()),
                 public_key: Some(identity.public_key_hex()),
+                device: None,
             }),
         )));
         assert_eq!(paired["paired"], true);
@@ -1655,6 +1867,7 @@ mod tests {
                 code: None,
                 name: None,
                 public_key: None,
+                device: None,
             }),
         )));
         let code = minted["code"].as_str().unwrap().to_string();
@@ -1666,6 +1879,7 @@ mod tests {
                 code: Some(code),
                 name: Some("Quest 3".into()),
                 public_key: Some(identity.public_key_hex()),
+                device: None,
             }),
         )));
         let id = paired["device"].as_str().unwrap();
@@ -1695,6 +1909,7 @@ mod tests {
                 code: None,
                 name: None,
                 public_key: None,
+                device: None,
             }),
         )));
         let code = minted["code"].as_str().unwrap().to_string();
@@ -1706,6 +1921,7 @@ mod tests {
                 code: Some(code),
                 name: Some("Quest 3".into()),
                 public_key: Some(identity.public_key_hex()),
+                device: None,
             }),
         )));
         let id = paired["device"].as_str().unwrap().to_string();
@@ -1734,6 +1950,7 @@ mod tests {
                 code: None,
                 name: None,
                 public_key: None,
+                device: None,
             }),
         ));
         let identity = crate::crypto::DeviceIdentity::generate().unwrap();
@@ -1744,6 +1961,7 @@ mod tests {
                 code: Some("000000".into()),
                 name: Some("Quest".into()),
                 public_key: Some(identity.public_key_hex()),
+                device: None,
             }),
         ));
         assert_eq!(err_code(res), ErrorCode::NotPaired);
@@ -1759,6 +1977,7 @@ mod tests {
                 code: Some("123456".into()),
                 name: None,
                 public_key: None,
+                device: None,
             }),
         ));
         assert_eq!(err_code(res), ErrorCode::InvalidArgs);
@@ -1774,6 +1993,7 @@ mod tests {
                 code: None,
                 name: None,
                 public_key: None,
+                device: None,
             }),
         )));
         let code = minted["code"].as_str().unwrap().to_string();
@@ -1785,6 +2005,7 @@ mod tests {
                 code: Some(code),
                 name: Some("Quest".into()),
                 public_key: Some(identity.public_key_hex()),
+                device: None,
             }),
         )));
         let device_id = paired["device"].as_str().unwrap().to_string();
